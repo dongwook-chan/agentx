@@ -2,6 +2,12 @@
 
 Monorepo for shared agent CLI wrapper infrastructure.
 
+The goal is to remove the developer tax of switching accounts after quota
+exhaustion. `agyx` and `cdxx` keep multiple authenticated profiles ready, detect
+quota exhaustion, and move the active prompt session to an eligible profile so
+development can continue without manually logging out, logging in, copying
+context, or restarting the conversation.
+
 Published CLI packages:
 
 - `agyx`

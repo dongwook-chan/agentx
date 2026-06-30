@@ -1,6 +1,12 @@
 # cdxx
 
-`cdxx` is a small Codex CLI companion inspired by `agyx`.
+`cdxx` is a Codex CLI companion for keeping the prompt experience moving after
+quota exhaustion.
+
+The goal is to remove the manual account-switching loop: when one Codex profile
+runs out of quota, `cdxx` can activate another eligible saved profile and resume
+the same Codex conversation, so development continues without logging out,
+logging in, or rebuilding prompt context by hand.
 
 It provides:
 

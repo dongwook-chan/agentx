@@ -4,6 +4,11 @@
 (`agy`). It can pause every managed terminal session, switch the shared macOS
 Keychain credential, and restart each conversation in its original terminal.
 
+The goal is a seamless prompt experience even when one account reaches quota:
+instead of stopping work to log out, log in, and reconstruct context, `agyx`
+keeps saved accounts ready and can move managed `agy` sessions to the next
+eligible account when quota is exhausted.
+
 ## Requirements
 
 - macOS on Apple Silicon (`darwin/arm64`) or Linux on ARM64 (`linux/arm64`)
