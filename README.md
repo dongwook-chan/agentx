@@ -1,4 +1,4 @@
-# agentx-suite
+# agentx
 
 Monorepo for shared agent CLI wrapper infrastructure.
 

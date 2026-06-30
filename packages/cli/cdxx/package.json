@@ -37,13 +37,13 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dongwook-chan/agentx-suite.git",
+    "url": "git+https://github.com/dongwook-chan/agentx.git",
     "directory": "packages/cli/cdxx"
   },
   "bugs": {
-    "url": "https://github.com/dongwook-chan/agentx-suite/issues"
+    "url": "https://github.com/dongwook-chan/agentx/issues"
   },
-  "homepage": "https://github.com/dongwook-chan/agentx-suite/tree/main/packages/cli/cdxx#readme",
+  "homepage": "https://github.com/dongwook-chan/agentx/tree/main/packages/cli/cdxx#readme",
   "dependencies": {
     "@dong-/agentx-core": "0.1.0",
     "@inquirer/prompts": "^8.5.2"
