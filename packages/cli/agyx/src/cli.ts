@@ -39,6 +39,7 @@ import { QuotaScope } from "./quota.js";
 import { supervise } from "./session.js";
 import {
   confirmAction,
+  decideProfileUse,
   pickAutoSwitchMode,
   pickProfileAction,
   printProfileTable,
@@ -201,6 +202,14 @@ async function browseProfiles(mode: "list" | "use"): Promise<string | undefined>
   let notice: string | undefined;
   while (true) {
     const state = await loadState();
+    if (mode === "use") {
+      const decision = decideProfileUse(state, quotaScopes);
+      if (decision.type === "empty") throw new Error(decision.message);
+      if (decision.type === "none") {
+        console.log(decision.message);
+        return undefined;
+      }
+    }
     const action = await pickProfileAction(state, mode, notice, quotaScopes);
     notice = undefined;
     if (action.type === "exit") return undefined;

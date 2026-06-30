@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyLaunchPolicy } from "../src/index.js";
+import {
+  applyLaunchPolicy,
+  decideUseProfile,
+  useProfileDisabledReason,
+} from "../src/index.js";
 
 test("applyLaunchPolicy injects yolo flag exactly once", () => {
   const args = applyLaunchPolicy(["resume", "abc"], {
@@ -44,4 +48,40 @@ test("applyLaunchPolicy honors yolo off and rejects foreign yolo flags", () => {
     }),
     /Codex option/,
   );
+});
+
+test("decideUseProfile exits active-only profile sets without opening a picker", () => {
+  assert.deepEqual(decideUseProfile([]), {
+    type: "empty",
+    message: "No saved profiles.",
+  });
+
+  assert.deepEqual(decideUseProfile([
+    { name: "dtjp_86", active: true, selectable: true },
+  ]), {
+    type: "none",
+    reason: "active_only",
+    message: "'dtjp_86' is already active.",
+  });
+
+  assert.equal(useProfileDisabledReason({
+    name: "dtjp_86",
+    active: true,
+    selectable: true,
+  }), "already active");
+});
+
+test("decideUseProfile selects only when a non-active selectable candidate exists", () => {
+  assert.deepEqual(decideUseProfile([
+    { name: "a", selectable: false, disabledReason: "quota exhausted" },
+  ]), {
+    type: "none",
+    reason: "no_selectable",
+    message: "No selectable profile found.",
+  });
+
+  assert.equal(decideUseProfile([
+    { name: "active", active: true, selectable: true },
+    { name: "next", selectable: true },
+  ]).type, "select");
 });

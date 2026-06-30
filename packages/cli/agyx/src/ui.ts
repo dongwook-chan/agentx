@@ -1,4 +1,9 @@
 import {
+  decideUseProfile,
+  useProfileDisabledReason,
+  UseProfileDecision,
+} from "@dong-/agentx-core";
+import {
   createPrompt,
   useEffect,
   isDownKey,
@@ -348,20 +353,39 @@ export async function pickProfileAction(
     header: profileHeaderLine(widths),
     notice,
     default: state.activeProfile ?? (mode === "use" ? suggested : undefined),
-    choices: rows.map((row) => ({
-      value: row.profile.name,
-      name: profileLine(row, widths),
-      short: profileLine(row, widths),
-      selectable: row.selectable,
-      active: row.marker === "*",
-      description: !row.selectable && row.disabledReason
-        ? color.yellow(row.disabledReason)
-        : undefined,
-      blockedDescription: color.red(
-        `Blocked: '${row.profile.name}' was not activated. ${row.disabledReason ?? "Profile is not selectable."}`,
-      ),
-    })),
+    choices: rows.map((row) => {
+      const disabledReason = useProfileDisabledReason({
+        name: row.profile.name,
+        active: row.marker === "*",
+        selectable: row.selectable,
+        disabledReason: row.disabledReason,
+      });
+      return {
+        value: row.profile.name,
+        name: profileLine(row, widths),
+        short: profileLine(row, widths),
+        selectable: !disabledReason,
+        active: row.marker === "*",
+        description: disabledReason ? color.yellow(disabledReason) : undefined,
+        blockedDescription: color.red(
+          `Blocked: '${row.profile.name}' was not activated. ${disabledReason ?? "Profile is not selectable."}`,
+        ),
+      };
+    }),
   });
+}
+
+export function decideProfileUse(
+  state: Pick<State, "activeProfile" | "profiles" | "settings">,
+  quotaScopes: QuotaScope[] = [],
+): UseProfileDecision {
+  const rows = profileRows(state, quotaScopes);
+  return decideUseProfile(rows.map((row) => ({
+    name: row.profile.name,
+    active: row.marker === "*",
+    selectable: row.selectable,
+    disabledReason: row.disabledReason,
+  })));
 }
 
 export async function confirmAction(

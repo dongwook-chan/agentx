@@ -1,4 +1,8 @@
 import { select } from "@inquirer/prompts";
+import {
+  decideUseProfile,
+  useProfileDisabledReason,
+} from "@dong-/agentx-core";
 import { formatReset } from "./quota.js";
 
 function pad(value, width) {
@@ -34,10 +38,21 @@ export function printProfiles(state) {
 }
 
 function selectableReason(profile, state) {
-  if (state.activeProfile === profile.name) return "already active";
   if (profile.disabled) return "disabled";
   if (profile.quotaStatus === "exhausted") return "quota exhausted";
   return undefined;
+}
+
+function useCandidates(state) {
+  return state.profiles.map((profile) => {
+    const reason = selectableReason(profile, state);
+    return {
+      name: profile.name,
+      active: state.activeProfile === profile.name,
+      selectable: !reason,
+      disabledReason: reason,
+    };
+  });
 }
 
 function profileChoiceLabel(profile, state) {
@@ -57,21 +72,23 @@ function profileChoiceLabel(profile, state) {
 }
 
 export async function pickProfileForUse(state) {
-  if (!state.profiles.length) throw new Error("No saved profiles.");
+  const candidates = useCandidates(state);
+  const decision = decideUseProfile(candidates);
+  if (decision.type === "empty") throw new Error(decision.message);
+  if (decision.type === "none") {
+    console.log(decision.message);
+    return undefined;
+  }
+  const candidatesByName = new Map(candidates.map((candidate) => [candidate.name, candidate]));
   const choices = state.profiles.map((profile) => {
-    const reason = selectableReason(profile, state);
+    const candidate = candidatesByName.get(profile.name);
+    const reason = candidate ? useProfileDisabledReason(candidate) : "not selectable";
     return {
       name: profileChoiceLabel(profile, state),
       value: profile.name,
       disabled: reason,
     };
   });
-  const selectable = choices.filter((choice) => !choice.disabled);
-  if (!selectable.length) {
-    const active = state.activeProfile ? `'${state.activeProfile}' is already active.` : "No selectable profile found.";
-    console.log(active);
-    return undefined;
-  }
   return await select({
     message: "Select profile",
     choices,
