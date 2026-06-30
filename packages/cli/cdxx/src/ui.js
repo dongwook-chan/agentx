@@ -97,6 +97,36 @@ export async function pickProfileForUse(state) {
   });
 }
 
+export async function pickConfigKey(settings) {
+  return await select({
+    message: "Select setting",
+    choices: [
+      {
+        name: `autoswitch  ${settings.autoswitch ? "on" : "off"}`,
+        value: "autoswitch",
+        description: "Switch profiles automatically when quota is exhausted.",
+      },
+      {
+        name: `yolo        ${settings.yolo ? "on" : "off"}`,
+        value: "yolo",
+        description: "Launch Codex with approvals and sandbox bypassed.",
+      },
+    ],
+    loop: true,
+  });
+}
+
+export async function pickConfigValue(key, current) {
+  return await select({
+    message: `Select value for ${key}`,
+    choices: [
+      { name: "on", value: "on", description: current === true ? "current" : undefined },
+      { name: "off", value: "off", description: current === false ? "current" : undefined },
+    ],
+    loop: true,
+  });
+}
+
 export function printScanSummary(summary) {
   console.log(`files: ${summary.scannedFiles}`);
   console.log(`token_count records: ${summary.tokenCountRecords}`);

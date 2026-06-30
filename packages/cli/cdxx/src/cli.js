@@ -6,31 +6,57 @@ import { join } from "node:path";
 import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
 import { clearExpiredQuota, effectiveYoloMode, loadState, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
-import { installShellIntegration, shellInit } from "./install.js";
+import { installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
 import { findRealCodex } from "./processes.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
 import { recordQuotaForActiveProfile, scanCodexSessions } from "./quota.js";
-import { pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
+import { pickConfigKey, pickConfigValue, pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
 
 const help = `cdxx - Codex CLI profile and quota helper
 
+Preferred shell usage after 'cdxx install':
+  codex login                    Protected Codex login; auto-save and activate profile
+  codex x list                   List saved profiles
+  codex x use [name]             Activate a saved profile
+  codex x next                   Switch to next selectable profile
+  codex x status                 Show wrapper status
+  codex x config                 Configure wrapper settings interactively
+  codex x config <key> [value]   Configure autoswitch/yolo
+  codex x remove <name>          Delete a saved profile
+  codex x import-current [name]  Import current $CODEX_HOME/auth.json as a profile
+  codex --native ...             Bypass cdxx and run the real Codex CLI
+
 Usage:
+  cdxx dispatch -- [codex args]   Shell integration dispatcher
   cdxx install                    Install codex shell function
   cdxx shell-init                 Print shell function for current terminal
   cdxx session -- [codex args]    Run Codex with live quota failover
-  cdxx save [name]                Save current $CODEX_HOME/auth.json as a profile
+  cdxx import-current [name]      Save current $CODEX_HOME/auth.json as a profile
   cdxx login [name]               Run 'codex login', then save as profile
   cdxx use [name]                 Activate a saved profile
   cdxx next                       Switch to next selectable profile
   cdxx list                       List profiles
-  cdxx current                    Print active profile
   cdxx scan [--json] [--full] [--record]
                                   Scan local Codex sessions
-  cdxx autoswitch [on|off]        Toggle live quota failover/autoswitch
-  cdxx yolo [on|off]              Auto-bypass Codex approvals/sandbox (default: on)
+  cdxx config [key] [value]       Configure wrapper settings
   cdxx remove <name>              Delete a saved profile
-  cdxx status                     Show active auth summary and profiles`;
+  cdxx status                     Show wrapper status`;
+
+const wrapperHelp = `cdxx wrapper commands:
+  codex login                    Protected login; auto-save and activate profile
+  codex x list                   List saved profiles
+  codex x use [name]             Activate a saved profile
+  codex x next                   Switch to next selectable profile
+  codex x status                 Show wrapper status
+  codex x config                 Configure wrapper settings interactively
+  codex x config list            Print wrapper settings
+  codex x config get <key>       Print one setting
+  codex x config set <key> <val> Set one setting
+  codex x config <key> [value]   Set autoswitch/yolo, or pick value interactively
+  codex x remove <name>          Delete a saved profile
+  codex x import-current [name]  Import current active Codex auth as a profile
+  codex --native ...             Bypass cdxx and run the real Codex CLI`;
 
 function takeFlag(args, name) {
   const index = args.indexOf(name);
@@ -86,13 +112,13 @@ function spawnInherited(command, args, options = {}) {
   });
 }
 
-async function loginProfile(name) {
+async function loginProfile(name, loginArgs = []) {
   const realCodex = await findRealCodex();
   const loginHome = await mkdtemp(join(tmpdir(), "cdxx-codex-login-"));
   try {
     return await guardedLoginProfile(
       name,
-      async () => await spawnInherited(realCodex, ["login"], {
+      async () => await spawnInherited(realCodex, ["login", ...loginArgs], {
         env: { ...process.env, CODEX_HOME: loginHome },
       }),
       { candidateAuthPath: join(loginHome, "auth.json") },
@@ -145,6 +171,70 @@ async function setYolo(value) {
   console.log(`Yolo mode: ${value}`);
 }
 
+const configKeys = new Set(["autoswitch", "yolo"]);
+
+function configValue(state, key) {
+  if (key === "autoswitch") return state.settings?.autoswitch ? "on" : "off";
+  if (key === "yolo") return effectiveYoloMode(state) ? "on" : "off";
+  throw new Error("Usage: cdxx config [list|get|set|autoswitch|yolo]");
+}
+
+function printConfig(state) {
+  console.log(`autoswitch ${configValue(state, "autoswitch")}`);
+  console.log(`yolo ${configValue(state, "yolo")}`);
+}
+
+async function setConfigValue(key, value) {
+  if (!configKeys.has(key)) throw new Error("Usage: cdxx config set <autoswitch|yolo> <on|off>");
+  if (value !== "on" && value !== "off") throw new Error(`Usage: cdxx config ${key} [on|off]`);
+  if (key === "autoswitch") await setAutoswitch(value);
+  else await setYolo(value);
+}
+
+async function configure(args) {
+  const state = await loadState();
+  const subcommand = args.shift();
+  if (!subcommand || subcommand === "list") {
+    if (!subcommand && process.stdin.isTTY && process.stdout.isTTY) {
+      const key = await pickConfigKey(state.settings ?? {});
+      const value = await pickConfigValue(key, configValue(state, key) === "on");
+      await setConfigValue(key, value);
+      return 0;
+    }
+    if (args.length) throw new Error("Usage: cdxx config list");
+    printConfig(state);
+    return 0;
+  }
+  if (subcommand === "get") {
+    const key = requireOne(args, "cdxx config get <autoswitch|yolo>");
+    if (!configKeys.has(key)) throw new Error("Usage: cdxx config get <autoswitch|yolo>");
+    console.log(configValue(state, key));
+    return 0;
+  }
+  if (subcommand === "set") {
+    const key = args.shift();
+    const value = args.shift();
+    if (!key || !value || args.length) throw new Error("Usage: cdxx config set <autoswitch|yolo> <on|off>");
+    await setConfigValue(key, value);
+    return 0;
+  }
+  if (!configKeys.has(subcommand)) {
+    throw new Error("Usage: cdxx config [list|get|set|autoswitch|yolo]");
+  }
+  const value = args.shift();
+  if (args.length) throw new Error(`Usage: cdxx config ${subcommand} [on|off]`);
+  if (!value) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      console.log(configValue(state, subcommand));
+      return 0;
+    }
+    await setConfigValue(subcommand, await pickConfigValue(subcommand, configValue(state, subcommand) === "on"));
+    return 0;
+  }
+  await setConfigValue(subcommand, value);
+  return 0;
+}
+
 function parseSupervisorPayload(encoded) {
   if (!encoded) throw new Error("Usage: cdxx _supervisor-failover <base64-json>");
   return JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
@@ -179,8 +269,110 @@ async function printStatus() {
   } catch {
     console.log("active auth: missing");
   }
+  console.log(`autoswitch: ${state.settings?.autoswitch ? "on" : "off"}`);
+  console.log(`yolo: ${effectiveYoloMode(state) ? "on" : "off"}`);
+  console.log(`real codex: ${await findRealCodex().catch(() => "(not found)")}`);
+  console.log(`shell integration file: ${shellIntegrationPath()}`);
+}
+
+async function runNativeCodex(args) {
+  return await spawnInherited(await findRealCodex(), args);
+}
+
+async function printCombinedHelp() {
+  await runNativeCodex(["--help"]);
   console.log("");
-  printProfiles(state);
+  console.log(wrapperHelp);
+}
+
+async function runWrapperCommand(command, args) {
+  switch (command) {
+    case "login":
+      return await loginProfile(optionalName(args, "cdxx login [name]"));
+    case "import-current":
+    case "save": {
+      const name = optionalName(args, `cdxx ${command} [name]`);
+      const result = await saveCurrentProfile(name);
+      console.log(`Saved and activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
+      return 0;
+    }
+    case "use": {
+      const name = optionalName(args, "cdxx use [name]") ?? await chooseProfileForUse();
+      if (!name) return 0;
+      const result = await useProfile(name);
+      console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
+      return 0;
+    }
+    case "next":
+      await switchNext();
+      return 0;
+    case "list":
+      printProfiles(await loadState());
+      return 0;
+    case "current": {
+      const state = await loadState();
+      console.log(state.activeProfile ?? "");
+      return state.activeProfile ? 0 : 1;
+    }
+    case "scan": {
+      const asJson = takeFlag(args, "--json");
+      const full = takeFlag(args, "--full");
+      const record = takeFlag(args, "--record");
+      if (args.length) throw new Error("Usage: cdxx scan [--json] [--full] [--record]");
+      const summary = await scanCodexSessions();
+      if (record) await recordQuotaForActiveProfile(summary);
+      if (asJson) {
+        const payload = full ? summary : {
+          ...summary,
+          highWatermarkCount: summary.highWatermarks.length,
+          highWatermarks: summary.highWatermarks.slice(-20),
+        };
+        console.log(JSON.stringify(payload, null, 2));
+      }
+      else printScanSummary(summary);
+      return 0;
+    }
+    case "config":
+      return await configure(args);
+    case "autoswitch":
+      await setAutoswitch(args.shift());
+      if (args.length) throw new Error("Usage: cdxx autoswitch [on|off]");
+      return 0;
+    case "yolo":
+      await setYolo(args.shift());
+      if (args.length) throw new Error("Usage: cdxx yolo [on|off]");
+      return 0;
+    case "remove":
+      await removeProfile(requireOne(args, "cdxx remove <name>"));
+      console.log("Removed.");
+      return 0;
+    case "status":
+      await printStatus();
+      return 0;
+    default:
+      throw new Error(`Unknown wrapper command: ${command}\n\n${wrapperHelp}`);
+  }
+}
+
+async function dispatchCodex(args) {
+  if (args[0] === "--") args.shift();
+  if (args[0] === "--native") return await runNativeCodex(args.slice(1));
+  if (!args.length) return await runCodexSession([]);
+  if (args[0] === "login") return await loginProfile(undefined, args.slice(1));
+  if (args[0] === "x") {
+    args.shift();
+    const command = args.shift();
+    if (!command || ["help", "-h", "--help"].includes(command)) {
+      console.log(wrapperHelp);
+      return 0;
+    }
+    return await runWrapperCommand(command, args);
+  }
+  if (["help", "-h", "--help"].includes(args[0])) {
+    await printCombinedHelp();
+    return 0;
+  }
+  return await runCodexSession(args);
 }
 
 async function main() {
@@ -201,11 +393,19 @@ async function main() {
     case "shell-init":
       console.log(shellInit());
       return 0;
+    case "dispatch":
+      return await dispatchCodex(args);
     case "session":
       if (args[0] === "--") args.shift();
       return await runCodexSession(args);
     case "save": {
       const name = optionalName(args, "cdxx save [name]");
+      const result = await saveCurrentProfile(name);
+      console.log(`Saved and activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
+      return 0;
+    }
+    case "import-current": {
+      const name = optionalName(args, "cdxx import-current [name]");
       const result = await saveCurrentProfile(name);
       console.log(`Saved and activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
       return 0;
@@ -256,6 +456,8 @@ async function main() {
       await setYolo(args.shift());
       if (args.length) throw new Error("Usage: cdxx yolo [on|off]");
       return 0;
+    case "config":
+      return await configure(args);
     case "remove":
       await removeProfile(requireOne(args, "cdxx remove <name>"));
       return 0;

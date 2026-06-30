@@ -71,7 +71,11 @@ export async function findRealAgy(): Promise<string> {
     if (!await executable(candidate)) continue;
     try {
       const header = await readFile(candidate, { encoding: "utf8" });
-      if (header.includes("agyx session")) continue;
+      if (
+        header.includes("agyx session")
+        || header.includes("agyx dispatch")
+        || header.includes("agyx-supervisor")
+      ) continue;
     } catch {
       // Native binaries are expected to fail UTF-8 inspection.
     }

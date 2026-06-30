@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { select } from "@inquirer/prompts";
 import {
   activateProfile,
   activeQuotaScopes,
@@ -48,21 +50,32 @@ import {
 
 const help = `agyx — multi-account session supervisor for Antigravity CLI
 
+Preferred shell usage after 'agyx install':
+  agy login                            Protected Antigravity login; auto-save and activate profile
+  agy x list                           List saved profiles
+  agy x use [name]                     Activate a saved profile
+  agy x next                           Switch to next selectable profile
+  agy x status                         Show wrapper status
+  agy x config                         Configure wrapper settings interactively
+  agy x config <key> [value]           Configure autoswitch/ineligible/yolo
+  agy x remove <name>                  Delete a saved profile
+  agy x import-current [name]          Import current active agy credential as a profile
+  agy --native ...                     Bypass agyx and run the real agy CLI
+
 Usage:
+  agyx dispatch -- [agy options]        Shell integration dispatcher
   agyx install                         Install agy shell function
   agyx session -- [agy options]        Run agy under a restartable supervisor
-  agyx save [name] [--email EMAIL]     Save the current Keychain account
+  agyx import-current [name] [--email EMAIL]
+                                       Save the current active account
   agyx login [name] [--email EMAIL] [--no-resume]
                                        Pause all sessions and add an account
   agyx use [name]                      Switch account and resume every session
   agyx next                            Rotate to the next selectable account
-  agyx autoswitch [off|provider-first|all-providers]
-                                       Configure automatic quota failover (default: all-providers)
-  agyx ineligible [allow|block]        Configure whether ineligible profiles can be activated (default: allow)
-  agyx yolo [on|off]                   Auto-approve all agy permissions via --dangerously-skip-permissions (default: on)
+  agyx config [key] [value]            Configure wrapper settings
   agyx list [--verify]                 List profiles; optionally verify saved credentials
-  agyx current                         Print the active profile
-  agyx status                          List supervised terminal sessions
+  agyx status                          Show wrapper status
+  agyx sessions                        List supervised terminal sessions
   agyx pause | resume                  Pause or resume all supervised sessions
   agyx rename <old> <new>              Rename a saved profile
   agyx remove <name>                   Delete a saved profile
@@ -71,6 +84,22 @@ Usage:
 
 All arguments passed through "agy" are forwarded to the real agy executable.
 Non-interactive --print/--prompt commands are not automatically restarted.`;
+
+const wrapperHelp = `agyx wrapper commands:
+  agy login                            Protected login; auto-save and activate profile
+  agy x list                           List saved profiles
+  agy x use [name]                     Activate a saved profile
+  agy x next                           Switch to next selectable profile
+  agy x status                         Show wrapper status
+  agy x config                         Configure wrapper settings interactively
+  agy x config list                    Print wrapper settings
+  agy x config get <key>               Print one setting
+  agy x config set <key> <val>         Set one setting
+  agy x config <key> [value]           Set autoswitch/ineligible/yolo, or pick value interactively
+  agy x remove <name>                  Delete a saved profile
+  agy x rename <old> <new>             Rename a saved profile
+  agy x import-current [name]          Import current active agy credential as a profile
+  agy --native ...                     Bypass agyx and run the real agy CLI`;
 
 function printSwitchResult(result: { name: string; email?: string; alreadyActive?: boolean }): void {
   if (result.alreadyActive) {
@@ -119,11 +148,165 @@ function parseIneligibleMode(value: string): boolean {
   throw new Error("Usage: agyx ineligible [allow|block]");
 }
 
+function spawnInherited(command: string, args: string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: "inherit",
+      cwd: process.cwd(),
+      env: process.env,
+    });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+  });
+}
+
 function parseQuotaScope(value: string | undefined): QuotaScope {
   if (value === "claude" || value === "gemini" || value === "gpt-oss" || value === "unknown") {
     return value;
   }
   return "unknown";
+}
+
+type ConfigKey = "autoswitch" | "ineligible" | "yolo";
+
+const configKeys = new Set<string>(["autoswitch", "ineligible", "yolo"]);
+
+function configValue(state: Awaited<ReturnType<typeof loadState>>, key: ConfigKey): string {
+  if (key === "autoswitch") return effectiveAutoSwitchMode(state);
+  if (key === "ineligible") return effectiveAllowIneligibleActivation(state) ? "allow" : "block";
+  return effectiveYoloMode(state) ? "on" : "off";
+}
+
+function printConfig(state: Awaited<ReturnType<typeof loadState>>): void {
+  console.log(`autoswitch ${configValue(state, "autoswitch")}`);
+  console.log(`ineligible ${configValue(state, "ineligible")}`);
+  console.log(`yolo ${configValue(state, "yolo")}`);
+}
+
+async function pickConfigKey(state: Awaited<ReturnType<typeof loadState>>): Promise<ConfigKey | undefined> {
+  try {
+    return await select<ConfigKey>({
+      message: "Select setting",
+      choices: [
+        {
+          name: `autoswitch  ${configValue(state, "autoswitch")}`,
+          value: "autoswitch",
+          description: "Configure automatic quota failover.",
+        },
+        {
+          name: `ineligible  ${configValue(state, "ineligible")}`,
+          value: "ineligible",
+          description: "Allow or block activation of ineligible profiles.",
+        },
+        {
+          name: `yolo        ${configValue(state, "yolo")}`,
+          value: "yolo",
+          description: "Launch agy with permissions skipped.",
+        },
+      ],
+      loop: true,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "ExitPromptError") return undefined;
+    throw error;
+  }
+}
+
+async function pickConfigValue(key: ConfigKey, current: string): Promise<string | undefined> {
+  const choices = key === "autoswitch"
+    ? ["all-providers", "provider-first", "off"]
+    : key === "ineligible"
+    ? ["allow", "block"]
+    : ["on", "off"];
+  try {
+    return await select<string>({
+      message: `Select value for ${key}`,
+      choices: choices.map((value) => ({
+        name: value,
+        value,
+        description: value === current ? "current" : undefined,
+      })),
+      loop: true,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "ExitPromptError") return undefined;
+    throw error;
+  }
+}
+
+async function setConfigValue(key: string, value: string): Promise<void> {
+  if (!configKeys.has(key)) {
+    throw new Error("Usage: agyx config set <autoswitch|ineligible|yolo> <value>");
+  }
+  if (key === "autoswitch") {
+    const parsed = parseAutoSwitchMode(value);
+    await setAutoSwitchMode(parsed);
+    console.log(`Automatic quota failover: ${parsed}`);
+    return;
+  }
+  if (key === "ineligible") {
+    const allow = parseIneligibleMode(value);
+    await setAllowIneligibleActivation(allow);
+    console.log(`Ineligible activation: ${allow ? "allow" : "block"}`);
+    return;
+  }
+  if (value !== "on" && value !== "off") throw new Error("Usage: agyx config yolo [on|off]");
+  const state = await loadState();
+  state.settings = state.settings ?? {};
+  state.settings.yolo = value === "on";
+  await saveState(state);
+  console.log(`Yolo mode: ${value}`);
+}
+
+async function configure(args: string[]): Promise<number> {
+  const state = await loadState();
+  const subcommand = args.shift();
+  if (!subcommand || subcommand === "list") {
+    if (!subcommand && process.stdin.isTTY && process.stdout.isTTY) {
+      const key = await pickConfigKey(state);
+      if (!key) return 0;
+      const value = await pickConfigValue(key, configValue(state, key));
+      if (!value) return 0;
+      await setConfigValue(key, value);
+      return 0;
+    }
+    if (args.length) throw new Error("Usage: agyx config list");
+    printConfig(state);
+    return 0;
+  }
+  if (subcommand === "get") {
+    const key = takeOptionalName(args, "agyx config get <autoswitch|ineligible|yolo>") as ConfigKey | undefined;
+    if (!key || !configKeys.has(key)) throw new Error("Usage: agyx config get <autoswitch|ineligible|yolo>");
+    console.log(configValue(state, key));
+    return 0;
+  }
+  if (subcommand === "set") {
+    const key = args.shift();
+    const value = args.shift();
+    if (!key || !value || args.length) {
+      throw new Error("Usage: agyx config set <autoswitch|ineligible|yolo> <value>");
+    }
+    await setConfigValue(key, value);
+    return 0;
+  }
+  if (!configKeys.has(subcommand)) {
+    throw new Error("Usage: agyx config [list|get|set|autoswitch|ineligible|yolo]");
+  }
+  const key = subcommand as ConfigKey;
+  const value = args.shift();
+  if (args.length) throw new Error(`Usage: agyx config ${key} [value]`);
+  if (!value) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      console.log(configValue(state, key));
+      return 0;
+    }
+    const selected = await pickConfigValue(key, configValue(state, key));
+    if (!selected) return 0;
+    await setConfigValue(key, selected);
+    return 0;
+  }
+  await setConfigValue(key, value);
+  return 0;
 }
 
 async function removeProfile(name: string): Promise<void> {
@@ -227,6 +410,217 @@ async function browseProfiles(mode: "list" | "use"): Promise<string | undefined>
   }
 }
 
+async function printSessionRecords(): Promise<void> {
+  const records = await sessionRecords();
+  if (!records.length) console.log("No supervised agy sessions.");
+  for (const record of records) {
+    console.log(
+      `${record.id}  pid=${record.pid} child=${record.childPid ?? "-"}`
+      + `  ${record.paused ? "paused" : "running"}  cwd=${record.cwd}`
+      + (record.conversationId ? `  conversation=${record.conversationId}` : ""),
+    );
+  }
+}
+
+async function printStatus(): Promise<void> {
+  const state = await loadState();
+  const sessions = await sessionRecords();
+  console.log(`active profile: ${state.activeProfile ?? "unmanaged"}`);
+  console.log(`autoswitch: ${effectiveAutoSwitchMode(state)}`);
+  console.log(`ineligible: ${effectiveAllowIneligibleActivation(state) ? "allow" : "block"}`);
+  console.log(`yolo: ${effectiveYoloMode(state) ? "on" : "off"}`);
+  console.log(`real agy: ${await findRealAgy().catch(() => "(not found)")}`);
+  console.log(`shell integration file: ${shellIntegrationPath()}`);
+  console.log(`shell integration installed: ${await shellIntegrationInstalled() ? "yes" : "no"}`);
+  console.log(`supervised sessions: ${sessions.length}`);
+}
+
+async function handleLoginCommand(args: string[]): Promise<number> {
+  const email = takeOption(args, "--email");
+  const noResume = takeFlag(args, "--no-resume");
+  const name = takeOptionalName(args, "agyx login [name] [--email EMAIL] [--no-resume]");
+  await loginProfile(name, email, !noResume);
+  return 0;
+}
+
+async function handleImportCurrentCommand(args: string[], command = "import-current"): Promise<number> {
+  const email = takeOption(args, "--email");
+  const name = takeOptionalName(args, `agyx ${command} [name] [--email EMAIL]`);
+  const result = await saveCurrent(name, email);
+  console.log(
+    `Saved and activated profile '${result.name}'.`
+    + (result.email ? ` (${result.email})` : ""),
+  );
+  return 0;
+}
+
+async function handleUseCommand(args: string[]): Promise<number> {
+  const name = args.shift();
+  if (args.length) throw new Error("Usage: agyx use [name]");
+  const selected = name ?? await browseProfiles("use");
+  if (!selected) return 0;
+  const result = await switchProfile(selected);
+  printSwitchResult(result);
+  return 0;
+}
+
+async function handleListCommand(args: string[]): Promise<number> {
+  const verify = takeFlag(args, "--verify");
+  if (args.length) throw new Error("Usage: agyx list [--verify]");
+  const state = verify ? await verifyAllProfiles() : await loadState();
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    let notice: string | undefined;
+    const quotaScopes = await activeQuotaScopes();
+    while (true) {
+      const action = await pickProfileAction(await loadState(), "list", notice, quotaScopes);
+      notice = undefined;
+      if (action.type === "exit") break;
+      if (action.type === "delete") {
+        if (await confirmAndRemoveProfile(action.name)) {
+          notice = `Removed profile '${action.name}'.`;
+        }
+      } else if (action.type === "rename") {
+        const nextName = await promptAndRenameProfile(action.name);
+        if (nextName) {
+          notice = `Renamed profile '${action.name}' to '${nextName}'.`;
+        }
+      }
+    }
+  } else {
+    printProfileTable(state, await activeQuotaScopes());
+  }
+  return 0;
+}
+
+async function runWrapperCommand(command: string, args: string[]): Promise<number> {
+  switch (command) {
+    case "login":
+      return await handleLoginCommand(args);
+    case "import-current":
+    case "save":
+      return await handleImportCurrentCommand(args, command);
+    case "use":
+      return await handleUseCommand(args);
+    case "next": {
+      const result = await switchToNextProfile();
+      printSwitchResult(result);
+      return 0;
+    }
+    case "config":
+      return await configure(args);
+    case "autoswitch": {
+      const mode = args.shift();
+      if (args.length) throw new Error("Usage: agyx autoswitch [off|provider-first|all-providers]");
+      if (!mode) {
+        if (!process.stdin.isTTY || !process.stdout.isTTY) {
+          console.log(effectiveAutoSwitchMode(await loadState()));
+          return 0;
+        }
+        const selected = await pickAutoSwitchMode(effectiveAutoSwitchMode(await loadState()));
+        if (!selected) return 0;
+        await setAutoSwitchMode(selected);
+        console.log(`Automatic quota failover: ${selected}`);
+        return 0;
+      }
+      const parsed = parseAutoSwitchMode(mode);
+      await setAutoSwitchMode(parsed);
+      console.log(`Automatic quota failover: ${parsed}`);
+      return 0;
+    }
+    case "ineligible": {
+      const mode = args.shift();
+      if (args.length) throw new Error("Usage: agyx ineligible [allow|block]");
+      if (!mode) {
+        console.log(effectiveAllowIneligibleActivation(await loadState()) ? "allow" : "block");
+        return 0;
+      }
+      const allow = parseIneligibleMode(mode);
+      await setAllowIneligibleActivation(allow);
+      console.log(`Ineligible activation: ${allow ? "allow" : "block"}`);
+      return 0;
+    }
+    case "yolo": {
+      const value = args.shift();
+      if (args.length) throw new Error("Usage: agyx yolo [on|off]");
+      if (!value) {
+        const current = effectiveYoloMode(await loadState());
+        console.log(`Yolo mode: ${current ? "on" : "off"}`);
+        return 0;
+      }
+      await setConfigValue("yolo", value);
+      return 0;
+    }
+    case "list":
+      return await handleListCommand(args);
+    case "current":
+      console.log((await loadState()).activeProfile ?? "unmanaged");
+      return 0;
+    case "status":
+      await printStatus();
+      return 0;
+    case "sessions":
+      await printSessionRecords();
+      return 0;
+    case "pause": {
+      const records = await pauseAll();
+      console.log(`Paused ${records.length} supervised session(s).`);
+      return 0;
+    }
+    case "resume": {
+      const records = await sessionRecords();
+      await resumeAll(records);
+      console.log(`Resumed ${records.length} supervised session(s).`);
+      return 0;
+    }
+    case "rename": {
+      const oldName = args.shift();
+      const newName = args.shift();
+      if (!oldName || !newName || args.length) {
+        throw new Error("Usage: agyx rename <old> <new>");
+      }
+      const renamed = await renameProfile(oldName, newName);
+      console.log(renamed
+        ? `Renamed profile '${oldName}' to '${newName}'.`
+        : `Profile '${oldName}' is already named '${newName}'.`);
+      return 0;
+    }
+    case "remove": {
+      const name = args.shift();
+      if (!name || args.length) throw new Error("Usage: agyx remove <name>");
+      await confirmAndRemoveProfile(name);
+      return 0;
+    }
+    default:
+      throw new Error(`Unknown wrapper command: ${command}\n\n${wrapperHelp}`);
+  }
+}
+
+async function printCombinedHelp(): Promise<void> {
+  await spawnInherited(await findRealAgy(), ["--help"]);
+  console.log("");
+  console.log(wrapperHelp);
+}
+
+async function dispatchAgy(args: string[]): Promise<number> {
+  if (args[0] === "--") args.shift();
+  if (args[0] === "--native") return await spawnInherited(await findRealAgy(), args.slice(1));
+  if (args[0] === "login") return await handleLoginCommand(args.slice(1));
+  if (args[0] === "x") {
+    args.shift();
+    const command = args.shift();
+    if (!command || ["help", "-h", "--help"].includes(command)) {
+      console.log(wrapperHelp);
+      return 0;
+    }
+    return await runWrapperCommand(command, args);
+  }
+  if (!args.length || ["help", "-h", "--help"].includes(args[0]!)) {
+    await printCombinedHelp();
+    return 0;
+  }
+  return await supervise(args);
+}
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const command = args.shift();
@@ -252,34 +646,29 @@ async function main(): Promise<number> {
     case "shell-init":
       console.log(shellInit());
       return 0;
+    case "dispatch":
+      return await dispatchAgy(args);
+    case "x": {
+      const wrapperCommand = args.shift();
+      if (!wrapperCommand || ["help", "-h", "--help"].includes(wrapperCommand)) {
+        console.log(wrapperHelp);
+        return 0;
+      }
+      return await runWrapperCommand(wrapperCommand, args);
+    }
     case "session":
       if (args[0] === "--") args.shift();
       return await supervise(args);
     case "save": {
-      const email = takeOption(args, "--email");
-      const name = takeOptionalName(args, "agyx save [name] [--email EMAIL]");
-      const result = await saveCurrent(name, email);
-      console.log(
-        `Saved and activated profile '${result.name}'.`
-        + (result.email ? ` (${result.email})` : ""),
-      );
-      return 0;
+      return await handleImportCurrentCommand(args, "save");
     }
+    case "import-current":
+      return await handleImportCurrentCommand(args);
     case "login": {
-      const email = takeOption(args, "--email");
-      const noResume = takeFlag(args, "--no-resume");
-      const name = takeOptionalName(args, "agyx login [name] [--email EMAIL] [--no-resume]");
-      await loginProfile(name, email, !noResume);
-      return 0;
+      return await handleLoginCommand(args);
     }
     case "use": {
-      const name = args.shift();
-      if (args.length) throw new Error("Usage: agyx use [name]");
-      const selected = name ?? await browseProfiles("use");
-      if (!selected) return 0;
-      const result = await switchProfile(selected);
-      printSwitchResult(result);
-      return 0;
+      return await handleUseCommand(args);
     }
     case "next": {
       const result = await switchToNextProfile();
@@ -334,47 +723,18 @@ async function main(): Promise<number> {
       return 0;
     }
     case "list": {
-      const verify = takeFlag(args, "--verify");
-      if (args.length) throw new Error("Usage: agyx list [--verify]");
-      const state = verify ? await verifyAllProfiles() : await loadState();
-      if (process.stdin.isTTY && process.stdout.isTTY) {
-        let notice: string | undefined;
-        const quotaScopes = await activeQuotaScopes();
-        while (true) {
-          const action = await pickProfileAction(await loadState(), "list", notice, quotaScopes);
-          notice = undefined;
-          if (action.type === "exit") break;
-          if (action.type === "delete") {
-            if (await confirmAndRemoveProfile(action.name)) {
-              notice = `Removed profile '${action.name}'.`;
-            }
-          } else if (action.type === "rename") {
-            const nextName = await promptAndRenameProfile(action.name);
-            if (nextName) {
-              notice = `Renamed profile '${action.name}' to '${nextName}'.`;
-            }
-          }
-        }
-      } else {
-        printProfileTable(state, await activeQuotaScopes());
-      }
-      return 0;
+      return await handleListCommand(args);
     }
     case "current":
       console.log((await loadState()).activeProfile ?? "unmanaged");
       return 0;
     case "status": {
-      const records = await sessionRecords();
-      if (!records.length) console.log("No supervised agy sessions.");
-      for (const record of records) {
-        console.log(
-          `${record.id}  pid=${record.pid} child=${record.childPid ?? "-"}`
-          + `  ${record.paused ? "paused" : "running"}  cwd=${record.cwd}`
-          + (record.conversationId ? `  conversation=${record.conversationId}` : ""),
-        );
-      }
+      await printStatus();
       return 0;
     }
+    case "sessions":
+      await printSessionRecords();
+      return 0;
     case "pause": {
       const records = await pauseAll();
       console.log(`Paused ${records.length} supervised session(s).`);
@@ -419,6 +779,8 @@ async function main(): Promise<number> {
       console.log(`supervised sessions: ${sessions.length}`);
       return 0;
     }
+    case "config":
+      return await configure(args);
     case "_activate":
       await activateProfile(args[0] ?? "");
       return 0;

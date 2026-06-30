@@ -9,11 +9,12 @@ This document explains why the manifest values differ.
 
 ### agy
 
-`agy` does not expose a dedicated `login` subcommand. If its active credential
-slot is populated, launching `agy` can reuse the current account instead of
-opening a fresh Google OAuth flow.
+`agy` does not expose a dedicated login command with the same semantics as
+`codex login`. If its active credential slot is populated, launching `agy` can
+reuse the current account instead of opening a fresh Google OAuth flow.
 
-`agyx login` therefore:
+After shell integration, `agy login` is owned by the wrapper and runs `agyx
+login`. It therefore:
 
 1. backs up the current active credential into the active saved profile,
 2. clears only the active credential slot,
@@ -25,11 +26,12 @@ Saved profile credentials are not deleted.
 
 ### codex
 
-`codex login` is a real login command, but it can clear the active
+`codex login` is a real login command, but plain Codex can clear the active
 `auth.json` immediately after it starts. If the user cancels or the browser
 flow does not produce a valid credential, Codex can be left logged out.
 
-`cdxx login` therefore:
+After shell integration, `codex login` is owned by the wrapper and runs the cdxx
+protected login transaction. It therefore:
 
 1. backs up the current active `auth.json`,
 2. runs `codex login` in an isolated temporary `CODEX_HOME`,

@@ -80,8 +80,28 @@ The shell integration makes `agy` transparently run as:
 agyx-supervisor <all original agy arguments>
 ```
 
-If the native supervisor binary is not available in a development checkout, the
-shell function falls back to `agyx-agy`, which uses the Node supervisor.
+Wrapper management commands live under the `x` namespace, while normal `agy`
+commands keep their original shape:
+
+```bash
+agy                         # supervised agy
+agy login                   # protected login, auto-save, activate
+agy x list
+agy x use
+agy x use personal
+agy x next
+agy x status
+agy x config
+agy x config autoswitch all-providers
+agy x config ineligible block
+agy x config yolo off
+agy --native --help         # bypass agyx and run real agy
+```
+
+The shell function routes `agy login` and `agy x ...` to `agyx`; all other
+interactive `agy` invocations still go directly to `agyx-supervisor`. If the
+native supervisor binary is not available in a development checkout, the shell
+function falls back to `agyx-agy`, which uses the Node supervisor.
 
 Verify the active terminal with:
 
@@ -104,7 +124,7 @@ agy -p "one-shot prompt"
 
 `agyx` defaults to yolo mode and injects agy's own
 `--dangerously-skip-permissions` flag for supervised sessions unless you already
-passed it yourself. Configure it with `agyx yolo [on|off]`. Codex's
+passed it yourself. Configure it with `agy x config yolo [on|off]`. Codex's
 `--dangerously-bypass-approvals-and-sandbox` flag is rejected by the launch-args
 builder because it is not an agy option.
 
@@ -113,26 +133,14 @@ prevents duplicate requests.
 
 ## Account setup
 
-Save the account currently stored by `agy`:
-
-```bash
-agyx save
-agyx save personal
-```
-
-When the name is omitted, `agyx save` briefly probes `agy` authentication,
-detects the actual keyring account email from the `agy` log, and derives a
-profile name from the email local-part. Use `--email EMAIL` only when you want
-to override the detected metadata.
-
 Add another account:
 
 ```bash
-agyx login work
-agyx login
+agy login
+agy x login work
 ```
 
-`agyx login` performs this transaction:
+`agy login` performs this transaction through agyx:
 
 1. Pause every supervised `agy` child process.
 2. Stop any unmanaged `agy` process that could overwrite the Keychain.
@@ -145,19 +153,25 @@ in the `agy` log.
 
 Use `--no-resume` to leave sessions paused after login.
 
+Import an already-active Antigravity credential only for recovery or migration:
+
+```bash
+agy x import-current
+agy x import-current personal
+```
+
 ## Switching
 
 ```bash
-agyx list
-agyx use work
-agyx use
-agyx next
-agyx autoswitch
-agyx ineligible
-agyx status
+agy x list
+agy x use work
+agy x use
+agy x next
+agy x config
+agy x status
 ```
 
-`agyx use` without a profile opens an interactive picker. `agyx list` renders a
+`agy x use` without a profile opens an interactive picker. `agy x list` renders a
 terminal table. Both show profile metadata:
 
 - `status`: `ready`, `quota`, `disabled`, or `unknown`
@@ -175,14 +189,14 @@ accounts can still be activated. To block them from `use`, `next`, and automatic
 quota failover candidates, run:
 
 ```bash
-agyx ineligible block
-agyx ineligible allow
+agy x config ineligible block
+agy x config ineligible allow
 ```
 
-Account-changing commands (`save`, `login`, `use`, `next`, `remove`, `rename`,
-`list --verify`, and automatic quota failover) share a global auth switch lock,
-so concurrent wrappers do not overwrite the active Keychain credential mid
-transaction.
+Account-changing commands (`login`, `import-current`, `use`, `next`, `remove`,
+`rename`, `list --verify`, and automatic quota failover) share a global auth
+switch lock, so concurrent wrappers do not overwrite the active Keychain
+credential mid transaction.
 
 Each supervisor preserves its working directory and original arguments. It also
 extracts the active conversation UUID from the session log and uses
@@ -206,10 +220,10 @@ profile-wide.
 Automatic quota failover is configured with:
 
 ```bash
-agyx autoswitch
-agyx autoswitch all-providers
-agyx autoswitch provider-first
-agyx autoswitch off
+agy x config
+agy x config autoswitch all-providers
+agy x config autoswitch provider-first
+agy x config autoswitch off
 ```
 
 The default is `all-providers`: agyx waits until both Claude and Gemini quota are

@@ -61,6 +61,8 @@ test("activation keeps exhausted quota until reset time", () => {
 });
 
 test("shell integration uses the lightweight agy shim", () => {
+  assert.match(shellInit(), /command agyx login "\$@"/);
+  assert.match(shellInit(), /command agyx x "\$@"/);
   assert.match(shellInit(), /command agyx-supervisor "\$@"/);
   assert.match(shellInit(), /command agyx-agy "\$@"/);
 });

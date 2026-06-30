@@ -12,15 +12,14 @@ It provides:
 
 - local Codex auth profile save/use/next
 - passive quota scanning from `$CODEX_HOME/sessions`
-- optional shell integration so `codex` runs through `cdxx session`
+- shell integration so `codex` runs through the cdxx dispatcher
 - a Rust native supervisor for wrapped Codex TUI processes, with a Node supervisor fallback
 - live autoswitch and `codex resume <session_id>` failover when a profile reaches quota
 
 ## Install locally
 
 ```bash
-cd ~/codexx
-npm link
+npm install -g @dong-/cdxx
 cdxx install
 source ~/.zshrc
 ```
@@ -39,7 +38,8 @@ npm run build:native
 
 ## Native supervisor support
 
-`cdxx session` first tries to run the Rust native supervisor for the current
+`codex` first enters the cdxx dispatcher. Normal interactive Codex sessions then
+run through the Rust native supervisor for the current
 host. If the matching native binary is not present, it falls back to the Node
 supervisor with the same behavior. Set `CDXX_REQUIRE_NATIVE_SUPERVISOR=1` to
 fail instead of falling back.
@@ -67,45 +67,64 @@ autoswitch-off handling, no-selectable-profile handling, and user-facing
 messages; the supervisor only prints the helper message and performs the
 requested process action. This keeps native and Node supervisor behavior aligned.
 
+## Command model
+
+After `cdxx install`, use the normal Codex command. Wrapper commands live under
+the `x` namespace, except `codex login`, which is intentionally protected
+because plain Codex can clear active auth before login succeeds.
+
+```bash
+codex                      # supervised Codex TUI
+codex "inspect this repo"  # supervised prompt
+codex login                # protected login, auto-save, activate
+codex x list
+codex x use
+codex x use personal
+codex x next
+codex x status
+codex x config
+codex x config autoswitch on
+codex x config yolo off
+codex x remove personal
+codex --native --help      # bypass cdxx and run real Codex
+```
+
+`cdxx` remains installed as the backend command for setup, shell integration,
+and compatibility. Existing `cdxx login`, `cdxx use`, and `cdxx list` commands
+still work, but the intended daily interface is `codex`.
+
 ## Profile workflow
-
-Save the currently active Codex login:
-
-```bash
-cdxx save
-```
-
-When the name is omitted, `cdxx` derives one from the active Codex account email
-or account id. You can still provide an explicit name:
-
-```bash
-cdxx save personal
-```
 
 Add another profile:
 
 ```bash
-cdxx login
+codex login
 ```
 
 Codex has an annoying edge case: starting `codex login` can immediately clear
 or invalidate the current active login before the browser flow succeeds. If you
 cancel at that point, plain Codex can be left logged out.
 
-`cdxx login` avoids that by running `codex login` in an isolated temporary
+The cdxx dispatcher avoids that by running Codex login in an isolated temporary
 `CODEX_HOME`. The real active Codex home is not touched while login is in
 progress. Only after the temporary login produces a valid Codex `auth.json` does
 `cdxx` copy that credential into the real active slot and save it as a profile.
 If login is cancelled or fails, the previous active profile stays active.
 
+Import an already-active Codex login only for recovery or migration:
+
+```bash
+codex x import-current
+codex x import-current personal
+```
+
 Switch profiles:
 
 ```bash
-cdxx list
-cdxx use
-cdxx use personal
-cdxx next
-cdxx current
+codex x list
+codex x use
+codex x use personal
+codex x next
 ```
 
 `cdxx` stores profile credentials under `~/.config/cdxx/profiles/<name>/auth.json`
@@ -121,9 +140,9 @@ Codex records two quota windows in session JSONL as `primary` and `secondary`.
 Scan local Codex session transcripts:
 
 ```bash
-cdxx scan
-cdxx scan --json
-cdxx scan --json --full
+codex x scan
+codex x scan --json
+codex x scan --json --full
 ```
 
 `cdxx` defaults to yolo mode for supervised Codex sessions. It injects Codex's
@@ -131,26 +150,20 @@ own dangerous flag, `--dangerously-bypass-approvals-and-sandbox`, unless you
 already passed it yourself. Configure it with:
 
 ```bash
-cdxx yolo
-cdxx yolo on
-cdxx yolo off
+codex x config
+codex x config yolo on
+codex x config yolo off
 ```
 
 The `agy` flag `--dangerously-skip-permissions` is rejected when passed through
 `cdxx`; it is not a Codex option.
-
-Run Codex through the wrapper:
-
-```bash
-cdxx session -- "inspect this repo"
-```
 
 After a wrapped session exits, `cdxx` scans new or modified Codex transcripts
 and records rate-limit status on the active profile. Enable live profile
 failover:
 
 ```bash
-cdxx autoswitch on
+codex x config autoswitch on
 ```
 
 With autoswitch enabled, the Rust supervisor tails the matched Codex transcript

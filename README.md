@@ -13,6 +13,12 @@ Published CLI packages:
 - `agyx`
 - `@dong-/cdxx`
 
+After installation, daily use stays on the original CLI names. Wrapper
+management commands use the `x` namespace, such as `agy x list` and
+`codex x config autoswitch on`; protected `agy login` and `codex login` are
+owned by the wrappers so credentials can be saved automatically and restored on
+failed login attempts.
+
 `agentx`, the future umbrella router across multiple agent CLIs, is intentionally
 not implemented yet. This repository first centralizes shared policy and
 contract tests so existing CLIs cannot drift.

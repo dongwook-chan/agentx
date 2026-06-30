@@ -17,7 +17,7 @@ export function shellIntegrationPath() {
 export function shellInit() {
   return [
     "codex() {",
-    "  command cdxx session -- \"$@\"",
+    "  command cdxx dispatch -- \"$@\"",
     "}",
   ].join("\n");
 }

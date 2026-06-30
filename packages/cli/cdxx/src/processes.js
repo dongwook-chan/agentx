@@ -15,7 +15,9 @@ async function executable(path) {
 async function isCdxxWrapper(path) {
   try {
     const content = await readFile(path, "utf8");
-    return content.includes("cdxx session") || content.includes("cdxx-supervisor");
+    return content.includes("cdxx session")
+      || content.includes("cdxx dispatch")
+      || content.includes("cdxx-supervisor");
   } catch {
     return false;
   }
