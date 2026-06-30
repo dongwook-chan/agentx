@@ -1,7 +1,7 @@
 import { findRealAgy, run } from "./processes.js";
 import { configDir } from "./config.js";
 import { join } from "node:path";
-import { readFile, writeFile, rm, mkdir } from "node:fs/promises";
+import { access, readFile, writeFile, rm, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 
 const security = "/usr/bin/security";
@@ -22,6 +22,26 @@ async function getCredentialFilePath(service: string, account: string): Promise<
   const safeService = encodeURIComponent(service);
   const safeAccount = encodeURIComponent(account);
   return join(credsDir, `${safeService}_${safeAccount}`);
+}
+
+async function activeCredentialFilePath(): Promise<string> {
+  return await getCredentialFilePath(activeService, activeAccount);
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeForActiveFile(credential: Buffer): Buffer {
+  const text = credential.toString("utf8").trim();
+  const prefix = "go-keyring-base64:";
+  if (!text.startsWith(prefix)) return credential;
+  return Buffer.from(text.slice(prefix.length), "base64");
 }
 
 async function read(service: string, account: string): Promise<Buffer> {
@@ -86,8 +106,15 @@ async function write(
 }
 
 export const keychain = {
-  readActive: () => read(activeService, activeAccount),
+  async readActive(): Promise<Buffer> {
+    const filePath = await activeCredentialFilePath();
+    if (await fileExists(filePath)) return await readFile(filePath);
+    return await read(activeService, activeAccount);
+  },
   async writeActive(credential: Buffer): Promise<void> {
+    const filePath = await activeCredentialFilePath();
+    await writeFile(filePath, normalizeForActiveFile(credential), { mode: 0o600 });
+    if (!isDarwin) return;
     const trustedApps = isDarwin ? [await findRealAgy(), security] : [await findRealAgy()];
     await write(
       activeService,
@@ -96,7 +123,10 @@ export const keychain = {
       trustedApps,
     );
   },
-  deleteActive: () => remove(activeService, activeAccount),
+  async deleteActive(): Promise<void> {
+    await rm(await activeCredentialFilePath(), { force: true });
+    await remove(activeService, activeAccount);
+  },
   readProfile: (name: string) => read(vaultService, name),
   writeProfile: (name: string, credential: Buffer) =>
     write(vaultService, name, credential, isDarwin ? [security] : []),
