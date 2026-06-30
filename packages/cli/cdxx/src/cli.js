@@ -49,8 +49,33 @@ function optionalName(args, usage) {
 function spawnInherited(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: "inherit", cwd: process.cwd(), env: process.env });
-    child.on("error", reject);
-    child.on("exit", (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+    const previousListeners = new Map();
+    let interruptedSignal;
+    const signalNumbers = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+    const cleanup = () => {
+      for (const [signal, listeners] of previousListeners) {
+        process.removeAllListeners(signal);
+        for (const listener of listeners) process.on(signal, listener);
+      }
+    };
+    const installSignalHandler = (signal) => {
+      previousListeners.set(signal, process.listeners(signal));
+      process.removeAllListeners(signal);
+      process.on(signal, () => {
+        interruptedSignal = signal;
+        if (child.exitCode === null && !child.killed) child.kill(signal);
+      });
+    };
+    for (const signal of Object.keys(signalNumbers)) installSignalHandler(signal);
+    child.on("error", (error) => {
+      cleanup();
+      reject(error);
+    });
+    child.on("exit", (code, signal) => {
+      cleanup();
+      const exitSignal = signal ?? interruptedSignal;
+      resolve(code ?? (exitSignal ? 128 + (signalNumbers[exitSignal] ?? 0) : 1));
+    });
   });
 }
 

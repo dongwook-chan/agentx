@@ -1,9 +1,21 @@
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { configDir, ensureConfig } from "./config.js";
 import { wait } from "./quota_tail.js";
 
 const lockDir = join(configDir, "auth-switch.lock");
+
+async function lockOwnerIsDead() {
+  const owner = await readFile(join(lockDir, "owner"), "utf8").catch(() => undefined);
+  const pid = Number(owner?.split("\n")[0]);
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error?.code === "ESRCH";
+  }
+}
 
 export async function withAuthSwitchLock(fn, options = {}) {
   const timeoutMs = options.timeoutMs ?? 30000;
@@ -21,6 +33,10 @@ export async function withAuthSwitchLock(fn, options = {}) {
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       const info = await stat(lockDir).catch(() => undefined);
+      if (await lockOwnerIsDead()) {
+        await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+        continue;
+      }
       if (info && Date.now() - info.mtimeMs > staleMs) {
         await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
         continue;
