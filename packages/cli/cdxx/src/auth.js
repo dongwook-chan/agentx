@@ -1,5 +1,6 @@
-import { chmod, copyFile, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { codexHome, ensureConfig, ensureDir, loadState, markActive, profileNameFromIdentity, profilesDir, saveState, uniqueProfileName, upsertProfile, validateProfileName } from "./config.js";
 import { withAuthSwitchLock } from "./lock.js";
 
@@ -40,37 +41,92 @@ export async function readActiveAuthSummary() {
   return summarizeAuthJson(JSON.parse(content));
 }
 
+export function isValidCodexAuth(raw) {
+  try {
+    const summary = summarizeAuthJson(JSON.parse(String(raw)));
+    return Boolean(summary.hasRefreshToken || summary.hasApiKey);
+  } catch {
+    return false;
+  }
+}
+
+async function readActiveAuthIfValid() {
+  const raw = await readFile(activeAuthPath, "utf8");
+  if (!isValidCodexAuth(raw)) throw new Error(`Active Codex auth is invalid at ${activeAuthPath}.`);
+  return raw;
+}
+
+async function restoreActiveAuth(raw) {
+  await ensureDir(codexHome);
+  await writeFile(activeAuthPath, raw, { mode: 0o600 });
+  await chmod(activeAuthPath, 0o600).catch(() => undefined);
+}
+
+export async function guardedLoginProfile(inputName, runLogin) {
+  return await withAuthSwitchLock(async () => {
+    const stateBefore = await loadState();
+    const previousActiveProfile = stateBefore.activeProfile;
+    const previousAuth = await readActiveAuthIfValid().catch(() => undefined);
+    const backupDir = await mkdtemp(join(tmpdir(), "cdxx-login-"));
+    const backupPath = join(backupDir, "auth.json");
+    if (previousAuth) await writeFile(backupPath, previousAuth, { mode: 0o600 });
+    try {
+      const code = await runLogin();
+      const nextAuth = await readActiveAuthIfValid().catch(() => undefined);
+      if (code !== 0 || !nextAuth) {
+        if (previousAuth) await restoreActiveAuth(previousAuth);
+        await saveState(stateBefore);
+        console.error(
+          previousActiveProfile
+            ? `Login was cancelled or did not produce a valid Codex credential. Restored previous active profile '${previousActiveProfile}'.`
+            : "Login was cancelled or did not produce a valid Codex credential.",
+        );
+        return code === 0 ? 1 : code;
+      }
+      const result = await saveCurrentProfileUnlocked(inputName);
+      console.log(`Saved and activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
+      return 0;
+    } finally {
+      await rm(backupDir, { recursive: true, force: true });
+    }
+  });
+}
+
 export async function saveCurrentProfile(inputName) {
   return await withAuthSwitchLock(async () => {
-    await stat(activeAuthPath).catch(() => {
-      throw new Error(`No active Codex auth file found at ${activeAuthPath}. Run 'codex login' first.`);
-    });
-    await ensureConfig();
-    const raw = await readFile(activeAuthPath, "utf8");
-    const summary = summarizeAuthJson(JSON.parse(raw));
-    const state = await loadState();
-    const name = inputName
-      ? validateProfileName(inputName)
-      : resolveProfileName(state, summary);
-    const profileDir = join(profilesDir, name);
-    await ensureDir(profileDir);
-    const target = profileAuthPath(name);
-    await writeFile(target, raw, { mode: 0o600 });
-    await chmod(target, 0o600).catch(() => undefined);
-
-    upsertProfile(state, name, {
-      email: summary.email,
-      accountId: summary.accountId,
-      authMode: summary.authMode,
-      hasApiKey: summary.hasApiKey,
-      hasRefreshToken: summary.hasRefreshToken,
-      credentialStatus: "saved",
-      quotaStatus: "available",
-    });
-    markActive(state, name);
-    await saveState(state);
-    return { name, ...summary };
+    return await saveCurrentProfileUnlocked(inputName);
   });
+}
+
+async function saveCurrentProfileUnlocked(inputName) {
+  await stat(activeAuthPath).catch(() => {
+    throw new Error(`No active Codex auth file found at ${activeAuthPath}. Run 'codex login' first.`);
+  });
+  await ensureConfig();
+  const raw = await readFile(activeAuthPath, "utf8");
+  const summary = summarizeAuthJson(JSON.parse(raw));
+  const state = await loadState();
+  const name = inputName
+    ? validateProfileName(inputName)
+    : resolveProfileName(state, summary);
+  const profileDir = join(profilesDir, name);
+  await ensureDir(profileDir);
+  const target = profileAuthPath(name);
+  await writeFile(target, raw, { mode: 0o600 });
+  await chmod(target, 0o600).catch(() => undefined);
+
+  upsertProfile(state, name, {
+    email: summary.email,
+    accountId: summary.accountId,
+    authMode: summary.authMode,
+    hasApiKey: summary.hasApiKey,
+    hasRefreshToken: summary.hasRefreshToken,
+    credentialStatus: "saved",
+    quotaStatus: "available",
+  });
+  markActive(state, name);
+  await saveState(state);
+  return { name, ...summary };
 }
 
 function resolveProfileName(state, summary) {

@@ -74,3 +74,65 @@ export function decideUseProfile(
     message: "No selectable profile found.",
   };
 }
+
+export interface LoginSemantics {
+  command: readonly string[];
+  clearsActiveCredentialAtStart: boolean;
+  requiresActiveSlotClearedBeforeLogin: boolean;
+  mustRestorePreviousActiveOnFailure: boolean;
+  successRequiresCredentialValidation: boolean;
+}
+
+export interface CredentialSemantics {
+  activeLocations: readonly string[];
+  savedProfileLocation: string;
+}
+
+export interface AgentCliManifest {
+  id: "agy" | "codex";
+  packageName: string;
+  executable: string;
+  login: LoginSemantics;
+  credentials: CredentialSemantics;
+}
+
+export const agentCliManifests = {
+  agy: {
+    id: "agy",
+    packageName: "agyx",
+    executable: "agy",
+    login: {
+      command: [],
+      clearsActiveCredentialAtStart: false,
+      requiresActiveSlotClearedBeforeLogin: true,
+      mustRestorePreviousActiveOnFailure: true,
+      successRequiresCredentialValidation: true,
+    },
+    credentials: {
+      activeLocations: [
+        "~/.gemini/antigravity-cli/antigravity-oauth-token",
+        "legacy macOS Keychain gemini/antigravity",
+      ],
+      savedProfileLocation: "agyx credential vault by profile name",
+    },
+  },
+  codex: {
+    id: "codex",
+    packageName: "@dong-/cdxx",
+    executable: "codex",
+    login: {
+      command: ["login"],
+      clearsActiveCredentialAtStart: true,
+      requiresActiveSlotClearedBeforeLogin: false,
+      mustRestorePreviousActiveOnFailure: true,
+      successRequiresCredentialValidation: true,
+    },
+    credentials: {
+      activeLocations: [
+        "$CODEX_HOME/auth.json",
+        "~/.codex/auth.json",
+      ],
+      savedProfileLocation: "cdxx profiles directory by profile name",
+    },
+  },
+} as const satisfies Record<string, AgentCliManifest>;

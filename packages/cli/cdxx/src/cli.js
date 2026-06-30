@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
+import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
 import { clearExpiredQuota, effectiveYoloMode, loadState, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
 import { installShellIntegration, shellInit } from "./install.js";
@@ -56,11 +56,7 @@ function spawnInherited(command, args) {
 
 async function loginProfile(name) {
   const realCodex = await findRealCodex();
-  const code = await spawnInherited(realCodex, ["login"]);
-  if (code !== 0) return code;
-  const result = await saveCurrentProfile(name);
-  console.log(`Saved and activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
-  return 0;
+  return await guardedLoginProfile(name, async () => await spawnInherited(realCodex, ["login"]));
 }
 
 async function chooseProfileForUse() {

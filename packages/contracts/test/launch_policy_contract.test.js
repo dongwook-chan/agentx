@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  agentCliManifests,
   applyLaunchPolicy,
   decideUseProfile,
 } from "@dong-/agentx-core";
@@ -64,4 +65,15 @@ test("shared use contract opens selection only for non-active selectable candida
     { name: "active", active: true, selectable: true },
     { name: "other", selectable: true },
   ]).type, "select");
+});
+
+test("CLI login semantics are recorded in the shared manifest", () => {
+  assert.equal(agentCliManifests.agy.login.requiresActiveSlotClearedBeforeLogin, true);
+  assert.equal(agentCliManifests.agy.login.clearsActiveCredentialAtStart, false);
+  assert.equal(agentCliManifests.agy.login.mustRestorePreviousActiveOnFailure, true);
+
+  assert.equal(agentCliManifests.codex.login.requiresActiveSlotClearedBeforeLogin, false);
+  assert.equal(agentCliManifests.codex.login.clearsActiveCredentialAtStart, true);
+  assert.equal(agentCliManifests.codex.login.mustRestorePreviousActiveOnFailure, true);
+  assert.equal(agentCliManifests.codex.login.successRequiresCredentialValidation, true);
 });
