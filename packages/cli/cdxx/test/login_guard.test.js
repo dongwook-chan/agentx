@@ -30,6 +30,10 @@ async function resetState(activeProfile = "old") {
   await mkdir(process.env.CODEX_HOME, { recursive: true });
   await mkdir(process.env.CDXX_CONFIG_DIR, { recursive: true });
   await writeFile(auth.activeAuthPath, codexAuth("old"), { mode: 0o600 });
+  if (activeProfile) {
+    await mkdir(join(process.env.CDXX_CONFIG_DIR, "profiles", activeProfile), { recursive: true });
+    await writeFile(auth.profileAuthPath(activeProfile), codexAuth("old"), { mode: 0o600 });
+  }
   await writeFile(config.statePath, `${JSON.stringify({
     version: 1,
     activeProfile,
@@ -115,6 +119,43 @@ test("guardedLoginProfile leaves active auth intact when isolated login is cance
   try {
     const code = await auth.guardedLoginProfile("new", async () => 130, {
       candidateAuthPath: isolatedAuthPath,
+    });
+
+    assert.equal(code, 130);
+    assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("old"));
+    assert.match(errors.join("\n"), /Restored previous active profile 'old'/);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("guardedLoginProfile restores from the saved active profile when active auth is missing", async () => {
+  await resetState("old");
+  await rm(auth.activeAuthPath, { force: true });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (message) => errors.push(String(message));
+  try {
+    const code = await auth.guardedLoginProfile("new", async () => 130);
+
+    assert.equal(code, 130);
+    assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("old"));
+    assert.match(errors.join("\n"), /Restored previous active profile 'old'/);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("guardedLoginProfile prefers the saved active profile over stale active auth on failure", async () => {
+  await resetState("old");
+  await writeFile(auth.activeAuthPath, codexAuth("stale-active"), { mode: 0o600 });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (message) => errors.push(String(message));
+  try {
+    const code = await auth.guardedLoginProfile("new", async () => {
+      await rm(auth.activeAuthPath, { force: true });
+      return 130;
     });
 
     assert.equal(code, 130);

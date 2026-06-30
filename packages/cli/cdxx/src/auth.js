@@ -56,6 +56,12 @@ async function readActiveAuthIfValid() {
   return raw;
 }
 
+async function readProfileAuthIfValid(name) {
+  const raw = await readFile(profileAuthPath(name), "utf8");
+  if (!isValidCodexAuth(raw)) throw new Error(`Saved Codex auth is invalid for profile '${name}'.`);
+  return raw;
+}
+
 async function restoreActiveAuth(raw) {
   await ensureDir(codexHome);
   await writeFile(activeAuthPath, raw, { mode: 0o600 });
@@ -67,9 +73,13 @@ export async function guardedLoginProfile(inputName, runLogin, options = {}) {
     const stateBefore = await loadState();
     const previousActiveProfile = stateBefore.activeProfile;
     const previousAuth = await readActiveAuthIfValid().catch(() => undefined);
+    const previousProfileAuth = previousActiveProfile
+      ? await readProfileAuthIfValid(previousActiveProfile).catch(() => undefined)
+      : undefined;
     const backupDir = await mkdtemp(join(tmpdir(), "cdxx-login-"));
     const backupPath = join(backupDir, "auth.json");
-    if (previousAuth) await writeFile(backupPath, previousAuth, { mode: 0o600 });
+    const restoreAuth = previousProfileAuth ?? previousAuth;
+    if (restoreAuth) await writeFile(backupPath, restoreAuth, { mode: 0o600 });
     try {
       const code = await runLogin();
       const nextAuth = options.candidateAuthPath
@@ -78,10 +88,10 @@ export async function guardedLoginProfile(inputName, runLogin, options = {}) {
         ).catch(() => undefined)
         : await readActiveAuthIfValid().catch(() => undefined);
       if (code !== 0 || !nextAuth) {
-        if (previousAuth) await restoreActiveAuth(previousAuth);
+        if (restoreAuth) await restoreActiveAuth(restoreAuth);
         await saveState(stateBefore);
         console.error(
-          previousActiveProfile
+          previousActiveProfile && restoreAuth
             ? `Login was cancelled or did not produce a valid Codex credential. Restored previous active profile '${previousActiveProfile}'.`
             : "Login was cancelled or did not produce a valid Codex credential.",
         );
