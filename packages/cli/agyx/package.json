@@ -1,0 +1,69 @@
+{
+  "name": "agyx",
+  "version": "0.1.5",
+  "description": "Multi-account session supervisor for Google Antigravity CLI",
+  "type": "module",
+  "bin": {
+    "agyx": "dist/src/cli.js",
+    "agyx-agy": "dist/src/shim.js",
+    "agyx-supervisor": "bin/agyx-supervisor"
+  },
+  "files": [
+    "bin/agyx-supervisor",
+    "bin/agyx-supervisor-darwin-arm64",
+    "bin/agyx-supervisor-linux-arm64",
+    "dist/src",
+    "scripts/*.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/src/cli.js dist/src/shim.js bin/agyx-supervisor",
+    "build:native": "node scripts/build-native.cjs",
+    "check:native-package": "node scripts/check-native-package.cjs",
+    "clean": "rm -rf dist",
+    "preinstall": "node scripts/preinstall.cjs",
+    "prepack": "npm run clean && npm run build && AGYX_REQUIRE_ALL_NATIVE=1 npm run check:native-package",
+    "test": "npm run clean && npm run build && node --test dist/test/*.test.js"
+  },
+  "keywords": [
+    "antigravity",
+    "gemini",
+    "cli",
+    "oauth",
+    "account-switcher"
+  ],
+  "author": "Dongwook Chan",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dongwook-chan/agentx-suite.git",
+    "directory": "packages/cli/agyx"
+  },
+  "bugs": {
+    "url": "https://github.com/dongwook-chan/agentx-suite/issues"
+  },
+  "homepage": "https://github.com/dongwook-chan/agentx-suite/tree/main/packages/cli/agyx#readme",
+  "dependencies": {
+    "@dong-/agentx-core": "0.1.0",
+    "@inquirer/ansi": "^2.0.7",
+    "@inquirer/core": "^11.2.1",
+    "@inquirer/prompts": "^8.5.2",
+    "cli-table3": "^0.6.5",
+    "string-width": "^8.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}

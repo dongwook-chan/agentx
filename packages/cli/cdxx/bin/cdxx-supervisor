@@ -1,0 +1,23 @@
+#!/usr/bin/env node
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const supported = {
+  "darwin:arm64": "cdxx-supervisor-darwin-arm64",
+  "linux:arm64": "cdxx-supervisor-linux-arm64"
+};
+const binary = supported[`${process.platform}:${process.arch}`];
+if (!binary) {
+  console.error(`cdxx-supervisor does not support ${process.platform}/${process.arch}`);
+  process.exit(1);
+}
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const path = join(__dirname, binary);
+if (!existsSync(path)) {
+  console.error(`Missing native supervisor binary: ${path}`);
+  process.exit(1);
+}
+const result = spawnSync(path, process.argv.slice(2), { stdio: "inherit", env: process.env });
+process.exit(result.status ?? 1);

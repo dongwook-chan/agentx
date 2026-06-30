@@ -1,0 +1,16 @@
+{
+  "name": "@dong-/agentx-contracts",
+  "version": "0.1.0",
+  "description": "Shared behavior contracts for agent CLI wrappers",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@dong-/agentx-core": "0.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
