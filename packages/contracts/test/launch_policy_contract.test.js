@@ -70,10 +70,12 @@ test("shared use contract opens selection only for non-active selectable candida
 test("CLI login semantics are recorded in the shared manifest", () => {
   assert.equal(agentCliManifests.agy.login.requiresActiveSlotClearedBeforeLogin, true);
   assert.equal(agentCliManifests.agy.login.clearsActiveCredentialAtStart, false);
+  assert.equal(agentCliManifests.agy.login.isolatesLoginEnvironment, false);
   assert.equal(agentCliManifests.agy.login.mustRestorePreviousActiveOnFailure, true);
 
   assert.equal(agentCliManifests.codex.login.requiresActiveSlotClearedBeforeLogin, false);
   assert.equal(agentCliManifests.codex.login.clearsActiveCredentialAtStart, true);
+  assert.equal(agentCliManifests.codex.login.isolatesLoginEnvironment, true);
   assert.equal(agentCliManifests.codex.login.mustRestorePreviousActiveOnFailure, true);
   assert.equal(agentCliManifests.codex.login.successRequiresCredentialValidation, true);
 });

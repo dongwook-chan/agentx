@@ -84,6 +84,47 @@ test("guardedLoginProfile saves valid Codex auth produced by login", async () =>
   }
 });
 
+test("guardedLoginProfile can capture auth from an isolated login home", async () => {
+  await resetState("old");
+  const isolatedHome = join(root, "isolated-login");
+  await mkdir(isolatedHome, { recursive: true });
+  const isolatedAuthPath = join(isolatedHome, "auth.json");
+  const originalLog = console.log;
+  console.log = () => undefined;
+  try {
+    const code = await auth.guardedLoginProfile("isolated", async () => {
+      assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("old"));
+      await writeFile(isolatedAuthPath, codexAuth("isolated"), { mode: 0o600 });
+      return 0;
+    }, { candidateAuthPath: isolatedAuthPath });
+
+    assert.equal(code, 0);
+    assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("isolated"));
+    assert.equal(await readFile(auth.profileAuthPath("isolated"), "utf8"), codexAuth("isolated"));
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test("guardedLoginProfile leaves active auth intact when isolated login is cancelled", async () => {
+  await resetState("old");
+  const isolatedAuthPath = join(root, "missing-login", "auth.json");
+  const errors = [];
+  const originalError = console.error;
+  console.error = (message) => errors.push(String(message));
+  try {
+    const code = await auth.guardedLoginProfile("new", async () => 130, {
+      candidateAuthPath: isolatedAuthPath,
+    });
+
+    assert.equal(code, 130);
+    assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("old"));
+    assert.match(errors.join("\n"), /Restored previous active profile 'old'/);
+  } finally {
+    console.error = originalError;
+  }
+});
+
 test("isValidCodexAuth rejects missing credentials", () => {
   assert.equal(auth.isValidCodexAuth(codexAuth("ok")), true);
   assert.equal(auth.isValidCodexAuth(JSON.stringify({ auth_mode: "chatgpt", tokens: {} })), false);

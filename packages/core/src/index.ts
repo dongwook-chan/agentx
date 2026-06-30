@@ -79,6 +79,7 @@ export interface LoginSemantics {
   command: readonly string[];
   clearsActiveCredentialAtStart: boolean;
   requiresActiveSlotClearedBeforeLogin: boolean;
+  isolatesLoginEnvironment: boolean;
   mustRestorePreviousActiveOnFailure: boolean;
   successRequiresCredentialValidation: boolean;
 }
@@ -105,6 +106,7 @@ export const agentCliManifests = {
       command: [],
       clearsActiveCredentialAtStart: false,
       requiresActiveSlotClearedBeforeLogin: true,
+      isolatesLoginEnvironment: false,
       mustRestorePreviousActiveOnFailure: true,
       successRequiresCredentialValidation: true,
     },
@@ -124,6 +126,7 @@ export const agentCliManifests = {
       command: ["login"],
       clearsActiveCredentialAtStart: true,
       requiresActiveSlotClearedBeforeLogin: false,
+      isolatesLoginEnvironment: true,
       mustRestorePreviousActiveOnFailure: true,
       successRequiresCredentialValidation: true,
     },

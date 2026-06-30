@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
 import { clearExpiredQuota, effectiveYoloMode, loadState, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
@@ -46,9 +49,13 @@ function optionalName(args, usage) {
   return args[0];
 }
 
-function spawnInherited(command, args) {
+function spawnInherited(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "inherit", cwd: process.cwd(), env: process.env });
+    const child = spawn(command, args, {
+      stdio: "inherit",
+      cwd: process.cwd(),
+      env: options.env ?? process.env,
+    });
     const previousListeners = new Map();
     let interruptedSignal;
     const signalNumbers = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
@@ -81,7 +88,18 @@ function spawnInherited(command, args) {
 
 async function loginProfile(name) {
   const realCodex = await findRealCodex();
-  return await guardedLoginProfile(name, async () => await spawnInherited(realCodex, ["login"]));
+  const loginHome = await mkdtemp(join(tmpdir(), "cdxx-codex-login-"));
+  try {
+    return await guardedLoginProfile(
+      name,
+      async () => await spawnInherited(realCodex, ["login"], {
+        env: { ...process.env, CODEX_HOME: loginHome },
+      }),
+      { candidateAuthPath: join(loginHome, "auth.json") },
+    );
+  } finally {
+    await rm(loginHome, { recursive: true, force: true });
+  }
 }
 
 async function chooseProfileForUse() {

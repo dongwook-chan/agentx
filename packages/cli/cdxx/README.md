@@ -82,6 +82,16 @@ Add another profile:
 cdxx login
 ```
 
+Codex has an annoying edge case: starting `codex login` can immediately clear
+or invalidate the current active login before the browser flow succeeds. If you
+cancel at that point, plain Codex can be left logged out.
+
+`cdxx login` avoids that by running `codex login` in an isolated temporary
+`CODEX_HOME`. The real active Codex home is not touched while login is in
+progress. Only after the temporary login produces a valid Codex `auth.json` does
+`cdxx` copy that credential into the real active slot and save it as a profile.
+If login is cancelled or fails, the previous active profile stays active.
+
 Switch profiles:
 
 ```bash

@@ -32,10 +32,11 @@ flow does not produce a valid credential, Codex can be left logged out.
 `cdxx login` therefore:
 
 1. backs up the current active `auth.json`,
-2. runs `codex login`,
-3. validates that a new active credential exists,
-4. saves the new credential as a profile,
-5. restores the previous active `auth.json` if login fails or produces no
+2. runs `codex login` in an isolated temporary `CODEX_HOME`,
+3. validates that the temporary home produced a new credential,
+4. copies the validated credential into the real active `auth.json`,
+5. saves the new credential as a profile,
+6. restores the previous active state if login fails or produces no
    valid credential.
 
 Saved profile credentials are not deleted.
@@ -46,6 +47,7 @@ Every adapter must declare:
 
 - whether the target CLI clears active credentials at login start,
 - whether the wrapper must clear the active slot before login,
+- whether login must run in an isolated temporary environment,
 - whether previous active credentials must be restored on failure,
 - which active credential locations are authoritative.
 

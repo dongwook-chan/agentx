@@ -62,7 +62,7 @@ async function restoreActiveAuth(raw) {
   await chmod(activeAuthPath, 0o600).catch(() => undefined);
 }
 
-export async function guardedLoginProfile(inputName, runLogin) {
+export async function guardedLoginProfile(inputName, runLogin, options = {}) {
   return await withAuthSwitchLock(async () => {
     const stateBefore = await loadState();
     const previousActiveProfile = stateBefore.activeProfile;
@@ -72,7 +72,11 @@ export async function guardedLoginProfile(inputName, runLogin) {
     if (previousAuth) await writeFile(backupPath, previousAuth, { mode: 0o600 });
     try {
       const code = await runLogin();
-      const nextAuth = await readActiveAuthIfValid().catch(() => undefined);
+      const nextAuth = options.candidateAuthPath
+        ? await readFile(options.candidateAuthPath, "utf8").then((raw) =>
+          isValidCodexAuth(raw) ? raw : undefined
+        ).catch(() => undefined)
+        : await readActiveAuthIfValid().catch(() => undefined);
       if (code !== 0 || !nextAuth) {
         if (previousAuth) await restoreActiveAuth(previousAuth);
         await saveState(stateBefore);
@@ -83,6 +87,7 @@ export async function guardedLoginProfile(inputName, runLogin) {
         );
         return code === 0 ? 1 : code;
       }
+      if (options.candidateAuthPath) await restoreActiveAuth(nextAuth);
       const result = await saveCurrentProfileUnlocked(inputName);
       console.log(`Saved and activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
       return 0;
