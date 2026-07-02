@@ -10,6 +10,7 @@ import {
   logDir,
   recordProfileIneligible,
   recordProfileQuotaExhausted,
+  recordProfileQuotaAvailable,
   recordProfileRequest,
   runtimeDir,
 } from "./config.js";
@@ -23,6 +24,7 @@ import {
   isRequestEventLine,
   parseModelEventLine,
   parseQuotaEventLine,
+  parseUsageQuotaSnapshots,
   QuotaScope,
 } from "./quota.js";
 
@@ -103,6 +105,58 @@ async function triggerAutoSwitch(scope: QuotaScope): Promise<AutoSwitchAction | 
       }
     });
   });
+}
+
+async function readUsageProbe(realAgy: string): Promise<string | undefined> {
+  return await new Promise((resolvePromise) => {
+    const child = spawn(realAgy, ["-p", "/usage"], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        AGYX_USAGE_PROBE: "1",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (output?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(output?.trim() ? output : undefined);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish();
+    }, 20_000);
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk) => { stdout += chunk; });
+    child.stderr?.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", () => finish());
+    child.on("exit", () => finish(`${stdout}\n${stderr}`));
+  });
+}
+
+async function refreshUsageQuota(realAgy: string, profileName: string): Promise<QuotaScope[]> {
+  const output = await readUsageProbe(realAgy);
+  if (!output) return [];
+  const exhaustedScopes: QuotaScope[] = [];
+  for (const snapshot of parseUsageQuotaSnapshots(output)) {
+    if (snapshot.status === "available") {
+      await recordProfileQuotaAvailable(profileName, snapshot.scope);
+      continue;
+    }
+    exhaustedScopes.push(snapshot.scope);
+    await recordProfileQuotaExhausted(profileName, {
+      reason: snapshot.reason ?? "usage quota exhausted",
+      resetAt: snapshot.resetAt,
+      scope: snapshot.scope,
+      modelLabel: snapshot.modelLabel,
+    });
+  }
+  return exhaustedScopes;
 }
 
 export async function supervise(args: string[]): Promise<number> {
@@ -232,6 +286,18 @@ export async function supervise(args: string[]): Promise<number> {
     quotaMarkedScopes = new Set<QuotaScope>();
     currentModelLabel = undefined;
     currentQuotaScope = undefined;
+    if (profileAtStart) {
+      const usageProfile = profileAtStart;
+      const usageExhaustedScopes = await refreshUsageQuota(realAgy, usageProfile);
+      for (const scope of usageExhaustedScopes) {
+        quotaMarkedScopes.add(scope);
+        if (autoSwitchStoppedScopes.has(scope)) continue;
+        const action = await triggerAutoSwitch(scope);
+        if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
+      }
+      profileAtStart = (await loadState()).activeProfile;
+      if (profileAtStart !== usageProfile) quotaMarkedScopes = new Set<QuotaScope>();
+    }
     const state = await loadState();
     const launchArgs = buildAgyLaunchArgs(args, { conversationId, logPath, state });
     child = spawn(realAgy, launchArgs, {
