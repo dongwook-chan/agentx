@@ -161,12 +161,13 @@ impl Supervisor {
         }
     }
 
-    fn scan_log_events(&mut self) {
+    fn scan_log_events(&mut self) -> Vec<String> {
+        let mut auto_switch_scopes = Vec::new();
         let Some(profile_name) = self.profile_at_start.clone() else {
-            return;
+            return auto_switch_scopes;
         };
         let Ok(content) = fs::read_to_string(&self.log_path) else {
-            return;
+            return auto_switch_scopes;
         };
         if content.len() < self.log_offset {
             self.log_offset = 0;
@@ -210,20 +211,14 @@ impl Supervisor {
                     &scope,
                     self.current_model_label.as_deref(),
                 );
-                if let Some(action) = trigger_auto_switch(&scope) {
-                    if let Some(message) = action.get("message").and_then(Value::as_str) {
-                        eprintln!("{message}");
-                    }
-                    if action.get("kind").and_then(Value::as_str) == Some("stop_retrying") {
-                        self.auto_switch_stopped_scopes.insert(scope);
-                    }
-                }
+                auto_switch_scopes.push(scope);
             }
         }
 
         if model_changed {
             let _ = self.persist();
         }
+        auto_switch_scopes
     }
 }
 
@@ -293,8 +288,13 @@ fn run(args: Vec<String>) -> Result<i32, String> {
 
     loop {
         thread::sleep(StdDuration::from_millis(500));
+        let auto_switch_scopes = {
+            let mut guard = supervisor.lock().map_err(to_string)?;
+            guard.scan_log_events()
+        };
+        process_auto_switch_scopes(&supervisor, auto_switch_scopes)?;
+
         let mut guard = supervisor.lock().map_err(to_string)?;
-        guard.scan_log_events();
         let exited = match guard.child.as_mut() {
             Some(child) => child
                 .try_wait()
@@ -324,6 +324,27 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             }
         }
     }
+}
+
+fn process_auto_switch_scopes(
+    supervisor: &Arc<Mutex<Supervisor>>,
+    scopes: Vec<String>,
+) -> Result<(), String> {
+    for scope in scopes {
+        if let Some(action) = trigger_auto_switch(&scope) {
+            if let Some(message) = action.get("message").and_then(Value::as_str) {
+                eprintln!("{message}");
+            }
+            if action.get("kind").and_then(Value::as_str) == Some("stop_retrying") {
+                supervisor
+                    .lock()
+                    .map_err(to_string)?
+                    .auto_switch_stopped_scopes
+                    .insert(scope);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn start_socket_server(
