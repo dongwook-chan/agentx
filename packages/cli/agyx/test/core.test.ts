@@ -8,6 +8,7 @@ import {
   markProfileCredentialMismatch,
   markProfileIneligible,
   markProfileQuotaExhausted,
+  markProfileQuotaAvailable,
   markProfileRequest,
   profileNameFromEmail,
   uniqueProfileName,
@@ -21,7 +22,9 @@ import { buildProfileViews } from "../src/profile_view.js";
 import {
   parseModelEventLine,
   isRequestEventLine,
+  createUsageTranscriptState,
   parseQuotaEventLine,
+  parseUsageTranscriptLine,
 } from "../src/quota.js";
 import {
   effectiveProfileStatus,
@@ -476,6 +479,67 @@ test("parses quota reset hints from agy logs", () => {
     resetAt: "2026-06-26T01:30:10.000Z",
   });
   assert.equal(parseQuotaEventLine("normal log line"), undefined);
+});
+
+test("parses interactive usage transcript quota rows", () => {
+  const state = createUsageTranscriptState();
+  assert.equal(parseUsageTranscriptLine("└ Models & Quota", state), undefined);
+  assert.equal(parseUsageTranscriptLine("  Gemini 3.5 Flash (High)", state), undefined);
+  assert.deepEqual(parseUsageTranscriptLine("[████] 100.00%", state), {
+    status: "available",
+    scope: "gemini",
+    modelLabel: "Gemini 3.5 Flash (High)",
+    reason: undefined,
+    resetAt: undefined,
+  });
+  assert.deepEqual(parseUsageTranscriptLine("Quota available", state), {
+    status: "available",
+    scope: "gemini",
+    modelLabel: "Gemini 3.5 Flash (High)",
+    reason: undefined,
+    resetAt: undefined,
+  });
+
+  assert.equal(parseUsageTranscriptLine("  Claude Sonnet 4.6 (Thinking)", state), undefined);
+  assert.deepEqual(
+    parseUsageTranscriptLine("Quota exhausted. Will reset after 49h37m0s.", state, new Date("2026-06-26T00:00:00.000Z")),
+    {
+      status: "exhausted",
+      scope: "claude",
+      modelLabel: "Claude Sonnet 4.6 (Thinking)",
+      reason: "quota exhausted",
+      resetAt: "2026-06-28T01:37:00.000Z",
+    },
+  );
+});
+
+test("usage availability overrides stale unknown quota from logs", () => {
+  const now = new Date("2026-06-26T00:00:00.000Z");
+  const state: State = {
+    version: 1,
+    activeProfile: "a",
+    profiles: [
+      {
+        name: "a",
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        quotaStatus: "exhausted",
+        quotaResetAt: "2026-06-27T00:00:00.000Z",
+        quotaScopes: {
+          unknown: {
+            status: "exhausted",
+            resetAt: "2026-06-27T00:00:00.000Z",
+          },
+        },
+      },
+    ],
+  };
+
+  markProfileQuotaAvailable(state, "a", "gemini", now);
+
+  assert.equal(state.profiles[0]!.quotaScopes, undefined);
+  assert.equal(state.profiles[0]!.quotaStatus, "available");
+  assert.equal(effectiveProfileStatus(state.profiles[0]!, now, { quotaScopes: ["gemini"] }), "ready");
 });
 
 test("tracks provider-scoped quota only from model log context", () => {

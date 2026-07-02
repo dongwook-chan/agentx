@@ -12,6 +12,24 @@ export interface ModelEvent {
   scope: QuotaScope;
 }
 
+export interface UsageTranscriptEvent {
+  status: "available" | "exhausted";
+  scope: QuotaScope;
+  modelLabel?: string;
+  reason?: string;
+  resetAt?: string;
+}
+
+export interface UsageTranscriptState {
+  inUsageView: boolean;
+  modelLabel?: string;
+  scope?: QuotaScope;
+}
+
+export function createUsageTranscriptState(): UsageTranscriptState {
+  return { inUsageView: false };
+}
+
 export function isRequestEventLine(line: string): boolean {
   return /Sending user message to conversation [0-9a-f-]{36}/i.test(line);
 }
@@ -55,7 +73,9 @@ function parseDurationMs(value: string): number | undefined {
 }
 
 function parseResetAt(line: string, now: Date): string | undefined {
-  const resetIn = line.match(/resets?\s+in\s+([0-9a-zA-Z.\s]+)/i)?.[1];
+  const resetIn = line.match(
+    /(?:resets?|refresh(?:es)?|will\s+reset|will\s+refresh)\s+(?:in|after)\s+([0-9a-zA-Z.\s]+)/i,
+  )?.[1];
   const resetMs = resetIn ? parseDurationMs(resetIn) : undefined;
   if (resetMs !== undefined) return new Date(now.getTime() + resetMs).toISOString();
 
@@ -65,6 +85,103 @@ function parseResetAt(line: string, now: Date): string | undefined {
   }
 
   return undefined;
+}
+
+export function normalizeTerminalTranscript(input: string): string {
+  let output = input
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[=>()#][0-9A-Za-z]?/g, "")
+    .replace(/\r/g, "\n");
+
+  let normalized = "";
+  for (const char of output) {
+    if (char === "\b") {
+      normalized = normalized.slice(0, -1);
+      continue;
+    }
+    const code = char.charCodeAt(0);
+    if (char === "\n" || char === "\t" || code >= 32) normalized += char;
+  }
+  return normalized;
+}
+
+function parseUsageStatus(line: string): "available" | "exhausted" | undefined {
+  const lower = line.toLowerCase();
+  if (
+    lower.includes("exhausted")
+    || lower.includes("locked out")
+    || lower.includes("lockout")
+    || lower.includes("capacity reached")
+    || lower.includes("quota reached")
+    || lower.includes("limit reached")
+    || lower.includes("no quota")
+    || lower.includes("no remaining")
+  ) {
+    return "exhausted";
+  }
+  if (lower.includes("quota available") || lower === "available") return "available";
+
+  const percent = line.match(/(\d+(?:\.\d+)?)\s*%/)?.[1];
+  if (percent) {
+    const value = Number(percent);
+    if (Number.isFinite(value)) return value <= 0.5 ? "exhausted" : "available";
+  }
+
+  return undefined;
+}
+
+function usageModelLabel(line: string): string | undefined {
+  const cleaned = line
+    .replace(/[|#=]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return undefined;
+  return cleaned.length > 120 ? cleaned.slice(0, 120) : cleaned;
+}
+
+export function parseUsageTranscriptLine(
+  line: string,
+  state: UsageTranscriptState,
+  now = new Date(),
+): UsageTranscriptEvent | undefined {
+  const cleaned = normalizeTerminalTranscript(line).replace(/\s+/g, " ").trim();
+  if (!cleaned) return undefined;
+
+  if (/Models\s+&\s+Quota/i.test(cleaned)) {
+    state.inUsageView = true;
+    state.modelLabel = undefined;
+    state.scope = undefined;
+    return undefined;
+  }
+  if (!state.inUsageView) return undefined;
+  if (/^(?:esc\s+Close|Scroll|CLI program exited)/i.test(cleaned)) {
+    state.inUsageView = false;
+    state.modelLabel = undefined;
+    state.scope = undefined;
+    return undefined;
+  }
+
+  const lineScope = classifyModelScope(cleaned);
+  if (lineScope !== "unknown") {
+    state.modelLabel = usageModelLabel(cleaned);
+    state.scope = lineScope;
+    return undefined;
+  }
+
+  if (!state.scope) return undefined;
+
+  const quotaEvent = parseQuotaEventLine(cleaned, now);
+  const status = quotaEvent ? "exhausted" : parseUsageStatus(cleaned);
+  if (!status) return undefined;
+
+  return {
+    status,
+    scope: state.scope,
+    modelLabel: state.modelLabel,
+    reason: quotaEvent?.reason ?? (status === "exhausted" ? "usage quota exhausted" : undefined),
+    resetAt: quotaEvent?.resetAt ?? parseResetAt(cleaned, now),
+  };
 }
 
 export function parseQuotaEventLine(

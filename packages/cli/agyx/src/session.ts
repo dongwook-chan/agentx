@@ -1,6 +1,7 @@
 import { ChildProcess, spawn } from "node:child_process";
 import { createServer, Socket } from "node:net";
-import { chmod, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import {
@@ -9,6 +10,7 @@ import {
   loadState,
   logDir,
   recordProfileIneligible,
+  recordProfileQuotaAvailable,
   recordProfileQuotaExhausted,
   recordProfileRequest,
   runtimeDir,
@@ -21,8 +23,11 @@ import { buildAgyLaunchArgs } from "./launch_args.js";
 import { parseEligibilityEventLine } from "./eligibility.js";
 import {
   isRequestEventLine,
+  createUsageTranscriptState,
+  normalizeTerminalTranscript,
   parseModelEventLine,
   parseQuotaEventLine,
+  parseUsageTranscriptLine,
   QuotaScope,
 } from "./quota.js";
 
@@ -67,6 +72,11 @@ interface AutoSwitchAction {
   retryKey?: string;
 }
 
+interface LaunchCommand {
+  command: string;
+  args: string[];
+}
+
 async function triggerAutoSwitch(scope: QuotaScope): Promise<AutoSwitchAction | undefined> {
   const cliPath = process.argv[1];
   if (!cliPath) return undefined;
@@ -105,6 +115,41 @@ async function triggerAutoSwitch(scope: QuotaScope): Promise<AutoSwitchAction | 
   });
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function executable(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function findScriptExecutable(): Promise<string | undefined> {
+  for (const candidate of ["/usr/bin/script", "/bin/script"]) {
+    if (await executable(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+async function terminalTranscriptCommand(
+  realAgy: string,
+  launchArgs: string[],
+  terminalLogPath: string,
+): Promise<LaunchCommand | undefined> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return undefined;
+  const script = await findScriptExecutable();
+  if (!script) return undefined;
+  if (process.platform === "linux") {
+    const command = [realAgy, ...launchArgs].map(shellQuote).join(" ");
+    return { command: script, args: ["-q", "-f", "-c", command, terminalLogPath] };
+  }
+  return { command: script, args: ["-q", terminalLogPath, realAgy, ...launchArgs] };
+}
+
 export async function supervise(args: string[]): Promise<number> {
   if (!isRestartable(args)) {
     const realAgy = await findRealAgy();
@@ -122,6 +167,7 @@ export async function supervise(args: string[]): Promise<number> {
   const socketPath = join(runtimeDir, `${process.pid}.sock`);
   const recordPath = join(runtimeDir, `${id}.json`);
   const logPath = join(logDir, `session-${id}.log`);
+  const terminalLogPath = join(runtimeDir, `${id}.terminal.log`);
   const realAgy = await findRealAgy();
   const startedAt = new Date().toISOString();
   let child: ChildProcess | undefined;
@@ -130,6 +176,7 @@ export async function supervise(args: string[]): Promise<number> {
   let conversationId: string | undefined;
   let finalCode = 0;
   let logOffset = 0;
+  let terminalLogOffset = 0;
   let scanningLogEvents = false;
   let profileAtStart: string | undefined;
   let quotaMarkedScopes = new Set<QuotaScope>();
@@ -138,6 +185,7 @@ export async function supervise(args: string[]): Promise<number> {
   let persistCount = 0;
   let currentModelLabel: string | undefined;
   let currentQuotaScope: QuotaScope | undefined;
+  const usageTranscriptState = createUsageTranscriptState();
 
   const currentRecord = (): SessionRecord => ({
     id,
@@ -178,45 +226,79 @@ export async function supervise(args: string[]): Promise<number> {
     }
   };
 
+  const handleQuotaExhausted = async (
+    profileName: string,
+    event: { reason: string; resetAt?: string; scope: QuotaScope; modelLabel?: string },
+  ): Promise<void> => {
+    const scope = event.scope;
+    if (autoSwitchStoppedScopes.has(scope)) return;
+    if (quotaMarkedScopes.has(scope)) return;
+    quotaMarkedScopes.add(scope);
+    await recordProfileQuotaExhausted(profileName, event);
+    const action = await triggerAutoSwitch(scope);
+    if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
+  };
+
+  const scanAgyLogEvents = async (profileName: string): Promise<boolean> => {
+    const content = await readFile(logPath, "utf8");
+    if (content.length < logOffset) logOffset = 0;
+    const appended = content.slice(logOffset);
+    logOffset = content.length;
+    let modelChanged = false;
+    for (const line of appended.split(/\r?\n/)) {
+      const modelEvent = parseModelEventLine(line);
+      if (modelEvent) {
+        currentModelLabel = modelEvent.label;
+        currentQuotaScope = modelEvent.scope;
+        modelChanged = true;
+      }
+      if (isRequestEventLine(line)) {
+        await recordProfileRequest(profileName);
+      }
+      const eligibilityEvent = parseEligibilityEventLine(line);
+      if (eligibilityEvent) {
+        await recordProfileIneligible(profileName, eligibilityEvent);
+      }
+      const event = parseQuotaEventLine(line);
+      if (!event) continue;
+      await handleQuotaExhausted(profileName, {
+        ...event,
+        scope: currentQuotaScope ?? "unknown",
+        modelLabel: currentModelLabel,
+      });
+    }
+    return modelChanged;
+  };
+
+  const scanTerminalUsageEvents = async (profileName: string): Promise<void> => {
+    const content = await readFile(terminalLogPath, "utf8");
+    if (content.length < terminalLogOffset) terminalLogOffset = 0;
+    const appended = content.slice(terminalLogOffset);
+    terminalLogOffset = content.length;
+    for (const line of normalizeTerminalTranscript(appended).split(/\n/)) {
+      const event = parseUsageTranscriptLine(line, usageTranscriptState);
+      if (!event) continue;
+      if (event.status === "available") {
+        await recordProfileQuotaAvailable(profileName, event.scope);
+        continue;
+      }
+      await handleQuotaExhausted(profileName, {
+        reason: event.reason ?? "usage quota exhausted",
+        resetAt: event.resetAt,
+        scope: event.scope,
+        modelLabel: event.modelLabel,
+      });
+    }
+  };
+
   const scanLogEvents = async (): Promise<void> => {
     if (scanningLogEvents) return;
     scanningLogEvents = true;
     try {
       const profileName = profileAtStart;
       if (!profileName) return;
-      const content = await readFile(logPath, "utf8");
-      if (content.length < logOffset) logOffset = 0;
-      const appended = content.slice(logOffset);
-      logOffset = content.length;
-      let modelChanged = false;
-      for (const line of appended.split(/\r?\n/)) {
-        const modelEvent = parseModelEventLine(line);
-        if (modelEvent) {
-          currentModelLabel = modelEvent.label;
-          currentQuotaScope = modelEvent.scope;
-          modelChanged = true;
-        }
-        if (isRequestEventLine(line)) {
-          await recordProfileRequest(profileName);
-        }
-        const eligibilityEvent = parseEligibilityEventLine(line);
-        if (eligibilityEvent) {
-          await recordProfileIneligible(profileName, eligibilityEvent);
-        }
-        const event = parseQuotaEventLine(line);
-        if (!event) continue;
-        const scope = currentQuotaScope ?? "unknown";
-        if (autoSwitchStoppedScopes.has(scope)) continue;
-        if (quotaMarkedScopes.has(scope)) continue;
-        quotaMarkedScopes.add(scope);
-        await recordProfileQuotaExhausted(profileName, {
-          ...event,
-          scope,
-          modelLabel: currentModelLabel,
-        });
-        const action = await triggerAutoSwitch(scope);
-        if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
-      }
+      const modelChanged = await scanAgyLogEvents(profileName).catch(() => false);
+      await scanTerminalUsageEvents(profileName).catch(() => undefined);
       if (modelChanged) await persist();
     } catch {
       // The log or state file may not exist yet.
@@ -234,7 +316,11 @@ export async function supervise(args: string[]): Promise<number> {
     currentQuotaScope = undefined;
     const state = await loadState();
     const launchArgs = buildAgyLaunchArgs(args, { conversationId, logPath, state });
-    child = spawn(realAgy, launchArgs, {
+    await cleanupRuntimeFile(terminalLogPath);
+    terminalLogOffset = 0;
+    const launchCommand = await terminalTranscriptCommand(realAgy, launchArgs, terminalLogPath)
+      ?? { command: realAgy, args: launchArgs };
+    child = spawn(launchCommand.command, launchCommand.args, {
       cwd: process.cwd(),
       stdio: "inherit",
       env: {
@@ -335,6 +421,7 @@ export async function supervise(args: string[]): Promise<number> {
     if (quotaInterval) clearInterval(quotaInterval);
     await cleanupRuntimeFile(socketPath);
     await cleanupRuntimeFile(recordPath);
+    await cleanupRuntimeFile(terminalLogPath);
     server.close();
   };
 

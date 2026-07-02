@@ -45,6 +45,14 @@ struct SessionCommand {
     command: String,
 }
 
+struct UsageTranscriptEvent {
+    status: String,
+    scope: String,
+    model_label: Option<String>,
+    reason: Option<String>,
+    reset_at: Option<String>,
+}
+
 struct Supervisor {
     id: String,
     args: Vec<String>,
@@ -53,17 +61,22 @@ struct Supervisor {
     socket_path: PathBuf,
     record_path: PathBuf,
     log_path: PathBuf,
+    terminal_log_path: PathBuf,
     started_at: String,
     child: Option<Child>,
     paused: bool,
     intentional_stop: bool,
     conversation_id: Option<String>,
     log_offset: usize,
+    terminal_log_offset: usize,
     profile_at_start: Option<String>,
     quota_marked_scopes: HashSet<String>,
     auto_switch_stopped_scopes: HashSet<String>,
     current_model_label: Option<String>,
     current_quota_scope: Option<String>,
+    usage_in_view: bool,
+    usage_model_label: Option<String>,
+    usage_scope: Option<String>,
     persist_count: usize,
 }
 
@@ -109,12 +122,20 @@ impl Supervisor {
         self.quota_marked_scopes.clear();
         self.current_model_label = None;
         self.current_quota_scope = None;
+        self.usage_in_view = false;
+        self.usage_model_label = None;
+        self.usage_scope = None;
 
         let launch_args =
             supervisor_launch_args(&self.args, self.conversation_id.as_deref(), &self.log_path)?;
+        let _ = fs::remove_file(&self.terminal_log_path);
+        self.terminal_log_offset = 0;
+        let (program, argv) =
+            terminal_transcript_command(&self.real_agy, &launch_args, &self.terminal_log_path)
+                .unwrap_or_else(|| (self.real_agy.clone(), launch_args));
 
-        let child = Command::new(&self.real_agy)
-            .args(&launch_args)
+        let child = Command::new(program)
+            .args(argv)
             .current_dir(&self.cwd)
             .env("AGYX_MANAGED", "1")
             .env("AGYX_SESSION_ID", &self.id)
@@ -126,6 +147,32 @@ impl Supervisor {
         self.child = Some(child);
         self.persist()?;
         Ok(())
+    }
+
+    fn record_quota_exhausted_from_event(
+        &mut self,
+        profile_name: &str,
+        reason: &str,
+        reset_at: Option<&str>,
+        scope: &str,
+        model_label: Option<&str>,
+        auto_switch_scopes: &mut Vec<String>,
+    ) {
+        if self.auto_switch_stopped_scopes.contains(scope) {
+            return;
+        }
+        if self.quota_marked_scopes.contains(scope) {
+            return;
+        }
+        self.quota_marked_scopes.insert(scope.to_string());
+        let _ = record_profile_quota_exhausted(
+            profile_name,
+            reason,
+            reset_at,
+            scope,
+            model_label,
+        );
+        auto_switch_scopes.push(scope.to_string());
     }
 
     fn stop_child(&mut self) -> Result<(), String> {
@@ -197,28 +244,110 @@ impl Supervisor {
                     .current_quota_scope
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
-                if self.auto_switch_stopped_scopes.contains(&scope) {
-                    continue;
-                }
-                if self.quota_marked_scopes.contains(&scope) {
-                    continue;
-                }
-                self.quota_marked_scopes.insert(scope.clone());
-                let _ = record_profile_quota_exhausted(
+                let model_label = self.current_model_label.clone();
+                self.record_quota_exhausted_from_event(
                     &profile_name,
                     &reason,
                     reset_at.as_deref(),
                     &scope,
-                    self.current_model_label.as_deref(),
+                    model_label.as_deref(),
+                    &mut auto_switch_scopes,
                 );
-                auto_switch_scopes.push(scope);
             }
         }
+
+        self.scan_terminal_usage_events(&profile_name, &mut auto_switch_scopes);
 
         if model_changed {
             let _ = self.persist();
         }
         auto_switch_scopes
+    }
+
+    fn scan_terminal_usage_events(
+        &mut self,
+        profile_name: &str,
+        auto_switch_scopes: &mut Vec<String>,
+    ) {
+        let Ok(content) = fs::read_to_string(&self.terminal_log_path) else {
+            return;
+        };
+        if content.len() < self.terminal_log_offset {
+            self.terminal_log_offset = 0;
+        }
+        let appended = &content[self.terminal_log_offset..];
+        self.terminal_log_offset = content.len();
+        let normalized = normalize_terminal_transcript(appended);
+        for line in normalized.lines() {
+            let Some(event) = self.parse_usage_transcript_line(line) else {
+                continue;
+            };
+            if event.status == "available" {
+                let _ = record_profile_quota_available(profile_name, &event.scope);
+                continue;
+            }
+            self.record_quota_exhausted_from_event(
+                profile_name,
+                event.reason.as_deref().unwrap_or("usage quota exhausted"),
+                event.reset_at.as_deref(),
+                &event.scope,
+                event.model_label.as_deref(),
+                auto_switch_scopes,
+            );
+        }
+    }
+
+    fn parse_usage_transcript_line(&mut self, line: &str) -> Option<UsageTranscriptEvent> {
+        let cleaned = Regex::new(r"\s+")
+            .map(|pattern| pattern.replace_all(line.trim(), " ").to_string())
+            .unwrap_or_else(|_| line.trim().to_string());
+        if cleaned.is_empty() {
+            return None;
+        }
+        if regex_match(r"(?i)Models\s+&\s+Quota", &cleaned) {
+            self.usage_in_view = true;
+            self.usage_model_label = None;
+            self.usage_scope = None;
+            return None;
+        }
+        if !self.usage_in_view {
+            return None;
+        }
+        if regex_match(r"(?i)^(esc\s+Close|Scroll|CLI program exited)", &cleaned) {
+            self.usage_in_view = false;
+            self.usage_model_label = None;
+            self.usage_scope = None;
+            return None;
+        }
+
+        let line_scope = classify_model_scope(&cleaned);
+        if line_scope != "unknown" {
+            self.usage_model_label = usage_model_label(&cleaned);
+            self.usage_scope = Some(line_scope);
+            return None;
+        }
+
+        let scope = self.usage_scope.clone()?;
+        let quota_event = parse_quota_event_line(&cleaned);
+        let status = if quota_event.is_some() {
+            Some("exhausted".to_string())
+        } else {
+            parse_usage_status(&cleaned)
+        }?;
+        let reason = quota_event
+            .as_ref()
+            .map(|(reason, _)| reason.clone())
+            .or_else(|| (status == "exhausted").then(|| "usage quota exhausted".to_string()));
+        let reset_at = quota_event
+            .and_then(|(_, reset)| reset)
+            .or_else(|| parse_reset_at(&cleaned));
+        Some(UsageTranscriptEvent {
+            status,
+            scope,
+            model_label: self.usage_model_label.clone(),
+            reason,
+            reset_at,
+        })
     }
 }
 
@@ -253,6 +382,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     let socket_path = runtime.join(format!("{}.sock", std::process::id()));
     let record_path = runtime.join(format!("{id}.json"));
     let log_path = logs.join(format!("session-{id}.log"));
+    let terminal_log_path = runtime.join(format!("{id}.terminal.log"));
     let _ = fs::remove_file(&socket_path);
     let real_agy = find_real_agy()?;
     let cwd = env::current_dir()
@@ -268,23 +398,33 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         socket_path: socket_path.clone(),
         record_path: record_path.clone(),
         log_path,
+        terminal_log_path: terminal_log_path.clone(),
         started_at: now_iso(),
         child: None,
         paused: false,
         intentional_stop: false,
         conversation_id: None,
         log_offset: 0,
+        terminal_log_offset: 0,
         profile_at_start: None,
         quota_marked_scopes: HashSet::new(),
         auto_switch_stopped_scopes: HashSet::new(),
         current_model_label: None,
         current_quota_scope: None,
+        usage_in_view: false,
+        usage_model_label: None,
+        usage_scope: None,
         persist_count: 0,
     }));
 
     supervisor.lock().map_err(to_string)?.start_child()?;
     start_socket_server(supervisor.clone(), socket_path.clone())?;
-    start_signal_handler(supervisor.clone(), socket_path.clone(), record_path.clone())?;
+    start_signal_handler(
+        supervisor.clone(),
+        socket_path.clone(),
+        record_path.clone(),
+        terminal_log_path.clone(),
+    )?;
 
     loop {
         thread::sleep(StdDuration::from_millis(500));
@@ -307,12 +447,12 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             guard.child = None;
             let _ = guard.persist();
             if guard.intentional_stop || guard.paused {
-                cleanup_paths(&socket_path, &record_path);
+                cleanup_paths(&socket_path, &record_path, &terminal_log_path);
                 return Ok(code);
             }
             let is_abnormal = code != 0 || is_abnormal_exit_log(&guard.log_path);
             if !is_abnormal {
-                cleanup_paths(&socket_path, &record_path);
+                cleanup_paths(&socket_path, &record_path, &terminal_log_path);
                 return Ok(0);
             } else {
                 eprintln!(
@@ -385,11 +525,12 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
             guard.stop_child()?;
             let socket_path = guard.socket_path.clone();
             let record_path = guard.record_path.clone();
+            let terminal_log_path = guard.terminal_log_path.clone();
             let reply = json!({ "ok": true });
             let _ = stream.write_all(
                 format!("{}\n", serde_json::to_string(&reply).map_err(to_string)?).as_bytes(),
             );
-            cleanup_paths(&socket_path, &record_path);
+            cleanup_paths(&socket_path, &record_path, &terminal_log_path);
             std::process::exit(0);
         }
         _ => {
@@ -408,6 +549,7 @@ fn start_signal_handler(
     supervisor: Arc<Mutex<Supervisor>>,
     socket_path: PathBuf,
     record_path: PathBuf,
+    terminal_log_path: PathBuf,
 ) -> Result<(), String> {
     let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(to_string)?;
     thread::spawn(move || {
@@ -415,16 +557,17 @@ fn start_signal_handler(
             if let Ok(mut guard) = supervisor.lock() {
                 let _ = guard.stop_child();
             }
-            cleanup_paths(&socket_path, &record_path);
+            cleanup_paths(&socket_path, &record_path, &terminal_log_path);
             std::process::exit(if signal == SIGINT { 130 } else { 143 });
         }
     });
     Ok(())
 }
 
-fn cleanup_paths(socket_path: &Path, record_path: &Path) {
+fn cleanup_paths(socket_path: &Path, record_path: &Path, terminal_log_path: &Path) {
     let _ = fs::remove_file(socket_path);
     let _ = fs::remove_file(record_path);
+    let _ = fs::remove_file(terminal_log_path);
 }
 
 fn config_dir() -> PathBuf {
@@ -602,6 +745,43 @@ fn is_restartable(args: &[String]) -> bool {
         .any(|arg| arg == "-p" || arg == "--print" || arg == "--prompt")
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn terminal_transcript_command(
+    real_agy: &str,
+    launch_args: &[String],
+    terminal_log_path: &Path,
+) -> Option<(String, Vec<String>)> {
+    let script = ["/usr/bin/script", "/bin/script"]
+        .iter()
+        .find(|candidate| is_executable(Path::new(candidate)))?
+        .to_string();
+    let terminal_path = terminal_log_path.to_string_lossy().to_string();
+    if cfg!(target_os = "linux") {
+        let command = std::iter::once(real_agy.to_string())
+            .chain(launch_args.iter().cloned())
+            .map(|arg| shell_quote(&arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some((
+            script,
+            vec![
+                "-q".to_string(),
+                "-f".to_string(),
+                "-c".to_string(),
+                command,
+                terminal_path,
+            ],
+        ))
+    } else {
+        let mut args = vec!["-q".to_string(), terminal_path, real_agy.to_string()];
+        args.extend(launch_args.iter().cloned());
+        Some((script, args))
+    }
+}
+
 fn is_abnormal_exit_log(log_path: &Path) -> bool {
     if let Ok(content) = fs::read_to_string(log_path) {
         let keywords = [
@@ -720,8 +900,78 @@ fn parse_quota_event_line(line: &str) -> Option<(String, Option<String>)> {
     Some((reason.to_string(), parse_reset_at(line)))
 }
 
+fn normalize_terminal_transcript(input: &str) -> String {
+    let mut output = Regex::new(r"\x1b\][\s\S]*?(\x07|\x1b\\)")
+        .map(|pattern| pattern.replace_all(input, "").to_string())
+        .unwrap_or_else(|_| input.to_string());
+    output = Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]")
+        .map(|pattern| pattern.replace_all(&output, "").to_string())
+        .unwrap_or(output);
+    output = Regex::new(r"\x1b[=>()#][0-9A-Za-z]?")
+        .map(|pattern| pattern.replace_all(&output, "").to_string())
+        .unwrap_or(output);
+    output = output.replace('\r', "\n");
+
+    let mut normalized = String::new();
+    for ch in output.chars() {
+        if ch == '\u{8}' {
+            normalized.pop();
+            continue;
+        }
+        if ch == '\n' || ch == '\t' || !ch.is_control() {
+            normalized.push(ch);
+        }
+    }
+    normalized
+}
+
+fn parse_usage_status(line: &str) -> Option<String> {
+    let lower = line.to_lowercase();
+    if lower.contains("exhausted")
+        || lower.contains("locked out")
+        || lower.contains("lockout")
+        || lower.contains("capacity reached")
+        || lower.contains("quota reached")
+        || lower.contains("limit reached")
+        || lower.contains("no quota")
+        || lower.contains("no remaining")
+    {
+        return Some("exhausted".to_string());
+    }
+    if lower.contains("quota available") || lower == "available" {
+        return Some("available".to_string());
+    }
+
+    if let Ok(pattern) = Regex::new(r"(\d+(?:\.\d+)?)\s*%") {
+        if let Some(percent) = pattern.captures(line).and_then(|capture| capture.get(1)) {
+            if let Ok(value) = percent.as_str().parse::<f64>() {
+                return Some(if value <= 0.5 { "exhausted" } else { "available" }.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn usage_model_label(line: &str) -> Option<String> {
+    let cleaned = Regex::new(r"[|#=]+")
+        .map(|pattern| pattern.replace_all(line, " ").to_string())
+        .unwrap_or_else(|_| line.to_string());
+    let cleaned = Regex::new(r"\s+")
+        .map(|pattern| pattern.replace_all(cleaned.trim(), " ").to_string())
+        .unwrap_or_else(|_| cleaned.trim().to_string());
+    if cleaned.is_empty() {
+        None
+    } else if cleaned.len() > 120 {
+        Some(cleaned.chars().take(120).collect())
+    } else {
+        Some(cleaned)
+    }
+}
+
 fn parse_reset_at(line: &str) -> Option<String> {
-    if let Ok(pattern) = Regex::new(r"(?i)resets?\s+in\s+([0-9a-zA-Z.\s]+)") {
+    if let Ok(pattern) = Regex::new(
+        r"(?i)(?:resets?|refresh(?:es)?|will\s+reset|will\s+refresh)\s+(?:in|after)\s+([0-9a-zA-Z.\s]+)",
+    ) {
         if let Some(value) = pattern.captures(line).and_then(|capture| capture.get(1)) {
             if let Some(duration) = parse_duration(value.as_str()) {
                 return Some(
@@ -838,6 +1088,42 @@ fn record_profile_quota_exhausted(
             }
         }
         profile["updatedAt"] = Value::String(now_iso());
+    }
+    save_state(&state)
+}
+
+fn record_profile_quota_available(name: &str, scope: &str) -> Result<(), String> {
+    let mut state = load_state()?;
+    let now = now_iso();
+    if let Some(profile) = find_profile_mut(&mut state, name) {
+        if scope == "unknown" {
+            profile["quotaStatus"] = Value::String("available".to_string());
+            remove_key(profile, "quotaResetAt");
+            remove_key(profile, "lastQuotaReason");
+            if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut) {
+                scopes.remove("unknown");
+            }
+        } else if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut) {
+            scopes.remove(scope);
+            scopes.remove("unknown");
+        }
+
+        if profile
+            .get("quotaScopes")
+            .and_then(Value::as_object)
+            .map(|scopes| scopes.is_empty())
+            .unwrap_or(false)
+        {
+            remove_key(profile, "quotaScopes");
+        }
+        if profile.get("quotaScopes").is_none()
+            && profile.get("quotaStatus").and_then(Value::as_str) == Some("exhausted")
+        {
+            profile["quotaStatus"] = Value::String("available".to_string());
+            remove_key(profile, "quotaResetAt");
+            remove_key(profile, "lastQuotaReason");
+        }
+        profile["updatedAt"] = Value::String(now);
     }
     save_state(&state)
 }
