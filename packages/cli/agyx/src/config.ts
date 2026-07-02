@@ -237,36 +237,6 @@ export function markProfileQuotaExhausted(
   profile.updatedAt = nowString;
 }
 
-export function markProfileQuotaAvailable(
-  state: State,
-  name: string,
-  scope: QuotaScope,
-  now = new Date(),
-): void {
-  const profile = state.profiles.find((entry) =>
-    entry.name === name || entry.previousNames?.includes(name)
-  );
-  if (!profile) return;
-  if (scope === "unknown") {
-    profile.quotaStatus = "available";
-    profile.quotaResetAt = undefined;
-    profile.lastQuotaReason = undefined;
-    delete profile.quotaScopes?.unknown;
-  } else {
-    delete profile.quotaScopes?.[scope];
-    delete profile.quotaScopes?.unknown;
-  }
-  if (profile.quotaScopes && !Object.keys(profile.quotaScopes).length) {
-    delete profile.quotaScopes;
-  }
-  if (!profile.quotaScopes && profile.quotaStatus === "exhausted") {
-    profile.quotaStatus = "available";
-    profile.quotaResetAt = undefined;
-    profile.lastQuotaReason = undefined;
-  }
-  profile.updatedAt = now.toISOString();
-}
-
 export function clearExpiredScopedQuotas(
   profile: ProfileRecord,
   now = new Date(),
@@ -350,15 +320,6 @@ export async function recordProfileQuotaExhausted(
 ): Promise<void> {
   const state = await loadState();
   markProfileQuotaExhausted(state, name, event);
-  await saveState(state);
-}
-
-export async function recordProfileQuotaAvailable(
-  name: string,
-  scope: QuotaScope,
-): Promise<void> {
-  const state = await loadState();
-  markProfileQuotaAvailable(state, name, scope);
   await saveState(state);
 }
 

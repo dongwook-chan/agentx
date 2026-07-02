@@ -7,14 +7,6 @@ export interface QuotaEvent {
 
 export type QuotaScope = "claude" | "gemini" | "gpt-oss" | "unknown";
 
-export interface UsageQuotaSnapshot {
-  status: "available" | "exhausted";
-  scope: QuotaScope;
-  resetAt?: string;
-  modelLabel?: string;
-  reason?: string;
-}
-
 export interface ModelEvent {
   label: string;
   scope: QuotaScope;
@@ -63,9 +55,7 @@ function parseDurationMs(value: string): number | undefined {
 }
 
 function parseResetAt(line: string, now: Date): string | undefined {
-  const resetIn = line.match(
-    /(?:resets?|refresh(?:es)?|will\s+reset|will\s+refresh)\s+(?:in|after)\s+([0-9a-zA-Z.\s]+)/i,
-  )?.[1];
+  const resetIn = line.match(/resets?\s+in\s+([0-9a-zA-Z.\s]+)/i)?.[1];
   const resetMs = resetIn ? parseDurationMs(resetIn) : undefined;
   if (resetMs !== undefined) return new Date(now.getTime() + resetMs).toISOString();
 
@@ -75,100 +65,6 @@ function parseResetAt(line: string, now: Date): string | undefined {
   }
 
   return undefined;
-}
-
-function parseUsageStatus(line: string): "available" | "exhausted" | undefined {
-  const lower = line.toLowerCase();
-  if (
-    lower.includes("exhausted")
-    || lower.includes("locked out")
-    || lower.includes("lockout")
-    || lower.includes("capacity reached")
-    || lower.includes("quota reached")
-    || lower.includes("limit reached")
-    || lower.includes("no quota")
-    || lower.includes("no remaining")
-  ) {
-    return "exhausted";
-  }
-
-  const percent = line.match(/(\d+(?:\.\d+)?)\s*%/)?.[1];
-  if (percent) {
-    const value = Number(percent);
-    if (Number.isFinite(value)) {
-      if (/\b(remaining|available|left)\b/i.test(line)) {
-        if (value <= 0.5) return "exhausted";
-        return "available";
-      }
-      if (/\b(used|usage|consumed)\b/i.test(line)) {
-        if (value >= 99.5) return "exhausted";
-        return "available";
-      }
-      if (value >= 99.5) return "exhausted";
-      return "available";
-    }
-  }
-
-  if (
-    lower.includes("available")
-    || lower.includes("ready")
-    || lower.includes("remaining")
-    || lower.includes("left")
-  ) {
-    return "available";
-  }
-
-  return undefined;
-}
-
-function modelLabelFromUsageLine(line: string): string | undefined {
-  const cleaned = line
-    .replace(/\x1b\[[0-9;]*m/g, "")
-    .replace(/[|#=]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!cleaned) return undefined;
-  return cleaned.length > 120 ? cleaned.slice(0, 120) : cleaned;
-}
-
-export function parseUsageQuotaSnapshots(
-  output: string,
-  now = new Date(),
-): UsageQuotaSnapshot[] {
-  const snapshots = new Map<QuotaScope, UsageQuotaSnapshot>();
-  let currentScope: QuotaScope | undefined;
-  let currentModelLabel: string | undefined;
-
-  for (const rawLine of output.split(/\r?\n/)) {
-    const line = rawLine.replace(/\x1b\[[0-9;]*m/g, "").trim();
-    if (!line) continue;
-
-    const lineScope = classifyModelScope(line);
-    if (lineScope !== "unknown") {
-      currentScope = lineScope;
-      currentModelLabel = modelLabelFromUsageLine(line);
-    }
-
-    const event = parseQuotaEventLine(line, now);
-    const status = event ? "exhausted" : parseUsageStatus(line);
-    if (!status) continue;
-
-    const scope = lineScope !== "unknown" ? lineScope : currentScope;
-    if (!scope || scope === "unknown") continue;
-
-    const previous = snapshots.get(scope);
-    if (previous?.status === "exhausted") continue;
-
-    snapshots.set(scope, {
-      status,
-      scope,
-      resetAt: event?.resetAt ?? parseResetAt(line, now) ?? previous?.resetAt,
-      modelLabel: lineScope !== "unknown" ? modelLabelFromUsageLine(line) : currentModelLabel,
-      reason: event?.reason ?? (status === "exhausted" ? "usage quota exhausted" : undefined),
-    });
-  }
-
-  return [...snapshots.values()];
 }
 
 export function parseQuotaEventLine(

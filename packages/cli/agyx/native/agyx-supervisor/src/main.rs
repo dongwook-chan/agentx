@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize)]
 struct SessionRecord {
@@ -43,14 +43,6 @@ struct SessionRecord {
 #[derive(Debug, Deserialize)]
 struct SessionCommand {
     command: String,
-}
-
-struct UsageQuotaSnapshot {
-    status: String,
-    scope: String,
-    reset_at: Option<String>,
-    model_label: Option<String>,
-    reason: Option<String>,
 }
 
 struct Supervisor {
@@ -117,7 +109,6 @@ impl Supervisor {
         self.quota_marked_scopes.clear();
         self.current_model_label = None;
         self.current_quota_scope = None;
-        self.refresh_usage_quota();
 
         let launch_args =
             supervisor_launch_args(&self.args, self.conversation_id.as_deref(), &self.log_path)?;
@@ -135,50 +126,6 @@ impl Supervisor {
         self.child = Some(child);
         self.persist()?;
         Ok(())
-    }
-
-    fn refresh_usage_quota(&mut self) {
-        let Some(profile_name) = self.profile_at_start.clone() else {
-            return;
-        };
-        let Some(output) = read_usage_probe(&self.real_agy) else {
-            return;
-        };
-        for snapshot in parse_usage_quota_snapshots(&output) {
-            if snapshot.status == "available" {
-                let _ = record_profile_quota_available(&profile_name, &snapshot.scope);
-                continue;
-            }
-            let scope = snapshot.scope.clone();
-            let _ = record_profile_quota_exhausted(
-                &profile_name,
-                snapshot
-                    .reason
-                    .as_deref()
-                    .unwrap_or("usage quota exhausted"),
-                snapshot.reset_at.as_deref(),
-                &scope,
-                snapshot.model_label.as_deref(),
-            );
-            self.quota_marked_scopes.insert(scope.clone());
-            if self.auto_switch_stopped_scopes.contains(&scope) {
-                continue;
-            }
-            if let Some(action) = trigger_auto_switch(&scope) {
-                if let Some(message) = action.get("message").and_then(Value::as_str) {
-                    eprintln!("{message}");
-                }
-                if action.get("kind").and_then(Value::as_str) == Some("stop_retrying") {
-                    self.auto_switch_stopped_scopes.insert(scope);
-                }
-            }
-        }
-        if let Ok(active) = active_profile() {
-            if active != Some(profile_name) {
-                self.quota_marked_scopes.clear();
-            }
-            self.profile_at_start = active;
-        }
     }
 
     fn stop_child(&mut self) -> Result<(), String> {
@@ -675,184 +622,6 @@ fn is_abnormal_exit_log(log_path: &Path) -> bool {
     }
 }
 
-fn read_usage_probe(real_agy: &str) -> Option<String> {
-    let mut child = Command::new(real_agy)
-        .arg("-p")
-        .arg("/usage")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("AGYX_USAGE_PROBE", "1")
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + StdDuration::from_secs(20);
-    loop {
-        if child.try_wait().ok()?.is_some() {
-            let output = child.wait_with_output().ok()?;
-            let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-            text.push('\n');
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            return if text.trim().is_empty() {
-                None
-            } else {
-                Some(text)
-            };
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        thread::sleep(StdDuration::from_millis(100));
-    }
-}
-
-fn parse_usage_quota_snapshots(output: &str) -> Vec<UsageQuotaSnapshot> {
-    let mut snapshots: Vec<UsageQuotaSnapshot> = Vec::new();
-    let mut current_scope: Option<String> = None;
-    let mut current_model_label: Option<String> = None;
-
-    for raw_line in output.lines() {
-        let line = strip_ansi(raw_line).trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        let line_scope = classify_model_scope(&line);
-        if line_scope != "unknown" {
-            current_scope = Some(line_scope.clone());
-            current_model_label = model_label_from_usage_line(&line);
-        }
-
-        let quota_event = parse_quota_event_line(&line);
-        let status = if quota_event.is_some() {
-            Some("exhausted".to_string())
-        } else {
-            parse_usage_status(&line)
-        };
-        let Some(status) = status else {
-            continue;
-        };
-        let scope = if line_scope != "unknown" {
-            Some(line_scope)
-        } else {
-            current_scope.clone()
-        };
-        let Some(scope) = scope else {
-            continue;
-        };
-        if scope == "unknown" {
-            continue;
-        }
-        if snapshots
-            .iter()
-            .any(|snapshot| snapshot.scope == scope && snapshot.status == "exhausted")
-        {
-            continue;
-        }
-        let reset_at = quota_event
-            .as_ref()
-            .and_then(|(_, reset)| reset.clone())
-            .or_else(|| parse_reset_at(&line))
-            .or_else(|| {
-                snapshots
-                    .iter()
-                    .find(|snapshot| snapshot.scope == scope)
-                    .and_then(|snapshot| snapshot.reset_at.clone())
-            });
-        let reason = quota_event
-            .map(|(reason, _)| reason)
-            .or_else(|| (status == "exhausted").then(|| "usage quota exhausted".to_string()));
-        if let Some(index) = snapshots.iter().position(|snapshot| snapshot.scope == scope) {
-            snapshots[index] = UsageQuotaSnapshot {
-                status,
-                scope,
-                reset_at,
-                model_label: if classify_model_scope(&line) != "unknown" {
-                    model_label_from_usage_line(&line)
-                } else {
-                    current_model_label.clone()
-                },
-                reason,
-            };
-        } else {
-            snapshots.push(UsageQuotaSnapshot {
-                status,
-                scope,
-                reset_at,
-                model_label: if classify_model_scope(&line) != "unknown" {
-                    model_label_from_usage_line(&line)
-                } else {
-                    current_model_label.clone()
-                },
-                reason,
-            });
-        }
-    }
-
-    snapshots
-}
-
-fn parse_usage_status(line: &str) -> Option<String> {
-    let lower = line.to_lowercase();
-    if lower.contains("exhausted")
-        || lower.contains("locked out")
-        || lower.contains("lockout")
-        || lower.contains("capacity reached")
-        || lower.contains("quota reached")
-        || lower.contains("limit reached")
-        || lower.contains("no quota")
-        || lower.contains("no remaining")
-    {
-        return Some("exhausted".to_string());
-    }
-
-    if let Ok(pattern) = Regex::new(r"(\d+(?:\.\d+)?)\s*%") {
-        if let Some(percent) = pattern.captures(line).and_then(|capture| capture.get(1)) {
-            if let Ok(value) = percent.as_str().parse::<f64>() {
-                if regex_match(r"(?i)\b(remaining|available|left)\b", line) {
-                    return Some(if value <= 0.5 { "exhausted" } else { "available" }.to_string());
-                }
-                if regex_match(r"(?i)\b(used|usage|consumed)\b", line) {
-                    return Some(if value >= 99.5 { "exhausted" } else { "available" }.to_string());
-                }
-                return Some(if value >= 99.5 { "exhausted" } else { "available" }.to_string());
-            }
-        }
-    }
-
-    if lower.contains("available")
-        || lower.contains("ready")
-        || lower.contains("remaining")
-        || lower.contains("left")
-    {
-        return Some("available".to_string());
-    }
-
-    None
-}
-
-fn strip_ansi(value: &str) -> String {
-    Regex::new(r"\x1b\[[0-9;]*m")
-        .map(|pattern| pattern.replace_all(value, "").to_string())
-        .unwrap_or_else(|_| value.to_string())
-}
-
-fn model_label_from_usage_line(line: &str) -> Option<String> {
-    let cleaned = Regex::new(r"[|#=]+")
-        .map(|pattern| pattern.replace_all(line, " ").to_string())
-        .unwrap_or_else(|_| line.to_string());
-    let cleaned = Regex::new(r"\s+")
-        .map(|pattern| pattern.replace_all(cleaned.trim(), " ").to_string())
-        .unwrap_or_else(|_| cleaned.trim().to_string());
-    if cleaned.is_empty() {
-        None
-    } else if cleaned.len() > 120 {
-        Some(cleaned.chars().take(120).collect())
-    } else {
-        Some(cleaned)
-    }
-}
-
 fn detect_conversation(content: &str) -> Option<String> {
     let pattern = Regex::new(
         r"(?i)(?:Created conversation|GetConversationDetail: found conversation|Conversation using ID:) ([0-9a-f-]{36})",
@@ -952,9 +721,7 @@ fn parse_quota_event_line(line: &str) -> Option<(String, Option<String>)> {
 }
 
 fn parse_reset_at(line: &str) -> Option<String> {
-    if let Ok(pattern) = Regex::new(
-        r"(?i)(?:resets?|refresh(?:es)?|will\s+reset|will\s+refresh)\s+(?:in|after)\s+([0-9a-zA-Z.\s]+)",
-    ) {
+    if let Ok(pattern) = Regex::new(r"(?i)resets?\s+in\s+([0-9a-zA-Z.\s]+)") {
         if let Some(value) = pattern.captures(line).and_then(|capture| capture.get(1)) {
             if let Some(duration) = parse_duration(value.as_str()) {
                 return Some(
@@ -1071,42 +838,6 @@ fn record_profile_quota_exhausted(
             }
         }
         profile["updatedAt"] = Value::String(now_iso());
-    }
-    save_state(&state)
-}
-
-fn record_profile_quota_available(name: &str, scope: &str) -> Result<(), String> {
-    let mut state = load_state()?;
-    let now = now_iso();
-    if let Some(profile) = find_profile_mut(&mut state, name) {
-        if scope == "unknown" {
-            profile["quotaStatus"] = Value::String("available".to_string());
-            remove_key(profile, "quotaResetAt");
-            remove_key(profile, "lastQuotaReason");
-            if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut) {
-                scopes.remove("unknown");
-            }
-        } else if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut) {
-            scopes.remove(scope);
-            scopes.remove("unknown");
-        }
-
-        if profile
-            .get("quotaScopes")
-            .and_then(Value::as_object)
-            .map(|scopes| scopes.is_empty())
-            .unwrap_or(false)
-        {
-            remove_key(profile, "quotaScopes");
-        }
-        if profile.get("quotaScopes").is_none()
-            && profile.get("quotaStatus").and_then(Value::as_str) == Some("exhausted")
-        {
-            profile["quotaStatus"] = Value::String("available".to_string());
-            remove_key(profile, "quotaResetAt");
-            remove_key(profile, "lastQuotaReason");
-        }
-        profile["updatedAt"] = Value::String(now);
     }
     save_state(&state)
 }
