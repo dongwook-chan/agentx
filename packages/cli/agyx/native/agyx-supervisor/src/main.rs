@@ -45,14 +45,6 @@ struct SessionCommand {
     command: String,
 }
 
-struct UsageTranscriptEvent {
-    status: String,
-    scope: String,
-    model_label: Option<String>,
-    reason: Option<String>,
-    reset_at: Option<String>,
-}
-
 struct Supervisor {
     id: String,
     args: Vec<String>,
@@ -68,15 +60,11 @@ struct Supervisor {
     intentional_stop: bool,
     conversation_id: Option<String>,
     log_offset: usize,
-    terminal_log_offset: usize,
     profile_at_start: Option<String>,
     quota_marked_scopes: HashSet<String>,
     auto_switch_stopped_scopes: HashSet<String>,
     current_model_label: Option<String>,
     current_quota_scope: Option<String>,
-    usage_in_view: bool,
-    usage_model_label: Option<String>,
-    usage_scope: Option<String>,
     persist_count: usize,
 }
 
@@ -122,20 +110,13 @@ impl Supervisor {
         self.quota_marked_scopes.clear();
         self.current_model_label = None;
         self.current_quota_scope = None;
-        self.usage_in_view = false;
-        self.usage_model_label = None;
-        self.usage_scope = None;
+
+        self.run_usage_probe_sweep();
 
         let launch_args =
             supervisor_launch_args(&self.args, self.conversation_id.as_deref(), &self.log_path)?;
-        let _ = fs::remove_file(&self.terminal_log_path);
-        self.terminal_log_offset = 0;
-        let (program, argv) =
-            terminal_transcript_command(&self.real_agy, &launch_args, &self.terminal_log_path)
-                .unwrap_or_else(|| (self.real_agy.clone(), launch_args));
-
-        let child = Command::new(program)
-            .args(argv)
+        let child = Command::new(&self.real_agy)
+            .args(launch_args)
             .current_dir(&self.cwd)
             .env("AGYX_MANAGED", "1")
             .env("AGYX_SESSION_ID", &self.id)
@@ -147,6 +128,39 @@ impl Supervisor {
         self.child = Some(child);
         self.persist()?;
         Ok(())
+    }
+
+    fn run_usage_probe_sweep(&mut self) {
+        for _ in 0..5 {
+            let Some(profile_name) = self.profile_at_start.clone() else {
+                return;
+            };
+            let scopes = usage_probe(&profile_name, &self.real_agy, &self.cwd);
+            let had_exhausted_scope = !scopes.is_empty();
+            for scope in scopes {
+                if self.auto_switch_stopped_scopes.contains(&scope) {
+                    continue;
+                }
+                if self.quota_marked_scopes.contains(&scope) {
+                    continue;
+                }
+                self.quota_marked_scopes.insert(scope.clone());
+                if let Some(action) = trigger_auto_switch(&scope) {
+                    if let Some(message) = action.get("message").and_then(Value::as_str) {
+                        eprintln!("{message}");
+                    }
+                    if action.get("kind").and_then(Value::as_str) == Some("stop_retrying") {
+                        self.auto_switch_stopped_scopes.insert(scope);
+                    }
+                }
+            }
+            let active = active_profile().ok().flatten();
+            self.profile_at_start = active.clone();
+            if !had_exhausted_scope || active.as_deref() == Some(profile_name.as_str()) {
+                return;
+            }
+            self.quota_marked_scopes.clear();
+        }
     }
 
     fn record_quota_exhausted_from_event(
@@ -256,99 +270,12 @@ impl Supervisor {
             }
         }
 
-        self.scan_terminal_usage_events(&profile_name, &mut auto_switch_scopes);
-
         if model_changed {
             let _ = self.persist();
         }
         auto_switch_scopes
     }
 
-    fn scan_terminal_usage_events(
-        &mut self,
-        profile_name: &str,
-        auto_switch_scopes: &mut Vec<String>,
-    ) {
-        let Ok(content) = fs::read_to_string(&self.terminal_log_path) else {
-            return;
-        };
-        if content.len() < self.terminal_log_offset {
-            self.terminal_log_offset = 0;
-        }
-        let appended = &content[self.terminal_log_offset..];
-        self.terminal_log_offset = content.len();
-        let normalized = normalize_terminal_transcript(appended);
-        for line in normalized.lines() {
-            let Some(event) = self.parse_usage_transcript_line(line) else {
-                continue;
-            };
-            if event.status == "available" {
-                let _ = record_profile_quota_available(profile_name, &event.scope);
-                continue;
-            }
-            self.record_quota_exhausted_from_event(
-                profile_name,
-                event.reason.as_deref().unwrap_or("usage quota exhausted"),
-                event.reset_at.as_deref(),
-                &event.scope,
-                event.model_label.as_deref(),
-                auto_switch_scopes,
-            );
-        }
-    }
-
-    fn parse_usage_transcript_line(&mut self, line: &str) -> Option<UsageTranscriptEvent> {
-        let cleaned = Regex::new(r"\s+")
-            .map(|pattern| pattern.replace_all(line.trim(), " ").to_string())
-            .unwrap_or_else(|_| line.trim().to_string());
-        if cleaned.is_empty() {
-            return None;
-        }
-        if regex_match(r"(?i)Models\s+&\s+Quota", &cleaned) {
-            self.usage_in_view = true;
-            self.usage_model_label = None;
-            self.usage_scope = None;
-            return None;
-        }
-        if !self.usage_in_view {
-            return None;
-        }
-        if regex_match(r"(?i)^(esc\s+Close|Scroll|CLI program exited)", &cleaned) {
-            self.usage_in_view = false;
-            self.usage_model_label = None;
-            self.usage_scope = None;
-            return None;
-        }
-
-        let line_scope = classify_model_scope(&cleaned);
-        if line_scope != "unknown" {
-            self.usage_model_label = usage_model_label(&cleaned);
-            self.usage_scope = Some(line_scope);
-            return None;
-        }
-
-        let scope = self.usage_scope.clone()?;
-        let quota_event = parse_quota_event_line(&cleaned);
-        let status = if quota_event.is_some() {
-            Some("exhausted".to_string())
-        } else {
-            parse_usage_status(&cleaned)
-        }?;
-        let reason = quota_event
-            .as_ref()
-            .map(|(reason, _)| reason.clone())
-            .or_else(|| (status == "exhausted").then(|| "usage quota exhausted".to_string()));
-        let reset_at = quota_event
-            .and_then(|(_, reset)| reset)
-            .or_else(|| parse_reset_at(&cleaned));
-        Some(UsageTranscriptEvent {
-            status,
-            scope,
-            model_label: self.usage_model_label.clone(),
-            reason,
-            reset_at,
-        })
-    }
 }
 
 fn main() {
@@ -405,15 +332,11 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         intentional_stop: false,
         conversation_id: None,
         log_offset: 0,
-        terminal_log_offset: 0,
         profile_at_start: None,
         quota_marked_scopes: HashSet::new(),
         auto_switch_stopped_scopes: HashSet::new(),
         current_model_label: None,
         current_quota_scope: None,
-        usage_in_view: false,
-        usage_model_label: None,
-        usage_scope: None,
         persist_count: 0,
     }));
 
@@ -691,6 +614,55 @@ fn supervisor_launch_args(
         .collect())
 }
 
+fn usage_probe(profile_name: &str, real_agy: &str, cwd: &str) -> Vec<String> {
+    let payload = json!({
+        "profileName": profile_name,
+        "realAgy": real_agy,
+        "cwd": cwd,
+    });
+    let Ok(payload) = serde_json::to_string(&payload) else {
+        return Vec::new();
+    };
+    let output = if let Ok(cli_path) = env::var("AGYX_CLI_PATH") {
+        let node_path = env::var("AGYX_NODE_PATH").unwrap_or_else(|_| "node".to_string());
+        Command::new(node_path)
+            .arg(cli_path)
+            .arg("_usage-probe")
+            .arg(payload)
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+    } else {
+        Command::new("agyx")
+            .arg("_usage-probe")
+            .arg(payload)
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+    };
+    let Some(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) else {
+        return Vec::new();
+    };
+    value
+        .get("exhaustedScopes")
+        .and_then(Value::as_array)
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn find_real_agy() -> Result<String, String> {
     if let Ok(path) = env::var("AGYX_REAL_AGY") {
         if is_executable(Path::new(&path)) {
@@ -743,43 +715,6 @@ fn is_restartable(args: &[String]) -> bool {
     !args
         .iter()
         .any(|arg| arg == "-p" || arg == "--print" || arg == "--prompt")
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn terminal_transcript_command(
-    real_agy: &str,
-    launch_args: &[String],
-    terminal_log_path: &Path,
-) -> Option<(String, Vec<String>)> {
-    let script = ["/usr/bin/script", "/bin/script"]
-        .iter()
-        .find(|candidate| is_executable(Path::new(candidate)))?
-        .to_string();
-    let terminal_path = terminal_log_path.to_string_lossy().to_string();
-    if cfg!(target_os = "linux") {
-        let command = std::iter::once(real_agy.to_string())
-            .chain(launch_args.iter().cloned())
-            .map(|arg| shell_quote(&arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        Some((
-            script,
-            vec![
-                "-q".to_string(),
-                "-f".to_string(),
-                "-c".to_string(),
-                command,
-                terminal_path,
-            ],
-        ))
-    } else {
-        let mut args = vec!["-q".to_string(), terminal_path, real_agy.to_string()];
-        args.extend(launch_args.iter().cloned());
-        Some((script, args))
-    }
 }
 
 fn is_abnormal_exit_log(log_path: &Path) -> bool {
@@ -898,74 +833,6 @@ fn parse_quota_event_line(line: &str) -> Option<(String, Option<String>)> {
         "quota exhausted"
     };
     Some((reason.to_string(), parse_reset_at(line)))
-}
-
-fn normalize_terminal_transcript(input: &str) -> String {
-    let mut output = Regex::new(r"\x1b\][\s\S]*?(\x07|\x1b\\)")
-        .map(|pattern| pattern.replace_all(input, "").to_string())
-        .unwrap_or_else(|_| input.to_string());
-    output = Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]")
-        .map(|pattern| pattern.replace_all(&output, "").to_string())
-        .unwrap_or(output);
-    output = Regex::new(r"\x1b[=>()#][0-9A-Za-z]?")
-        .map(|pattern| pattern.replace_all(&output, "").to_string())
-        .unwrap_or(output);
-    output = output.replace('\r', "\n");
-
-    let mut normalized = String::new();
-    for ch in output.chars() {
-        if ch == '\u{8}' {
-            normalized.pop();
-            continue;
-        }
-        if ch == '\n' || ch == '\t' || !ch.is_control() {
-            normalized.push(ch);
-        }
-    }
-    normalized
-}
-
-fn parse_usage_status(line: &str) -> Option<String> {
-    let lower = line.to_lowercase();
-    if lower.contains("exhausted")
-        || lower.contains("locked out")
-        || lower.contains("lockout")
-        || lower.contains("capacity reached")
-        || lower.contains("quota reached")
-        || lower.contains("limit reached")
-        || lower.contains("no quota")
-        || lower.contains("no remaining")
-    {
-        return Some("exhausted".to_string());
-    }
-    if lower.contains("quota available") || lower == "available" {
-        return Some("available".to_string());
-    }
-
-    if let Ok(pattern) = Regex::new(r"(\d+(?:\.\d+)?)\s*%") {
-        if let Some(percent) = pattern.captures(line).and_then(|capture| capture.get(1)) {
-            if let Ok(value) = percent.as_str().parse::<f64>() {
-                return Some(if value <= 0.5 { "exhausted" } else { "available" }.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn usage_model_label(line: &str) -> Option<String> {
-    let cleaned = Regex::new(r"[|#=]+")
-        .map(|pattern| pattern.replace_all(line, " ").to_string())
-        .unwrap_or_else(|_| line.to_string());
-    let cleaned = Regex::new(r"\s+")
-        .map(|pattern| pattern.replace_all(cleaned.trim(), " ").to_string())
-        .unwrap_or_else(|_| cleaned.trim().to_string());
-    if cleaned.is_empty() {
-        None
-    } else if cleaned.len() > 120 {
-        Some(cleaned.chars().take(120).collect())
-    } else {
-        Some(cleaned)
-    }
 }
 
 fn parse_reset_at(line: &str) -> Option<String> {
@@ -1088,42 +955,6 @@ fn record_profile_quota_exhausted(
             }
         }
         profile["updatedAt"] = Value::String(now_iso());
-    }
-    save_state(&state)
-}
-
-fn record_profile_quota_available(name: &str, scope: &str) -> Result<(), String> {
-    let mut state = load_state()?;
-    let now = now_iso();
-    if let Some(profile) = find_profile_mut(&mut state, name) {
-        if scope == "unknown" {
-            profile["quotaStatus"] = Value::String("available".to_string());
-            remove_key(profile, "quotaResetAt");
-            remove_key(profile, "lastQuotaReason");
-            if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut) {
-                scopes.remove("unknown");
-            }
-        } else if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut) {
-            scopes.remove(scope);
-            scopes.remove("unknown");
-        }
-
-        if profile
-            .get("quotaScopes")
-            .and_then(Value::as_object)
-            .map(|scopes| scopes.is_empty())
-            .unwrap_or(false)
-        {
-            remove_key(profile, "quotaScopes");
-        }
-        if profile.get("quotaScopes").is_none()
-            && profile.get("quotaStatus").and_then(Value::as_str) == Some("exhausted")
-        {
-            profile["quotaStatus"] = Value::String("available".to_string());
-            remove_key(profile, "quotaResetAt");
-            remove_key(profile, "lastQuotaReason");
-        }
-        profile["updatedAt"] = Value::String(now);
     }
     save_state(&state)
 }

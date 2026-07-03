@@ -24,6 +24,7 @@ import {
   isRequestEventLine,
   createUsageTranscriptState,
   parseQuotaEventLine,
+  parseUsageTranscriptAggregates,
   parseUsageTranscriptLine,
 } from "../src/quota.js";
 import {
@@ -511,6 +512,37 @@ test("parses interactive usage transcript quota rows", () => {
       resetAt: "2026-06-28T01:37:00.000Z",
     },
   );
+});
+
+test("aggregates usage transcript quota rows by provider scope", () => {
+  const aggregates = parseUsageTranscriptAggregates(`
+└ Models & Quota
+  Gemini 3.5 Flash (Medium)
+Quota exhausted. Will reset after 5h0m0s.
+  Gemini 3.5 Pro (High)
+Quota exhausted. Will reset after 2h0m0s.
+  Claude Sonnet 4.6 (Thinking)
+Quota exhausted. Will reset after 3h0m0s.
+  Claude Opus 4.1
+Quota available
+`, new Date("2026-06-26T00:00:00.000Z"));
+
+  assert.deepEqual(aggregates, [
+    {
+      status: "exhausted",
+      scope: "gemini",
+      resetAt: "2026-06-26T02:00:00.000Z",
+      reason: "quota exhausted",
+      modelLabel: "Gemini 3.5 Pro (High)",
+    },
+    {
+      status: "exhausted",
+      scope: "claude",
+      resetAt: "2026-06-26T03:00:00.000Z",
+      reason: "quota exhausted",
+      modelLabel: "Claude Sonnet 4.6 (Thinking)",
+    },
+  ]);
 });
 
 test("usage availability overrides stale unknown quota from logs", () => {

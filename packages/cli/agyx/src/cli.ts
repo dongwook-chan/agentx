@@ -39,6 +39,7 @@ import {
 } from "./config.js";
 import { QuotaScope } from "./quota.js";
 import { supervise } from "./session.js";
+import { runUsageProbe } from "./usage_probe.js";
 import {
   confirmAction,
   decideProfileUse,
@@ -801,6 +802,15 @@ async function main(): Promise<number> {
           state: await loadState(),
         }),
       }));
+      return 0;
+    }
+    case "_usage-probe": {
+      const payload = JSON.parse(args[0] ?? "{}") as {
+        profileName?: string;
+        realAgy?: string;
+        cwd?: string;
+      };
+      console.log(JSON.stringify(await runUsageProbe(payload)));
       return 0;
     }
     default:

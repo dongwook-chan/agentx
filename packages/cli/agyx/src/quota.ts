@@ -20,6 +20,14 @@ export interface UsageTranscriptEvent {
   resetAt?: string;
 }
 
+export interface UsageScopeAggregate {
+  status: "available" | "exhausted";
+  scope: QuotaScope;
+  resetAt?: string;
+  reason?: string;
+  modelLabel?: string;
+}
+
 export interface UsageTranscriptState {
   inUsageView: boolean;
   modelLabel?: string;
@@ -182,6 +190,52 @@ export function parseUsageTranscriptLine(
     reason: quotaEvent?.reason ?? (status === "exhausted" ? "usage quota exhausted" : undefined),
     resetAt: quotaEvent?.resetAt ?? parseResetAt(cleaned, now),
   };
+}
+
+function isEarlierReset(next: string | undefined, current: string | undefined): boolean {
+  if (!next) return !current;
+  if (!current) return true;
+  const nextTime = Date.parse(next);
+  const currentTime = Date.parse(current);
+  if (!Number.isFinite(nextTime)) return false;
+  if (!Number.isFinite(currentTime)) return true;
+  return nextTime < currentTime;
+}
+
+export function parseUsageTranscriptAggregates(
+  transcript: string,
+  now = new Date(),
+  state = createUsageTranscriptState(),
+): UsageScopeAggregate[] {
+  const aggregates = new Map<QuotaScope, UsageScopeAggregate>();
+  for (const line of normalizeTerminalTranscript(transcript).split(/\n/)) {
+    const event = parseUsageTranscriptLine(line, state, now);
+    if (!event) continue;
+
+    const current = aggregates.get(event.scope);
+    if (event.status === "available") {
+      if (!current) {
+        aggregates.set(event.scope, { status: "available", scope: event.scope });
+      }
+      continue;
+    }
+
+    const next: UsageScopeAggregate = {
+      status: "exhausted",
+      scope: event.scope,
+      resetAt: event.resetAt,
+      reason: event.reason ?? "usage quota exhausted",
+      modelLabel: event.modelLabel,
+    };
+    if (
+      !current
+      || current.status === "available"
+      || isEarlierReset(next.resetAt, current.resetAt)
+    ) {
+      aggregates.set(event.scope, next);
+    }
+  }
+  return [...aggregates.values()];
 }
 
 export function parseQuotaEventLine(

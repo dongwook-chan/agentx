@@ -24,12 +24,12 @@ import { parseEligibilityEventLine } from "./eligibility.js";
 import {
   isRequestEventLine,
   createUsageTranscriptState,
-  normalizeTerminalTranscript,
   parseModelEventLine,
   parseQuotaEventLine,
-  parseUsageTranscriptLine,
+  parseUsageTranscriptAggregates,
   QuotaScope,
 } from "./quota.js";
+import { runUsageProbe } from "./usage_probe.js";
 
 export interface SessionRecord {
   id: string;
@@ -275,19 +275,26 @@ export async function supervise(args: string[]): Promise<number> {
     if (content.length < terminalLogOffset) terminalLogOffset = 0;
     const appended = content.slice(terminalLogOffset);
     terminalLogOffset = content.length;
-    for (const line of normalizeTerminalTranscript(appended).split(/\n/)) {
-      const event = parseUsageTranscriptLine(line, usageTranscriptState);
-      if (!event) continue;
-      if (event.status === "available") {
-        await recordProfileQuotaAvailable(profileName, event.scope);
+    for (const aggregate of parseUsageTranscriptAggregates(
+      appended,
+      new Date(),
+      usageTranscriptState,
+    )) {
+      if (aggregate.status === "available") {
+        await recordProfileQuotaAvailable(profileName, aggregate.scope);
         continue;
       }
-      await handleQuotaExhausted(profileName, {
-        reason: event.reason ?? "usage quota exhausted",
-        resetAt: event.resetAt,
-        scope: event.scope,
-        modelLabel: event.modelLabel,
+      await recordProfileQuotaExhausted(profileName, {
+        reason: aggregate.reason ?? "usage quota exhausted",
+        resetAt: aggregate.resetAt,
+        scope: aggregate.scope,
+        modelLabel: aggregate.modelLabel,
       });
+      if (autoSwitchStoppedScopes.has(aggregate.scope)) continue;
+      if (quotaMarkedScopes.has(aggregate.scope)) continue;
+      quotaMarkedScopes.add(aggregate.scope);
+      const action = await triggerAutoSwitch(aggregate.scope);
+      if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(aggregate.scope);
     }
   };
 
@@ -314,6 +321,22 @@ export async function supervise(args: string[]): Promise<number> {
     quotaMarkedScopes = new Set<QuotaScope>();
     currentModelLabel = undefined;
     currentQuotaScope = undefined;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const profileName = profileAtStart;
+      if (!profileName) break;
+      const usageProbe = await runUsageProbe({ profileName, realAgy, cwd: process.cwd() });
+      for (const scope of usageProbe.exhaustedScopes) {
+        if (autoSwitchStoppedScopes.has(scope)) continue;
+        if (quotaMarkedScopes.has(scope)) continue;
+        quotaMarkedScopes.add(scope);
+        const action = await triggerAutoSwitch(scope);
+        if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
+      }
+      const activeProfile = (await loadState()).activeProfile;
+      if (!usageProbe.exhaustedScopes.length || activeProfile === profileName) break;
+      profileAtStart = activeProfile;
+      quotaMarkedScopes = new Set<QuotaScope>();
+    }
     const state = await loadState();
     const launchArgs = buildAgyLaunchArgs(args, { conversationId, logPath, state });
     await cleanupRuntimeFile(terminalLogPath);
