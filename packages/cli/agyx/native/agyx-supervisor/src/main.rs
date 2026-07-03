@@ -680,14 +680,30 @@ fn quota_scan_status(aggregates: &[Value], scope: &str) -> String {
     let percent = entry
         .get("remainingPercent")
         .and_then(Value::as_f64)
-        .map(|value| format!("{value:.2}%"))
+        .map(color_quota_percent)
         .unwrap_or_else(|| "unknown".to_string());
-    let status = if entry.get("status").and_then(Value::as_str) == Some("exhausted") {
-        "exhausted"
+    percent
+}
+
+fn color_enabled() -> bool {
+    env::var("AGYX_NO_COLOR").is_err()
+        && env::var("NO_COLOR").is_err()
+        && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
+}
+
+fn color_quota_percent(value: f64) -> String {
+    let percent = format!("{value:.2}%");
+    if !color_enabled() {
+        return percent;
+    }
+    let code = if value <= 20.0 {
+        "\x1b[31m"
+    } else if value < 50.0 {
+        "\x1b[38;5;208m"
     } else {
-        "quota"
+        "\x1b[32m"
     };
-    format!("{percent} {status}")
+    format!("{code}{percent}\x1b[0m")
 }
 
 fn print_usage_quota_scan(profile_name: &str, aggregates: &[Value]) {
@@ -695,7 +711,7 @@ fn print_usage_quota_scan(profile_name: &str, aggregates: &[Value]) {
         return;
     }
     eprintln!(
-        "[agyx] quota scan: profile '{}' gemini {} claude {}.",
+        "[agyx] usage scan: profile '{}' gemini {} claude {}.",
         profile_name,
         quota_scan_status(aggregates, "gemini"),
         quota_scan_status(aggregates, "claude"),

@@ -20,6 +20,7 @@ import {
   isRestartable,
 } from "./processes.js";
 import { buildAgyLaunchArgs } from "./launch_args.js";
+import { color } from "./color.js";
 import { parseEligibilityEventLine } from "./eligibility.js";
 import {
   isRequestEventLine,
@@ -81,11 +82,11 @@ interface LaunchCommand {
 function quotaScanStatus(aggregates: UsageScopeAggregate[], scope: QuotaScope): string {
   const aggregate = aggregates.find((entry) => entry.scope === scope);
   if (!aggregate) return "unknown";
-  const percent = aggregate.remainingPercent === undefined
-    ? "unknown"
-    : `${aggregate.remainingPercent.toFixed(2)}%`;
-  const status = aggregate.status === "exhausted" ? "exhausted" : "quota";
-  return `${percent} ${status}`;
+  if (aggregate.remainingPercent === undefined) return "unknown";
+  const percent = `${aggregate.remainingPercent.toFixed(2)}%`;
+  if (aggregate.remainingPercent <= 20) return color.red(percent);
+  if (aggregate.remainingPercent < 50) return color.orange(percent);
+  return color.green(percent);
 }
 
 function formatUsageQuotaScan(profileName: string, aggregates: UsageScopeAggregate[]): string | undefined {
@@ -115,7 +116,7 @@ async function triggerAutoSwitch(
     child.stdout?.on("data", (chunk) => { stdout += chunk; });
     child.stderr?.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => {
-      console.error(`\n[agyx] Automatic quota failover failed: ${error.message}`);
+      console.error(`\n[agyx] Automatic usage failover failed: ${error.message}`);
       resolvePromise({ kind: "stop_retrying", retryKey: `quota:${scope}` });
     });
     child.on("exit", () => {
@@ -355,7 +356,7 @@ export async function supervise(args: string[]): Promise<number> {
           const action = await triggerAutoSwitch(scope, { printMessage: false });
           if (action?.kind === "switched") {
             const scanText = formatUsageQuotaScan(probeProfileName, usageProbe.aggregates);
-            if (scanText) console.error(`[agyx] quota scan: ${scanText}.`);
+            if (scanText) console.error(`[agyx] usage scan: ${scanText}.`);
           }
           if (action?.message) console.error(action.message);
           if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
