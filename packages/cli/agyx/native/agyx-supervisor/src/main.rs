@@ -136,6 +136,7 @@ impl Supervisor {
                 return;
             };
             let scopes = usage_probe(&profile_name, &self.real_agy, &self.cwd);
+            print_usage_quota_exhausted(&profile_name, &scopes);
             let had_exhausted_scope = !scopes.is_empty();
             for scope in scopes {
                 if self.auto_switch_stopped_scopes.contains(&scope) {
@@ -661,6 +662,38 @@ fn usage_probe(profile_name: &str, real_agy: &str, cwd: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn format_quota_scan_scopes(scopes: &[String]) -> String {
+    let has_gemini = scopes.iter().any(|scope| scope == "gemini");
+    let has_claude = scopes.iter().any(|scope| scope == "claude");
+    if has_gemini && has_claude {
+        return "gemini and claude".to_string();
+    }
+    if has_gemini {
+        return "gemini".to_string();
+    }
+    if has_claude {
+        return "claude".to_string();
+    }
+    let mut unique = Vec::new();
+    for scope in scopes {
+        if !unique.contains(scope) {
+            unique.push(scope.clone());
+        }
+    }
+    unique.join(", ")
+}
+
+fn print_usage_quota_exhausted(profile_name: &str, scopes: &[String]) {
+    if scopes.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[agyx] quota scan: profile '{}' exhausted {} quota.",
+        profile_name,
+        format_quota_scan_scopes(scopes),
+    );
 }
 
 fn find_real_agy() -> Result<String, String> {

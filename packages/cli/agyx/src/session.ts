@@ -77,6 +77,23 @@ interface LaunchCommand {
   args: string[];
 }
 
+function formatQuotaScanScopes(scopes: QuotaScope[]): string {
+  const unique = [...new Set(scopes)];
+  const hasGemini = unique.includes("gemini");
+  const hasClaude = unique.includes("claude");
+  if (hasGemini && hasClaude) return "gemini and claude";
+  if (hasGemini) return "gemini";
+  if (hasClaude) return "claude";
+  return unique.join(", ");
+}
+
+function printUsageQuotaExhausted(profileName: string, scopes: QuotaScope[]): void {
+  if (!scopes.length) return;
+  console.error(
+    `[agyx] quota scan: profile '${profileName}' exhausted ${formatQuotaScanScopes(scopes)} quota.`,
+  );
+}
+
 async function triggerAutoSwitch(scope: QuotaScope): Promise<AutoSwitchAction | undefined> {
   const cliPath = process.argv[1];
   if (!cliPath) return undefined;
@@ -325,6 +342,7 @@ export async function supervise(args: string[]): Promise<number> {
       const profileName = profileAtStart;
       if (!profileName) break;
       const usageProbe = await runUsageProbe({ profileName, realAgy, cwd: process.cwd() });
+      printUsageQuotaExhausted(profileName, usageProbe.exhaustedScopes);
       for (const scope of usageProbe.exhaustedScopes) {
         if (autoSwitchStoppedScopes.has(scope)) continue;
         if (quotaMarkedScopes.has(scope)) continue;
