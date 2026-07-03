@@ -18,6 +18,7 @@ export interface UsageTranscriptEvent {
   modelLabel?: string;
   reason?: string;
   resetAt?: string;
+  remainingPercent?: number;
 }
 
 export interface UsageScopeAggregate {
@@ -26,12 +27,14 @@ export interface UsageScopeAggregate {
   resetAt?: string;
   reason?: string;
   modelLabel?: string;
+  remainingPercent?: number;
 }
 
 export interface UsageTranscriptState {
   inUsageView: boolean;
   modelLabel?: string;
   scope?: QuotaScope;
+  remainingPercent?: number;
 }
 
 export function createUsageTranscriptState(): UsageTranscriptState {
@@ -114,6 +117,13 @@ export function normalizeTerminalTranscript(input: string): string {
   return normalized;
 }
 
+function parseRemainingPercent(line: string): number | undefined {
+  const percent = line.match(/(\d+(?:\.\d+)?)\s*%/)?.[1];
+  if (!percent) return undefined;
+  const value = Number(percent);
+  return Number.isFinite(value) ? value : undefined;
+}
+
 function parseUsageStatus(line: string): "available" | "exhausted" | undefined {
   const lower = line.toLowerCase();
   if (
@@ -130,11 +140,8 @@ function parseUsageStatus(line: string): "available" | "exhausted" | undefined {
   }
   if (lower.includes("quota available") || lower === "available") return "available";
 
-  const percent = line.match(/(\d+(?:\.\d+)?)\s*%/)?.[1];
-  if (percent) {
-    const value = Number(percent);
-    if (Number.isFinite(value)) return value <= 0.5 ? "exhausted" : "available";
-  }
+  const percent = parseRemainingPercent(line);
+  if (percent !== undefined) return percent <= 0.5 ? "exhausted" : "available";
 
   return undefined;
 }
@@ -160,6 +167,7 @@ export function parseUsageTranscriptLine(
     state.inUsageView = true;
     state.modelLabel = undefined;
     state.scope = undefined;
+    state.remainingPercent = undefined;
     return undefined;
   }
   if (!state.inUsageView) return undefined;
@@ -167,6 +175,7 @@ export function parseUsageTranscriptLine(
     state.inUsageView = false;
     state.modelLabel = undefined;
     state.scope = undefined;
+    state.remainingPercent = undefined;
     return undefined;
   }
 
@@ -174,6 +183,7 @@ export function parseUsageTranscriptLine(
   if (lineScope !== "unknown") {
     state.modelLabel = usageModelLabel(cleaned);
     state.scope = lineScope;
+    state.remainingPercent = undefined;
     return undefined;
   }
 
@@ -182,6 +192,9 @@ export function parseUsageTranscriptLine(
   const quotaEvent = parseQuotaEventLine(cleaned, now);
   const status = quotaEvent ? "exhausted" : parseUsageStatus(cleaned);
   if (!status) return undefined;
+  const lineRemainingPercent = parseRemainingPercent(cleaned);
+  if (lineRemainingPercent !== undefined) state.remainingPercent = lineRemainingPercent;
+  const remainingPercent = lineRemainingPercent ?? state.remainingPercent;
 
   return {
     status,
@@ -189,6 +202,7 @@ export function parseUsageTranscriptLine(
     modelLabel: state.modelLabel,
     reason: quotaEvent?.reason ?? (status === "exhausted" ? "usage quota exhausted" : undefined),
     resetAt: quotaEvent?.resetAt ?? parseResetAt(cleaned, now),
+    remainingPercent,
   };
 }
 
@@ -214,8 +228,23 @@ export function parseUsageTranscriptAggregates(
 
     const current = aggregates.get(event.scope);
     if (event.status === "available") {
-      if (!current) {
-        aggregates.set(event.scope, { status: "available", scope: event.scope });
+      if (
+        !current
+        || (
+          current.status === "available"
+          && event.remainingPercent !== undefined
+          && (
+            current.remainingPercent === undefined
+            || event.remainingPercent < current.remainingPercent
+          )
+        )
+      ) {
+        aggregates.set(event.scope, {
+          status: "available",
+          scope: event.scope,
+          modelLabel: event.modelLabel,
+          remainingPercent: event.remainingPercent,
+        });
       }
       continue;
     }
@@ -226,6 +255,7 @@ export function parseUsageTranscriptAggregates(
       resetAt: event.resetAt,
       reason: event.reason ?? "usage quota exhausted",
       modelLabel: event.modelLabel,
+      remainingPercent: event.remainingPercent,
     };
     if (
       !current

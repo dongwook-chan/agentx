@@ -492,6 +492,7 @@ test("parses interactive usage transcript quota rows", () => {
     modelLabel: "Gemini 3.5 Flash (High)",
     reason: undefined,
     resetAt: undefined,
+    remainingPercent: 100,
   });
   assert.deepEqual(parseUsageTranscriptLine("Quota available", state), {
     status: "available",
@@ -499,6 +500,7 @@ test("parses interactive usage transcript quota rows", () => {
     modelLabel: "Gemini 3.5 Flash (High)",
     reason: undefined,
     resetAt: undefined,
+    remainingPercent: 100,
   });
 
   assert.equal(parseUsageTranscriptLine("  Claude Sonnet 4.6 (Thinking)", state), undefined);
@@ -510,6 +512,7 @@ test("parses interactive usage transcript quota rows", () => {
       modelLabel: "Claude Sonnet 4.6 (Thinking)",
       reason: "quota exhausted",
       resetAt: "2026-06-28T01:37:00.000Z",
+      remainingPercent: undefined,
     },
   );
 });
@@ -518,12 +521,16 @@ test("aggregates usage transcript quota rows by provider scope", () => {
   const aggregates = parseUsageTranscriptAggregates(`
 └ Models & Quota
   Gemini 3.5 Flash (Medium)
+[████] 42.00%
 Quota exhausted. Will reset after 5h0m0s.
   Gemini 3.5 Pro (High)
+[████] 12.00%
 Quota exhausted. Will reset after 2h0m0s.
   Claude Sonnet 4.6 (Thinking)
+[████] 8.00%
 Quota exhausted. Will reset after 3h0m0s.
   Claude Opus 4.1
+[████] 60.00%
 Quota available
 `, new Date("2026-06-26T00:00:00.000Z"));
 
@@ -534,6 +541,7 @@ Quota available
       resetAt: "2026-06-26T02:00:00.000Z",
       reason: "quota exhausted",
       modelLabel: "Gemini 3.5 Pro (High)",
+      remainingPercent: 12,
     },
     {
       status: "exhausted",
@@ -541,6 +549,7 @@ Quota available
       resetAt: "2026-06-26T03:00:00.000Z",
       reason: "quota exhausted",
       modelLabel: "Claude Sonnet 4.6 (Thinking)",
+      remainingPercent: 8,
     },
   ]);
 });

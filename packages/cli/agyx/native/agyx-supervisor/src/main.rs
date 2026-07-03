@@ -668,21 +668,24 @@ fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String)
     });
 }
 
-fn quota_scan_status(aggregates: &[Value], scope: &str) -> &'static str {
-    let status = aggregates.iter().find_map(|aggregate| {
-        if aggregate.get("scope").and_then(Value::as_str) == Some(scope) {
-            aggregate.get("status").and_then(Value::as_str)
-        } else {
-            None
-        }
+fn quota_scan_status(aggregates: &[Value], scope: &str) -> String {
+    let entry = aggregates.iter().find(|aggregate| {
+        aggregate.get("scope").and_then(Value::as_str) == Some(scope)
     });
-    if status == Some("exhausted") {
+    let Some(entry) = entry else {
+        return "unknown".to_string();
+    };
+    let percent = entry
+        .get("remainingPercent")
+        .and_then(Value::as_f64)
+        .map(|value| format!("{value:.2}%"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = if entry.get("status").and_then(Value::as_str) == Some("exhausted") {
         "exhausted"
-    } else if status == Some("available") {
-        "quota"
     } else {
-        "unknown"
-    }
+        "quota"
+    };
+    format!("{percent} {status}")
 }
 
 fn print_usage_quota_scan(profile_name: &str, aggregates: &[Value]) {

@@ -81,7 +81,11 @@ interface LaunchCommand {
 function quotaScanStatus(aggregates: UsageScopeAggregate[], scope: QuotaScope): string {
   const aggregate = aggregates.find((entry) => entry.scope === scope);
   if (!aggregate) return "unknown";
-  return aggregate.status === "exhausted" ? "exhausted" : "quota";
+  const percent = aggregate.remainingPercent === undefined
+    ? "unknown"
+    : `${aggregate.remainingPercent.toFixed(2)}%`;
+  const status = aggregate.status === "exhausted" ? "exhausted" : "quota";
+  return `${percent} ${status}`;
 }
 
 function printUsageQuotaScan(profileName: string, aggregates: UsageScopeAggregate[]): void {
