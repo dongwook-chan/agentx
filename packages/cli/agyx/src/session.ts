@@ -88,14 +88,15 @@ function quotaScanStatus(aggregates: UsageScopeAggregate[], scope: QuotaScope): 
   return `${percent} ${status}`;
 }
 
-function printUsageQuotaScan(profileName: string, aggregates: UsageScopeAggregate[]): void {
-  if (!aggregates.length) return;
-  console.error(
-    `[agyx] quota scan: profile '${profileName}' gemini ${quotaScanStatus(aggregates, "gemini")} claude ${quotaScanStatus(aggregates, "claude")}.`,
-  );
+function formatUsageQuotaScan(profileName: string, aggregates: UsageScopeAggregate[]): string | undefined {
+  if (!aggregates.length) return undefined;
+  return `profile '${profileName}' gemini ${quotaScanStatus(aggregates, "gemini")} claude ${quotaScanStatus(aggregates, "claude")}`;
 }
 
-async function triggerAutoSwitch(scope: QuotaScope): Promise<AutoSwitchAction | undefined> {
+async function triggerAutoSwitch(
+  scope: QuotaScope,
+  options: { printMessage?: boolean } = {},
+): Promise<AutoSwitchAction | undefined> {
   const cliPath = process.argv[1];
   if (!cliPath) return undefined;
   return await new Promise((resolvePromise) => {
@@ -122,7 +123,7 @@ async function triggerAutoSwitch(scope: QuotaScope): Promise<AutoSwitchAction | 
         const action = stdout.trim()
           ? JSON.parse(stdout.trim()) as AutoSwitchAction
           : undefined;
-        if (action?.message) console.error(action.message);
+        if (action?.message && options.printMessage !== false) console.error(action.message);
         else if (stderr.trim()) console.error(stderr.trim());
         resolvePromise(action);
       } catch {
@@ -346,13 +347,17 @@ export async function supervise(args: string[]): Promise<number> {
           realAgy,
           cwd: process.cwd(),
         });
-        printUsageQuotaScan(probeProfileName, usageProbe.aggregates);
         for (const scope of usageProbe.exhaustedScopes) {
           if (autoSwitchStoppedScopes.has(scope)) continue;
           if (localMarkedScopes.has(scope)) continue;
           localMarkedScopes.add(scope);
           quotaMarkedScopes.add(scope);
-          const action = await triggerAutoSwitch(scope);
+          const action = await triggerAutoSwitch(scope, { printMessage: false });
+          if (action?.kind === "switched") {
+            const scanText = formatUsageQuotaScan(probeProfileName, usageProbe.aggregates);
+            if (scanText) console.error(`[agyx] quota scan: ${scanText}.`);
+          }
+          if (action?.message) console.error(action.message);
           if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
         }
         const activeProfile = (await loadState()).activeProfile;

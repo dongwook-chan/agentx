@@ -646,7 +646,6 @@ fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String)
                 return;
             };
             let (scopes, aggregates) = usage_probe_result(&current_profile_name, &real_agy, &cwd);
-            print_usage_quota_scan(&current_profile_name, &aggregates);
             let had_exhausted_scope = !scopes.is_empty();
             let mut triggered_scopes = HashSet::new();
             for scope in scopes {
@@ -654,6 +653,9 @@ fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String)
                     continue;
                 }
                 if let Some(action) = trigger_auto_switch(&scope) {
+                    if action.get("kind").and_then(Value::as_str) == Some("switched") {
+                        print_usage_quota_scan(&current_profile_name, &aggregates);
+                    }
                     if let Some(message) = action.get("message").and_then(Value::as_str) {
                         eprintln!("{message}");
                     }
