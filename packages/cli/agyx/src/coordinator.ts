@@ -503,7 +503,7 @@ export async function autoSwitchAfterQuota(
             }
           }
         }
-        throw lastError ?? new Error("No selectable profile for automatic usage failover.");
+        throw lastError ?? new Error("No selectable profile for automatic quota failover.");
       } catch (error) {
         if (previousCredential) await keychain.writeActive(previousCredential);
         throw error;
@@ -524,14 +524,14 @@ export async function autoSwitchAfterQuotaAction(
       kind: "switched",
       profile: result.name,
       email: result.email,
-      message: `\n[agyx] Switched to profile '${result.name}' after usage limit was reached.`,
+      message: `\n[agyx] Switched to profile '${result.name}' after quota was reached.`,
     };
   } catch (error) {
     return {
       kind: "stop_retrying",
       reason: "auto_switch_failed",
       retryKey: `quota:${quotaScope}`,
-      message: `\n[agyx] Automatic usage failover stopped: ${(error as Error).message}`,
+      message: `\n[agyx] Automatic quota failover stopped: ${(error as Error).message}`,
     };
   }
 }
