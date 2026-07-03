@@ -110,8 +110,7 @@ impl Supervisor {
         self.quota_marked_scopes.clear();
         self.current_model_label = None;
         self.current_quota_scope = None;
-
-        self.run_usage_probe_sweep();
+        let probe_profile_name = self.profile_at_start.clone();
 
         let launch_args =
             supervisor_launch_args(&self.args, self.conversation_id.as_deref(), &self.log_path)?;
@@ -127,41 +126,10 @@ impl Supervisor {
             .map_err(to_string)?;
         self.child = Some(child);
         self.persist()?;
-        Ok(())
-    }
-
-    fn run_usage_probe_sweep(&mut self) {
-        for _ in 0..5 {
-            let Some(profile_name) = self.profile_at_start.clone() else {
-                return;
-            };
-            let scopes = usage_probe(&profile_name, &self.real_agy, &self.cwd);
-            print_usage_quota_exhausted(&profile_name, &scopes);
-            let had_exhausted_scope = !scopes.is_empty();
-            for scope in scopes {
-                if self.auto_switch_stopped_scopes.contains(&scope) {
-                    continue;
-                }
-                if self.quota_marked_scopes.contains(&scope) {
-                    continue;
-                }
-                self.quota_marked_scopes.insert(scope.clone());
-                if let Some(action) = trigger_auto_switch(&scope) {
-                    if let Some(message) = action.get("message").and_then(Value::as_str) {
-                        eprintln!("{message}");
-                    }
-                    if action.get("kind").and_then(Value::as_str) == Some("stop_retrying") {
-                        self.auto_switch_stopped_scopes.insert(scope);
-                    }
-                }
-            }
-            let active = active_profile().ok().flatten();
-            self.profile_at_start = active.clone();
-            if !had_exhausted_scope || active.as_deref() == Some(profile_name.as_str()) {
-                return;
-            }
-            self.quota_marked_scopes.clear();
+        if let Some(profile_name) = probe_profile_name {
+            start_usage_probe_thread(profile_name, self.real_agy.clone(), self.cwd.clone());
         }
+        Ok(())
     }
 
     fn record_quota_exhausted_from_event(
@@ -662,6 +630,36 @@ fn usage_probe(profile_name: &str, real_agy: &str, cwd: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String) {
+    thread::spawn(move || {
+        let mut probe_profile_name = Some(profile_name);
+        for _ in 0..5 {
+            let Some(current_profile_name) = probe_profile_name.clone() else {
+                return;
+            };
+            let scopes = usage_probe(&current_profile_name, &real_agy, &cwd);
+            print_usage_quota_exhausted(&current_profile_name, &scopes);
+            let had_exhausted_scope = !scopes.is_empty();
+            let mut triggered_scopes = HashSet::new();
+            for scope in scopes {
+                if !triggered_scopes.insert(scope.clone()) {
+                    continue;
+                }
+                if let Some(action) = trigger_auto_switch(&scope) {
+                    if let Some(message) = action.get("message").and_then(Value::as_str) {
+                        eprintln!("{message}");
+                    }
+                }
+            }
+            let active = active_profile().ok().flatten();
+            if !had_exhausted_scope || active.as_deref() == Some(current_profile_name.as_str()) {
+                return;
+            }
+            probe_profile_name = active;
+        }
+    });
 }
 
 fn format_quota_scan_scopes(scopes: &[String]) -> String {

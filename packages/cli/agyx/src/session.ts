@@ -203,6 +203,7 @@ export async function supervise(args: string[]): Promise<number> {
   let currentModelLabel: string | undefined;
   let currentQuotaScope: QuotaScope | undefined;
   const usageTranscriptState = createUsageTranscriptState();
+  let usageProbeRunning = false;
 
   const currentRecord = (): SessionRecord => ({
     id,
@@ -331,6 +332,40 @@ export async function supervise(args: string[]): Promise<number> {
     }
   };
 
+  const runUsageProbeSweep = async (initialProfileName: string | undefined): Promise<void> => {
+    if (!initialProfileName || usageProbeRunning) return;
+    usageProbeRunning = true;
+    try {
+      let probeProfileName: string | undefined = initialProfileName;
+      const localMarkedScopes = new Set<QuotaScope>();
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        if (!probeProfileName) break;
+        const usageProbe = await runUsageProbe({
+          profileName: probeProfileName,
+          realAgy,
+          cwd: process.cwd(),
+        });
+        printUsageQuotaExhausted(probeProfileName, usageProbe.exhaustedScopes);
+        for (const scope of usageProbe.exhaustedScopes) {
+          if (autoSwitchStoppedScopes.has(scope)) continue;
+          if (localMarkedScopes.has(scope)) continue;
+          localMarkedScopes.add(scope);
+          quotaMarkedScopes.add(scope);
+          const action = await triggerAutoSwitch(scope);
+          if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
+        }
+        const activeProfile = (await loadState()).activeProfile;
+        if (!usageProbe.exhaustedScopes.length || activeProfile === probeProfileName) break;
+        probeProfileName = activeProfile;
+        localMarkedScopes.clear();
+      }
+    } catch {
+      // Usage probing is opportunistic; normal agy startup should not depend on it.
+    } finally {
+      usageProbeRunning = false;
+    }
+  };
+
   const startChild = async (): Promise<void> => {
     intentionalStop = false;
     paused = false;
@@ -338,23 +373,6 @@ export async function supervise(args: string[]): Promise<number> {
     quotaMarkedScopes = new Set<QuotaScope>();
     currentModelLabel = undefined;
     currentQuotaScope = undefined;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const profileName = profileAtStart;
-      if (!profileName) break;
-      const usageProbe = await runUsageProbe({ profileName, realAgy, cwd: process.cwd() });
-      printUsageQuotaExhausted(profileName, usageProbe.exhaustedScopes);
-      for (const scope of usageProbe.exhaustedScopes) {
-        if (autoSwitchStoppedScopes.has(scope)) continue;
-        if (quotaMarkedScopes.has(scope)) continue;
-        quotaMarkedScopes.add(scope);
-        const action = await triggerAutoSwitch(scope);
-        if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
-      }
-      const activeProfile = (await loadState()).activeProfile;
-      if (!usageProbe.exhaustedScopes.length || activeProfile === profileName) break;
-      profileAtStart = activeProfile;
-      quotaMarkedScopes = new Set<QuotaScope>();
-    }
     const state = await loadState();
     const launchArgs = buildAgyLaunchArgs(args, { conversationId, logPath, state });
     await cleanupRuntimeFile(terminalLogPath);
@@ -371,6 +389,7 @@ export async function supervise(args: string[]): Promise<number> {
       },
     });
     await persist();
+    void runUsageProbeSweep(profileAtStart);
     child.on("exit", async (code, signal) => {
       finalCode = code ?? (signal ? 128 : 1);
       await refreshConversation();

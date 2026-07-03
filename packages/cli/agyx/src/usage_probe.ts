@@ -91,7 +91,7 @@ catch {stty rows 40 columns 120 < $spawn_out(slave,name)}
 set timeout 1
 expect { timeout {} eof {} }
 send "\\r"
-set timeout 6
+set timeout 4
 expect {
   -re {for shortcuts|>} {}
   timeout {}
@@ -99,20 +99,11 @@ expect {
 }
 set saw_usage 0
 send "\\025/usage\\r"
-set timeout 4
+set timeout 3
 expect {
   -re {Models[[:space:]]*&[[:space:]]*Quota} { set saw_usage 1 }
   timeout {}
   eof {}
-}
-if {$saw_usage == 0} {
-  send "\\025/usage\\r"
-  set timeout 4
-  expect {
-    -re {Models[[:space:]]*&[[:space:]]*Quota} { set saw_usage 1 }
-    timeout {}
-    eof {}
-  }
 }
 if {$saw_usage == 0} {
   send "\\025/usage\\r"
@@ -123,10 +114,23 @@ if {$saw_usage == 0} {
     eof {}
   }
 }
-set timeout 2
-expect { timeout {} eof {} }
-set timeout 1
-expect { timeout {} eof {} }
+if {$saw_usage == 0} {
+  send "\\025/usage\\r"
+  set timeout 2
+  expect {
+    -re {Models[[:space:]]*&[[:space:]]*Quota} { set saw_usage 1 }
+    timeout {}
+    eof {}
+  }
+}
+if {$saw_usage == 1} {
+  set timeout 2
+  expect {
+    -re {esc to cancel|press ctrl\\+c|Claude Opus|Quota exhausted} {}
+    timeout {}
+    eof {}
+  }
+}
 send "\\033\\003\\003"
 set timeout 1
 expect { timeout {} eof {} }
