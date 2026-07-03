@@ -583,14 +583,14 @@ fn supervisor_launch_args(
         .collect())
 }
 
-fn usage_probe(profile_name: &str, real_agy: &str, cwd: &str) -> Vec<String> {
+fn usage_probe_result(profile_name: &str, real_agy: &str, cwd: &str) -> (Vec<String>, Vec<Value>) {
     let payload = json!({
         "profileName": profile_name,
         "realAgy": real_agy,
         "cwd": cwd,
     });
     let Ok(payload) = serde_json::to_string(&payload) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let output = if let Ok(cli_path) = env::var("AGYX_CLI_PATH") {
         let node_path = env::var("AGYX_NODE_PATH").unwrap_or_else(|_| "node".to_string());
@@ -610,16 +610,16 @@ fn usage_probe(profile_name: &str, real_agy: &str, cwd: &str) -> Vec<String> {
             .ok()
     };
     let Some(output) = output else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if !output.status.success() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    value
+    let scopes = value
         .get("exhaustedScopes")
         .and_then(Value::as_array)
         .map(|scopes| {
@@ -629,7 +629,13 @@ fn usage_probe(profile_name: &str, real_agy: &str, cwd: &str) -> Vec<String> {
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let aggregates = value
+        .get("aggregates")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    (scopes, aggregates)
 }
 
 fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String) {
@@ -639,8 +645,8 @@ fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String)
             let Some(current_profile_name) = probe_profile_name.clone() else {
                 return;
             };
-            let scopes = usage_probe(&current_profile_name, &real_agy, &cwd);
-            print_usage_quota_exhausted(&current_profile_name, &scopes);
+            let (scopes, aggregates) = usage_probe_result(&current_profile_name, &real_agy, &cwd);
+            print_usage_quota_scan(&current_profile_name, &aggregates);
             let had_exhausted_scope = !scopes.is_empty();
             let mut triggered_scopes = HashSet::new();
             for scope in scopes {
@@ -662,35 +668,32 @@ fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String)
     });
 }
 
-fn format_quota_scan_scopes(scopes: &[String]) -> String {
-    let has_gemini = scopes.iter().any(|scope| scope == "gemini");
-    let has_claude = scopes.iter().any(|scope| scope == "claude");
-    if has_gemini && has_claude {
-        return "gemini and claude".to_string();
-    }
-    if has_gemini {
-        return "gemini".to_string();
-    }
-    if has_claude {
-        return "claude".to_string();
-    }
-    let mut unique = Vec::new();
-    for scope in scopes {
-        if !unique.contains(scope) {
-            unique.push(scope.clone());
+fn quota_scan_status(aggregates: &[Value], scope: &str) -> &'static str {
+    let status = aggregates.iter().find_map(|aggregate| {
+        if aggregate.get("scope").and_then(Value::as_str) == Some(scope) {
+            aggregate.get("status").and_then(Value::as_str)
+        } else {
+            None
         }
+    });
+    if status == Some("exhausted") {
+        "exhausted"
+    } else if status == Some("available") {
+        "quota"
+    } else {
+        "unknown"
     }
-    unique.join(", ")
 }
 
-fn print_usage_quota_exhausted(profile_name: &str, scopes: &[String]) {
-    if scopes.is_empty() {
+fn print_usage_quota_scan(profile_name: &str, aggregates: &[Value]) {
+    if aggregates.is_empty() {
         return;
     }
     eprintln!(
-        "[agyx] quota scan: profile '{}' exhausted {} quota.",
+        "[agyx] quota scan: profile '{}' gemini {} claude {}.",
         profile_name,
-        format_quota_scan_scopes(scopes),
+        quota_scan_status(aggregates, "gemini"),
+        quota_scan_status(aggregates, "claude"),
     );
 }
 
