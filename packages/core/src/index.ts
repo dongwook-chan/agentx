@@ -505,3 +505,45 @@ export function nativeSupervisorHostStatus(
       : `${productName} native supervisor supports ${expected} only; current host is ${platform}/${arch}.`,
   };
 }
+
+export const agentProfileTableHeaders = [
+  "",
+  "#",
+  "name",
+  "expected-email",
+  "actual-email",
+  "status",
+  "quota-reset",
+  "last-request",
+  "activated",
+  "verified",
+  "switches",
+] as const;
+
+export function relativeTime(value: string | undefined, now = new Date()): string {
+  if (!value) return "-";
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return "-";
+  const delta = timestamp - now.getTime();
+  const absolute = Math.abs(delta);
+  const units: Array<[number, string]> = [
+    [24 * 60 * 60 * 1000, "d"],
+    [60 * 60 * 1000, "h"],
+    [60 * 1000, "m"],
+    [1000, "s"],
+  ];
+  const [unitMs, suffix] = units.find(([ms]) => absolute >= ms) ?? units.at(-1)!;
+  const amount = Math.max(1, Math.round(absolute / unitMs));
+  return delta >= 0 ? `in ${amount}${suffix}` : `${amount}${suffix} ago`;
+}
+
+export interface RestartNoticeOptions {
+  productName: string;
+  sessionCount: number;
+}
+
+export function profileSwitchRestartNotice(options: RestartNoticeOptions): string | undefined {
+  if (options.sessionCount <= 0) return undefined;
+  const noun = options.sessionCount === 1 ? "session" : "sessions";
+  return `[${options.productName}] Profile switch will restart ${options.sessionCount} supervised ${noun}.`;
+}

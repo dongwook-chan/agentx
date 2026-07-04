@@ -1,4 +1,5 @@
 import {
+  agentProfileTableHeaders,
   decideUseProfile,
   useProfileDisabledReason,
   UseProfileDecision,
@@ -59,19 +60,7 @@ function colorCell(row: ProfileView, value: string): string {
   return color.gray(value);
 }
 
-const profileHeaders = [
-  "",
-  "#",
-  "name",
-  "expected-email",
-  "actual-email",
-  "status",
-  "quota-reset",
-  "last-request",
-  "activated",
-  "verified",
-  "switches",
-] as const;
+const profileHeaders = agentProfileTableHeaders;
 
 function profileCells(row: ProfileView): string[] {
   return [

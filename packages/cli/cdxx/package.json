@@ -46,7 +46,8 @@
   "homepage": "https://github.com/dongwook-chan/agentx/tree/main/packages/cli/cdxx#readme",
   "dependencies": {
     "@dong-/agentx-core": "0.1.0",
-    "@inquirer/prompts": "^8.5.2"
+    "@inquirer/prompts": "^8.5.2",
+    "cli-table3": "^0.6.5"
   },
   "engines": {
     "node": ">=20"

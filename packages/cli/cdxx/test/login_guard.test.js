@@ -171,3 +171,29 @@ test("isValidCodexAuth rejects missing credentials", () => {
   assert.equal(auth.isValidCodexAuth(JSON.stringify({ auth_mode: "chatgpt", tokens: {} })), false);
   assert.equal(auth.isValidCodexAuth("{"), false);
 });
+
+test("useProfile refuses exhausted profiles before replacing active auth", async () => {
+  await resetState("old");
+  await mkdir(join(process.env.CDXX_CONFIG_DIR, "profiles", "exhausted"), { recursive: true });
+  await writeFile(auth.profileAuthPath("exhausted"), codexAuth("exhausted"), { mode: 0o600 });
+  const state = await config.loadState();
+  state.profiles.push({
+    name: "exhausted",
+    accountId: "exhausted",
+    quotaStatus: "exhausted",
+    quotaScopes: {
+      unknown: {
+        status: "exhausted",
+        reason: "credits exhausted",
+      },
+    },
+  });
+  await config.saveState(state);
+
+  await assert.rejects(
+    () => auth.useProfile("exhausted"),
+    /not selectable: quota exhausted: unknown/,
+  );
+  assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("old"));
+  assert.equal((await config.loadState()).activeProfile, "old");
+});

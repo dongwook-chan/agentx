@@ -8,6 +8,7 @@ export const sessionsDir = join(codexHome, "sessions");
 export const codexQuotaScopes = {
   primary: "5h",
   secondary: "weekly",
+  unknown: "unknown",
 };
 
 async function walkJsonl(dir, out = []) {
@@ -184,6 +185,23 @@ export function createQuotaSummaryFromStatus(status, nowMs = Date.now()) {
 export function quotaScopesFromSummary(summary) {
   if (!summary?.current) return undefined;
   const checkedAt = summary.lastAt ?? summary.current.timestamp ?? new Date().toISOString();
+  if (
+    summary.exhausted
+    && summary.current.primary === undefined
+    && summary.current.secondary === undefined
+  ) {
+    return {
+      [codexQuotaScopes.unknown]: quotaScopeRecord({
+        status: "exhausted",
+        usedPercent: undefined,
+        remainingPercent: undefined,
+        resetAt: summary.resetAt,
+        resetText: undefined,
+        reason: summary.reason ?? "quota exhausted",
+        checkedAt,
+      }),
+    };
+  }
   const primaryRemaining = summary.statusRemaining?.primary
     ?? (typeof summary.current.primary === "number" ? Math.max(0, 100 - summary.current.primary) : undefined);
   const secondaryRemaining = summary.statusRemaining?.secondary

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { codexHome, ensureConfig, ensureDir, loadState, markActive, profileNameFromIdentity, profilesDir, saveState, uniqueProfileName, upsertProfile, validateProfileName } from "./config.js";
 import { withAuthSwitchLock } from "./lock.js";
+import { profileSelectableReason } from "./selection.js";
 
 export const activeAuthPath = join(codexHome, "auth.json");
 
@@ -192,13 +193,14 @@ export async function useProfile(inputName) {
     await stat(source).catch(() => {
       throw new Error(`No saved credential for profile '${name}'. Run 'cdxx save ${name}' first.`);
     });
+    const state = await loadState();
+    const profile = state.profiles.find((entry) => entry.name === name);
+    const blocked = profile ? profileSelectableReason(profile) : undefined;
+    if (blocked) throw new Error(`Profile '${name}' is not selectable: ${blocked}.`);
     await ensureDir(codexHome);
     await copyFile(source, activeAuthPath);
     await chmod(activeAuthPath, 0o600).catch(() => undefined);
-
-    const state = await loadState();
     markActive(state, name);
-    const profile = state.profiles.find((entry) => entry.name === name);
     if (profile) profile.credentialStatus = "active";
     await saveState(state);
     return profile ?? { name };

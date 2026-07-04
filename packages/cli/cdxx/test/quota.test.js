@@ -222,6 +222,24 @@ test("quotaScopesFromSummary preserves both Codex status windows", () => {
   assert.equal(scopes.weekly.resetAt, "2026-07-07T09:13:00.000Z");
 });
 
+test("quotaScopesFromSummary records premium credit exhaustion as unknown quota", () => {
+  const summary = {
+    exhausted: true,
+    reason: "credits exhausted",
+    lastAt: "2026-07-04T10:26:18.536Z",
+    current: {
+      timestamp: "2026-07-04T10:26:18.536Z",
+      primary: undefined,
+      secondary: undefined,
+    },
+  };
+
+  const scopes = quotaScopesFromSummary(summary);
+
+  assert.equal(scopes.unknown.status, "exhausted");
+  assert.equal(scopes.unknown.reason, "credits exhausted");
+});
+
 test("clearExpiredQuota clears expired scoped Codex quota", () => {
   const profile = {
     name: "user",

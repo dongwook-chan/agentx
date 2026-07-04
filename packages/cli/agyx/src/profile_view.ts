@@ -3,6 +3,7 @@ import {
   ProfileRecord,
   State,
 } from "./config.js";
+import { relativeTime } from "@dong-/agentx-core";
 import {
   effectiveProfileStatus,
   EffectiveStatusOptions,
@@ -28,23 +29,6 @@ export interface ProfileView {
   runtimeStatus: ProfileRuntimeStatus;
   disabledReason?: string;
   profile: ProfileRecord;
-}
-
-export function relativeTime(value: string | undefined, now = new Date()): string {
-  if (!value) return "-";
-  const timestamp = Date.parse(value);
-  if (Number.isNaN(timestamp)) return "-";
-  const delta = timestamp - now.getTime();
-  const absolute = Math.abs(delta);
-  const units: Array<[number, string]> = [
-    [24 * 60 * 60 * 1000, "d"],
-    [60 * 60 * 1000, "h"],
-    [60 * 1000, "m"],
-    [1000, "s"],
-  ];
-  const [unitMs, suffix] = units.find(([ms]) => absolute >= ms) ?? units.at(-1)!;
-  const amount = Math.max(1, Math.round(absolute / unitMs));
-  return delta >= 0 ? `in ${amount}${suffix}` : `${amount}${suffix} ago`;
 }
 
 export function profileStatusText(

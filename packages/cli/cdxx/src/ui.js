@@ -1,26 +1,27 @@
 import { select } from "@inquirer/prompts";
 import {
+  agentProfileTableHeaders,
   decideUseProfile,
+  relativeTime,
   useProfileDisabledReason,
 } from "@dong-/agentx-core";
+import Table from "cli-table3";
 import { codexQuotaScopes, formatReset } from "./quota.js";
+import { exhaustedQuotaScopes, profileSelectableReason } from "./selection.js";
 
 function pad(value, width) {
   const text = String(value ?? "");
   return text.length >= width ? text : `${text}${" ".repeat(width - text.length)}`;
 }
 
-function activeQuotaScopes(profile) {
-  return Object.entries(profile.quotaScopes ?? {})
-    .filter(([, quota]) => quota?.status === "exhausted")
-    .map(([scope]) => scope);
-}
-
 function profileStatus(profile) {
   if (profile.disabled) return "disabled";
-  const exhausted = activeQuotaScopes(profile);
-  if (exhausted.length) return `quota:${exhausted.join(",")}`;
-  return profile.quotaStatus === "available" ? "available" : (profile.quotaStatus ?? "unknown");
+  const exhausted = exhaustedQuotaScopes(profile);
+  if (exhausted.length) return exhausted.includes(codexQuotaScopes.unknown)
+    ? "quota"
+    : `quota:${exhausted.join(",")}`;
+  if (profile.quotaStatus === "exhausted") return "quota";
+  return profile.quotaStatus === "available" ? "ready" : (profile.quotaStatus ?? "unknown");
 }
 
 function profileReset(profile) {
@@ -31,13 +32,39 @@ function profileReset(profile) {
   return formatReset(resets[0] ?? profile.quotaResetAt);
 }
 
-function quotaCell(profile, scope, fallbackUsed) {
-  const quota = profile.quotaScopes?.[scope];
-  const used = quota ? quota.usedPercent : fallbackUsed;
-  const remaining = quota?.remainingPercent;
-  if (used === undefined && remaining === undefined) return "";
-  if (remaining !== undefined) return `${remaining}% left`;
-  return `${used}%`;
+function profileRows(state) {
+  return state.profiles.map((profile, index) => ({
+    marker: state.activeProfile === profile.name ? "*" : "",
+    number: String(index + 1),
+    name: profile.name,
+    expectedEmail: profile.email ?? profile.accountId ?? "-",
+    actualEmail: profile.email ?? profile.accountId ?? "-",
+    status: profileStatus(profile),
+    quotaReset: profileReset(profile) || "-",
+    lastRequest: relativeTime(profile.lastUsage?.lastAt ?? profile.lastSession?.matchedAt),
+    activated: relativeTime(profile.lastActivatedAt),
+    verified: relativeTime(profile.updatedAt),
+    switches: String(profile.selectionCount ?? 0),
+    selectable: !profileSelectableReason(profile),
+    disabledReason: profileSelectableReason(profile),
+    profile,
+  }));
+}
+
+function profileCells(row) {
+  return [
+    row.marker,
+    row.number,
+    row.name,
+    row.expectedEmail,
+    row.actualEmail,
+    row.status,
+    row.quotaReset,
+    row.lastRequest,
+    row.activated,
+    row.verified,
+    row.switches,
+  ];
 }
 
 export function printProfiles(state) {
@@ -45,39 +72,25 @@ export function printProfiles(state) {
     console.log("No saved profiles.");
     return;
   }
-  const rows = state.profiles.map((profile) => ({
-    active: state.activeProfile === profile.name ? "*" : "",
-    name: profile.name,
-    email: profile.email ?? profile.accountId ?? "",
-    status: profileStatus(profile),
-    reset: profileReset(profile),
-    fiveHour: quotaCell(profile, codexQuotaScopes.primary, profile.lastUsage?.maxPrimary),
-    weekly: quotaCell(profile, codexQuotaScopes.secondary, profile.lastUsage?.maxSecondary),
-    selected: profile.selectionCount ?? 0,
-  }));
-  const headers = ["", "name", "account", "status", "reset", "5h", "weekly", "switches"];
-  const widths = headers.map((header, index) => Math.max(
-    header.length,
-    ...rows.map((row) => String(Object.values(row)[index] ?? "").length),
-  ));
-  console.log(headers.map((header, index) => pad(header, widths[index])).join("  "));
-  console.log(widths.map((width) => "-".repeat(width)).join("  "));
-  for (const row of rows) {
-    console.log(Object.values(row).map((value, index) => pad(value, widths[index])).join("  "));
+  const table = new Table({
+    head: [...agentProfileTableHeaders],
+    colAligns: ["center", "right", "left", "left", "left", "left", "left", "left", "left", "left", "right"],
+    style: { head: [], border: [] },
+    wordWrap: false,
+  });
+  for (const row of profileRows(state)) {
+    table.push(profileCells(row));
   }
+  console.log(table.toString());
 }
 
-function selectableReason(profile, state) {
-  if (profile.disabled) return "disabled";
-  const exhausted = activeQuotaScopes(profile);
-  if (exhausted.length) return `quota exhausted: ${exhausted.join(",")}`;
-  if (profile.quotaStatus === "exhausted") return "quota exhausted";
-  return undefined;
+function selectableReason(profile) {
+  return profileSelectableReason(profile);
 }
 
 function useCandidates(state) {
   return state.profiles.map((profile) => {
-    const reason = selectableReason(profile, state);
+    const reason = selectableReason(profile);
     return {
       name: profile.name,
       active: state.activeProfile === profile.name,
@@ -88,23 +101,8 @@ function useCandidates(state) {
 }
 
 function profileChoiceLabel(profile, state) {
-  const marker = state.activeProfile === profile.name ? "*" : " ";
-  const account = profile.email ?? profile.accountId ?? "";
-  const status = profileStatus(profile);
-  const reset = profileReset(profile);
-  return [
-    marker,
-    profile.name,
-    account,
-    status,
-    reset,
-    quotaCell(profile, codexQuotaScopes.primary, profile.lastUsage?.maxPrimary)
-      ? `5h=${quotaCell(profile, codexQuotaScopes.primary, profile.lastUsage?.maxPrimary)}`
-      : "",
-    quotaCell(profile, codexQuotaScopes.secondary, profile.lastUsage?.maxSecondary)
-      ? `weekly=${quotaCell(profile, codexQuotaScopes.secondary, profile.lastUsage?.maxSecondary)}`
-      : "",
-  ].filter(Boolean).join("  ");
+  const row = profileRows(state).find((entry) => entry.profile === profile);
+  return row ? profileCells(row).map((value, index) => pad(value || " ", Math.max(agentProfileTableHeaders[index].length, String(value || "").length))).join("  ") : profile.name;
 }
 
 export async function pickProfileForUse(state) {
@@ -126,7 +124,7 @@ export async function pickProfileForUse(state) {
     };
   });
   return await select({
-    message: "Select profile",
+    message: `Select profile\n  ${agentProfileTableHeaders.join("  ")}`,
     choices,
     pageSize: 7,
     loop: true,

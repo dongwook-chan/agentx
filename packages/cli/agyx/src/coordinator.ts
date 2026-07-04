@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   pauseAllSessions,
+  profileSwitchRestartNotice,
   resumeAllSessions,
   runAuthSwitchTransaction,
   SessionControlAdapter,
@@ -266,6 +267,9 @@ async function withPausedAuthSwitch<T>(
   operation: () => Promise<T>,
   options: { resume?: boolean } = {},
 ): Promise<T> {
+  const sessions = await sessionRecords();
+  const notice = profileSwitchRestartNotice({ productName: "agyx", sessionCount: sessions.length });
+  if (notice) console.error(notice);
   return await runAuthSwitchTransaction(
     {
       sessionControl: sessionControlAdapter(),
