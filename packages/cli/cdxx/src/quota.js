@@ -38,6 +38,23 @@ function pickReset(rateLimits) {
   return epochSecondsToIso(primary?.resets_at) ?? epochSecondsToIso(secondary?.resets_at);
 }
 
+function numericPercent(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function creditsExhausted(rateLimits) {
+  const credits = rateLimits?.credits;
+  if (!credits || typeof credits !== "object") return false;
+  if (rateLimits.limit_id !== "premium" && (rateLimits.primary || rateLimits.secondary)) return false;
+  if (credits.unlimited === true) return false;
+  if (credits.has_credits === true) return false;
+  if (credits.has_credits !== false) return false;
+  const balance = typeof credits.balance === "number"
+    ? credits.balance
+    : Number.parseFloat(String(credits.balance ?? ""));
+  return Number.isFinite(balance) && balance <= 0;
+}
+
 export function createQuotaSummary() {
   return {
     source: "jsonl",
@@ -208,14 +225,15 @@ export function quotaScopesFromSummary(summary) {
 function updateSummary(summary, file, lineNumber, event) {
   const rateLimits = event.payload?.rate_limits;
   if (!rateLimits) return;
-  const primary = rateLimits.primary?.used_percent ?? 0;
-  const secondary = rateLimits.secondary?.used_percent ?? 0;
+  const primary = numericPercent(rateLimits.primary?.used_percent);
+  const secondary = numericPercent(rateLimits.secondary?.used_percent);
   const reachedType = rateLimits.rate_limit_reached_type ?? null;
+  const outOfCredits = creditsExhausted(rateLimits);
   const timestamp = event.timestamp;
 
   summary.tokenCountRecords += 1;
-  summary.maxPrimary = Math.max(summary.maxPrimary, primary);
-  summary.maxSecondary = Math.max(summary.maxSecondary, secondary);
+  if (primary !== undefined) summary.maxPrimary = Math.max(summary.maxPrimary, primary);
+  if (secondary !== undefined) summary.maxSecondary = Math.max(summary.maxSecondary, secondary);
   if (!summary.firstAt || timestamp < summary.firstAt) summary.firstAt = timestamp;
   if (!summary.lastAt || timestamp > summary.lastAt) {
     summary.lastAt = timestamp;
@@ -226,6 +244,7 @@ function updateSummary(summary, file, lineNumber, event) {
       primary,
       secondary,
       reachedType,
+      limitId: rateLimits.limit_id,
       resetAt: pickReset(rateLimits),
       resetAtByScope: {
         primary: epochSecondsToIso(rateLimits.primary?.resets_at),
@@ -239,7 +258,7 @@ function updateSummary(summary, file, lineNumber, event) {
   if (rateLimits.plan_type) summary.planType = rateLimits.plan_type;
   if (reachedType) summary.reachedTypes.add(String(reachedType));
 
-  const exhausted = primary >= 100 || secondary >= 100 || reachedType !== null;
+  const exhausted = primary >= 100 || secondary >= 100 || reachedType !== null || outOfCredits;
   if (primary >= 90 || secondary >= 90 || exhausted) {
     summary.highWatermarks.push({
       file,
@@ -257,7 +276,7 @@ function updateSummary(summary, file, lineNumber, event) {
     summary.exhaustedEvents += 1;
     summary.resetAt = pickReset(rateLimits) ?? summary.resetAt;
     summary.reason = reachedType ? `rate_limit_reached_type=${reachedType}` : (
-      primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached"
+      outOfCredits ? "credits exhausted" : (primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached")
     );
   }
 }
@@ -322,12 +341,25 @@ export function finalizeQuotaSummary(summary, nowMs = Date.now()) {
       summary.current.primary >= 100
       || summary.current.secondary >= 100
       || summary.current.reachedType !== null
+      || creditsExhausted({
+        limit_id: summary.current.limitId,
+        primary: summary.current.primary === undefined ? null : {},
+        secondary: summary.current.secondary === undefined ? null : {},
+        credits: summary.current.credits,
+      })
     ),
   );
   if (summary.exhausted) {
     summary.reason = summary.current.reachedType
       ? `rate_limit_reached_type=${summary.current.reachedType}`
-      : (summary.current.primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached");
+      : (creditsExhausted({
+        limit_id: summary.current.limitId,
+        primary: summary.current.primary === undefined ? null : {},
+        secondary: summary.current.secondary === undefined ? null : {},
+        credits: summary.current.credits,
+      })
+        ? "credits exhausted"
+        : (summary.current.primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached"));
     summary.resetAt = summary.current.resetAt;
   }
   return summary;

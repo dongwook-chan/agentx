@@ -57,6 +57,33 @@ function stopChildForFailover(child) {
   }, 5000).unref();
 }
 
+async function effectiveLiveQuotaSummary(summary) {
+  if (!summary?.exhausted && !summary?.quotaTrigger) return summary;
+  const statusSummary = await scanCodexQuota({ sinceMs: Date.now() - 60000, reason: "live-quota-trigger" });
+  if (statusSummary?.exhausted) return statusSummary;
+  if (summary.exhausted) return summary;
+  return {
+    ...summary,
+    source: "live-trigger",
+    exhausted: true,
+    historicalExhausted: true,
+    exhaustedEvents: Math.max(1, summary.exhaustedEvents ?? 0),
+    reason: summary.quotaTrigger?.reason ?? "usage limit reached",
+    lastAt: summary.quotaTrigger?.timestamp ?? summary.lastAt ?? new Date().toISOString(),
+    current: summary.current ?? {
+      file: undefined,
+      line: undefined,
+      timestamp: summary.quotaTrigger?.timestamp ?? new Date().toISOString(),
+      primary: undefined,
+      secondary: undefined,
+      reachedType: "usage_limit_message",
+      resetAt: undefined,
+      credits: undefined,
+      planType: summary.planType,
+    },
+  };
+}
+
 async function stopChild(child) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
@@ -96,9 +123,7 @@ async function monitorMatchedSession(matchedSession, child, profileName, signal)
   while (!signal.aborted) {
     const summary = await tail.readAdded();
     if (summary?.tokenCountRecords) {
-      const effectiveSummary = summary.exhausted || summary.quotaTrigger
-        ? await scanCodexQuota({ sinceMs: Date.now() - 60000, reason: "live-quota-trigger" })
-        : summary;
+      const effectiveSummary = await effectiveLiveQuotaSummary(summary);
       const profile = await recordQuotaForProfile(effectiveSummary, profileName);
       if (profile?.quotaStatus === "exhausted") {
         console.error(`[cdxx] Profile '${profile.name}' reached quota${describeReset(profile)}.`);
@@ -119,7 +144,7 @@ async function monitorMatchedSession(matchedSession, child, profileName, signal)
         return undefined;
       }
     } else if (summary?.quotaTrigger) {
-      const effectiveSummary = await scanCodexQuota({ sinceMs: Date.now() - 60000, reason: "live-quota-trigger" });
+      const effectiveSummary = await effectiveLiveQuotaSummary(summary);
       const profile = await recordQuotaForProfile(effectiveSummary, profileName);
       if (profile?.quotaStatus === "exhausted") {
         console.error(`[cdxx] Profile '${profile.name}' reached quota${describeReset(profile)}.`);
@@ -167,6 +192,8 @@ export async function runCodexSession(args) {
   let attempts = 0;
   let child;
   let paused = false;
+  let pauseRequested = false;
+  let resumePending = false;
   let activeMatchedSession;
   let lastSessionId;
   let resumeRequested;
@@ -190,8 +217,16 @@ export async function runCodexSession(args) {
 
   const waitForResume = async () => {
     if (!paused) return;
+    if (resumePending) {
+      resumePending = false;
+      paused = false;
+      return;
+    }
     await new Promise((resolve) => {
-      resumeRequested = resolve;
+      resumeRequested = () => {
+        resumePending = false;
+        resolve();
+      };
     });
   };
 
@@ -204,12 +239,15 @@ export async function runCodexSession(args) {
         const request = JSON.parse(input);
         if (request.command === "pause") {
           paused = true;
+          pauseRequested = true;
+          resumePending = false;
           await stopChild(child);
           child = undefined;
           await persist();
           writeJSON(socket, { ok: true, record: currentRecord() });
         } else if (request.command === "resume") {
           paused = false;
+          resumePending = true;
           const resolve = resumeRequested;
           resumeRequested = undefined;
           if (resolve) resolve();
@@ -239,6 +277,8 @@ export async function runCodexSession(args) {
       const launchArgs = await buildCodexLaunchArgsFromState(currentArgs);
       const spawned = spawnCodex(realCodex, launchArgs);
       child = spawned.child;
+      pauseRequested = false;
+      resumePending = false;
       activeMatchedSession = undefined;
       await persist();
 
@@ -322,10 +362,12 @@ export async function runCodexSession(args) {
 
       await persist();
 
-      if (paused) {
+      if (pauseRequested || paused) {
         if (matchedSession?.sessionId) currentArgs = ["resume", matchedSession.sessionId];
         await persist();
         await waitForResume();
+        pauseRequested = false;
+        resumePending = false;
         continue;
       }
 

@@ -34,6 +34,27 @@ function tokenCount(timestamp, primary, secondary, resetsAt) {
   });
 }
 
+function premiumCreditsDepleted(timestamp) {
+  return JSON.stringify({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: null,
+      rate_limits: {
+        limit_id: "premium",
+        limit_name: null,
+        primary: null,
+        secondary: null,
+        credits: { has_credits: false, unlimited: false, balance: "0" },
+        individual_limit: null,
+        plan_type: null,
+        rate_limit_reached_type: null,
+      },
+    },
+  });
+}
+
 test("scanCodexSessions separates current status from historical exhaustion", async () => {
   const root = await mkdtemp(join(tmpdir(), "cdxx-quota-"));
   try {
@@ -77,6 +98,27 @@ test("scanCodexSessions marks current future reset exhaustion", async () => {
     assert.equal(summary.exhausted, true);
     assert.equal(summary.reason, "primary rate limit reached");
     assert.ok(summary.resetAt);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("scanCodexSessions treats depleted premium credits as exhaustion", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-quota-"));
+  try {
+    const sessions = join(root, "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(
+      join(sessions, "rollout.jsonl"),
+      `${premiumCreditsDepleted("2026-07-04T10:26:18.536Z")}\n`,
+    );
+
+    const summary = await scanCodexSessions({ sessionsDir: sessions });
+
+    assert.equal(summary.tokenCountRecords, 1);
+    assert.equal(summary.exhausted, true);
+    assert.equal(summary.reason, "credits exhausted");
+    assert.deepEqual(summary.lastCredits, { has_credits: false, unlimited: false, balance: "0" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
