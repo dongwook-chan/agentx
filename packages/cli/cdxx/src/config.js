@@ -127,10 +127,19 @@ export function clearExpiredQuota(profile, now = new Date()) {
   if (!profile.quotaScopes) return;
   const exhausted = [];
   for (const quota of Object.values(profile.quotaScopes)) {
-    if (!quota || quota.status !== "exhausted") continue;
+    if (!quota) continue;
+    if (quota.status === "available" && quota.remainingPercent !== undefined && quota.remainingPercent <= 0) {
+      quota.usedPercent = undefined;
+      quota.remainingPercent = undefined;
+      quota.resetText = undefined;
+    }
+    if (quota.status !== "exhausted") continue;
     if (quota.resetAt && Date.parse(quota.resetAt) <= now.getTime()) {
       quota.status = "available";
       quota.resetAt = undefined;
+      quota.resetText = undefined;
+      quota.usedPercent = undefined;
+      quota.remainingPercent = undefined;
       quota.reason = undefined;
     } else {
       exhausted.push(quota);

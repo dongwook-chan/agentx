@@ -33,10 +33,10 @@ function profileReset(profile) {
 
 function quotaCell(profile, scope, fallbackUsed) {
   const quota = profile.quotaScopes?.[scope];
-  const used = quota?.usedPercent ?? fallbackUsed;
+  const used = quota ? quota.usedPercent : fallbackUsed;
   const remaining = quota?.remainingPercent;
   if (used === undefined && remaining === undefined) return "";
-  if (remaining !== undefined) return `${used ?? 100}%/${remaining}% left`;
+  if (remaining !== undefined) return `${remaining}% left`;
   return `${used}%`;
 }
 

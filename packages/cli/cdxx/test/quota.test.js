@@ -204,7 +204,37 @@ test("clearExpiredQuota clears expired scoped Codex quota", () => {
   assert.equal(profile.quotaStatus, "available");
   assert.equal(profile.quotaScopes["5h"].status, "available");
   assert.equal(profile.quotaScopes["5h"].resetAt, undefined);
+  assert.equal(profile.quotaScopes["5h"].resetText, undefined);
+  assert.equal(profile.quotaScopes["5h"].usedPercent, undefined);
+  assert.equal(profile.quotaScopes["5h"].remainingPercent, undefined);
   assert.equal(profile.quotaScopes.weekly.status, "available");
+});
+
+test("clearExpiredQuota removes inconsistent available zero-remaining scoped quota", () => {
+  const profile = {
+    name: "user",
+    quotaStatus: "available",
+    quotaScopes: {
+      "5h": {
+        status: "available",
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetText: "15:29",
+      },
+      weekly: {
+        status: "available",
+        usedPercent: 43,
+        remainingPercent: 57,
+      },
+    },
+  };
+
+  clearExpiredQuota(profile, new Date("2026-07-04T00:00:00.000Z"));
+
+  assert.equal(profile.quotaScopes["5h"].usedPercent, undefined);
+  assert.equal(profile.quotaScopes["5h"].remainingPercent, undefined);
+  assert.equal(profile.quotaScopes["5h"].resetText, undefined);
+  assert.equal(profile.quotaScopes.weekly.remainingPercent, 57);
 });
 
 test("clearExpiredQuota recomputes aggregate status from active scoped quota", () => {
