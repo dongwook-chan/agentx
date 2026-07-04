@@ -1,4 +1,5 @@
-import { open, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
+import { IncrementalFileTail } from "@dong-/agentx-core";
 import { createQuotaSummary, finalizeQuotaSummary, ingestQuotaLine, parseQuotaTriggerLine } from "./quota.js";
 
 function cloneFinalSummary(summary) {
@@ -12,9 +13,7 @@ function cloneFinalSummary(summary) {
 export class QuotaTail {
   constructor(file, options = {}) {
     this.file = file;
-    this.offset = options.offset ?? 0;
-    this.carry = "";
-    this.lineNumber = options.lineNumber ?? 0;
+    this.tail = new IncrementalFileTail(file, options);
     this.summary = createQuotaSummary();
     this.summary.scannedFiles = 1;
   }
@@ -22,35 +21,21 @@ export class QuotaTail {
   async readAdded() {
     const info = await stat(this.file).catch(() => undefined);
     if (!info) return undefined;
-    if (info.size < this.offset) {
-      this.offset = 0;
-      this.carry = "";
-      this.lineNumber = 0;
+    if (info.size < this.tail.offset) {
       this.summary = createQuotaSummary();
       this.summary.scannedFiles = 1;
     }
-    if (info.size === this.offset) return undefined;
-
-    const size = info.size - this.offset;
-    const buffer = Buffer.alloc(size);
-    const handle = await open(this.file, "r");
-    try {
-      await handle.read(buffer, 0, size, this.offset);
-    } finally {
-      await handle.close();
-    }
-    this.offset = info.size;
-
-    const text = this.carry + buffer.toString("utf8");
-    const lines = text.split(/\r?\n/);
-    this.carry = text.endsWith("\n") || text.endsWith("\r") ? "" : (lines.pop() ?? "");
+    const added = await this.tail.readAdded();
+    if (!added) return undefined;
 
     let changed = false;
     let quotaTrigger;
-    for (const line of lines) {
-      this.lineNumber += 1;
+    const startingLine = added.lineNumber - added.lines.length;
+    let lineNumber = startingLine;
+    for (const line of added.lines) {
+      lineNumber += 1;
       if (!line) continue;
-      if (ingestQuotaLine(this.summary, this.file, this.lineNumber, line)) changed = true;
+      if (ingestQuotaLine(this.summary, this.file, lineNumber, line)) changed = true;
       quotaTrigger = quotaTrigger ?? parseQuotaTriggerLine(line);
     }
     if (!changed && !quotaTrigger) return undefined;

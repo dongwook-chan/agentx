@@ -4,15 +4,20 @@ import {
   applyLaunchPolicy,
   clearExpiredProfileQuota,
   decideUseProfile,
+  IncrementalFileTail,
   markActiveProfile,
   nativeSupervisorHostStatus,
   profileNameFromIdentity,
+  readFirstLineBounded,
   runUsageCheck,
   uniqueProfileName,
   useProfileDisabledReason,
   usageCheckMode,
 } from "../src/index.js";
 import type { GenericProfileRecord } from "../src/index.js";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 interface TestProfile extends GenericProfileRecord {
   previousNames?: string[];
@@ -175,4 +180,36 @@ test("usage policy centralizes refresh, local-scan, and state-only conditions", 
   assert.equal((await runUsageCheck(adapter, "session-exit"))?.source, "local");
   assert.equal(await runUsageCheck(adapter, "list"), undefined);
   assert.deepEqual(calls, ["refresh:explicit-scan", "local:session-exit"]);
+});
+
+test("readFirstLineBounded reads only the first line prefix", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentx-core-tail-"));
+  try {
+    const file = join(root, "large.log");
+    await writeFile(file, `first\n${"x".repeat(128 * 1024)}`);
+
+    assert.deepEqual(await readFirstLineBounded(file, { maxBytes: 1024 }), {
+      line: "first",
+      truncated: false,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("IncrementalFileTail reads only appended complete lines", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentx-core-tail-"));
+  try {
+    const file = join(root, "tail.log");
+    await writeFile(file, "old\npartial");
+    const tail = new IncrementalFileTail(file, { offset: Buffer.byteLength("old\n") });
+
+    assert.equal(await tail.readAdded(), undefined);
+    await appendFile(file, " line\nnext");
+    assert.deepEqual((await tail.readAdded())?.lines, ["partial line"]);
+    await appendFile(file, " line\n");
+    assert.deepEqual((await tail.readAdded())?.lines, ["next line"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

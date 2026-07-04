@@ -1,10 +1,9 @@
 import { ChildProcess, spawn } from "node:child_process";
-import { usageCheckMode } from "@dong-/agentx-core";
+import { IncrementalFileTail, usageCheckMode } from "@dong-/agentx-core";
 import { createServer, Socket } from "node:net";
-import { access, chmod, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, rename, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
 import {
   cleanupRuntimeFile,
   ensureDirectories,
@@ -94,6 +93,19 @@ function formatUsageQuotaScan(profileName: string, aggregates: UsageScopeAggrega
   if (!aggregates.length) return undefined;
   return `profile '${profileName}' gemini ${quotaScanStatus(aggregates, "gemini")} claude ${quotaScanStatus(aggregates, "claude")}`;
 }
+
+const abnormalLogKeywords = [
+  "signal terminated",
+  "Got signal",
+  "model unreachable",
+  "context canceled",
+  "quota reached",
+  "quota exceeded",
+  "RESOURCE_EXHAUSTED",
+  "connection lost",
+  "connection closed",
+  "stream error",
+];
 
 async function triggerAutoSwitch(
   scope: QuotaScope,
@@ -196,8 +208,8 @@ export async function supervise(args: string[]): Promise<number> {
   let intentionalStop = false;
   let conversationId: string | undefined;
   let finalCode = 0;
-  let logOffset = 0;
-  let terminalLogOffset = 0;
+  let logTail = new IncrementalFileTail(logPath);
+  let terminalLogTail = new IncrementalFileTail(terminalLogPath);
   let scanningLogEvents = false;
   let profileAtStart: string | undefined;
   let quotaMarkedScopes = new Set<QuotaScope>();
@@ -208,6 +220,7 @@ export async function supervise(args: string[]): Promise<number> {
   let currentQuotaScope: QuotaScope | undefined;
   const usageTranscriptState = createUsageTranscriptState();
   let usageProbeRunning = false;
+  let sawAbnormalLogSignal = false;
 
   const currentRecord = (): SessionRecord => ({
     id,
@@ -240,12 +253,7 @@ export async function supervise(args: string[]): Promise<number> {
   };
 
   const refreshConversation = async (): Promise<void> => {
-    try {
-      conversationId = detectConversation(await readFile(logPath, "utf8"))
-        ?? conversationId;
-    } catch {
-      // The log may not exist until agy has initialized.
-    }
+    await scanLogEvents().catch(() => undefined);
   };
 
   const handleQuotaExhausted = async (
@@ -262,28 +270,30 @@ export async function supervise(args: string[]): Promise<number> {
     if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(scope);
   };
 
-  const scanAgyLogEvents = async (profileName: string): Promise<boolean> => {
-    const content = await readFile(logPath, "utf8");
-    if (content.length < logOffset) logOffset = 0;
-    const appended = content.slice(logOffset);
-    logOffset = content.length;
+  const scanAgyLogEvents = async (profileName?: string): Promise<boolean> => {
+    const added = await logTail.readAdded();
+    if (!added) return false;
+    conversationId = detectConversation(added.text) ?? conversationId;
     let modelChanged = false;
-    for (const line of appended.split(/\r?\n/)) {
+    for (const line of added.lines) {
+      if (abnormalLogKeywords.some((keyword) => line.includes(keyword))) {
+        sawAbnormalLogSignal = true;
+      }
       const modelEvent = parseModelEventLine(line);
       if (modelEvent) {
         currentModelLabel = modelEvent.label;
         currentQuotaScope = modelEvent.scope;
         modelChanged = true;
       }
-      if (isRequestEventLine(line)) {
+      if (profileName && isRequestEventLine(line)) {
         await recordProfileRequest(profileName);
       }
       const eligibilityEvent = parseEligibilityEventLine(line);
-      if (eligibilityEvent) {
+      if (profileName && eligibilityEvent) {
         await recordProfileIneligible(profileName, eligibilityEvent);
       }
       const event = parseQuotaEventLine(line);
-      if (!event) continue;
+      if (!profileName || !event) continue;
       await handleQuotaExhausted(profileName, {
         ...event,
         scope: currentQuotaScope ?? "unknown",
@@ -294,12 +304,10 @@ export async function supervise(args: string[]): Promise<number> {
   };
 
   const scanTerminalUsageEvents = async (profileName: string): Promise<void> => {
-    const content = await readFile(terminalLogPath, "utf8");
-    if (content.length < terminalLogOffset) terminalLogOffset = 0;
-    const appended = content.slice(terminalLogOffset);
-    terminalLogOffset = content.length;
+    const added = await terminalLogTail.readAdded();
+    if (!added) return;
     for (const aggregate of parseUsageTranscriptAggregates(
-      appended,
+      added.text,
       new Date(),
       usageTranscriptState,
     )) {
@@ -321,9 +329,8 @@ export async function supervise(args: string[]): Promise<number> {
     scanningLogEvents = true;
     try {
       const profileName = profileAtStart;
-      if (!profileName) return;
       const modelChanged = await scanAgyLogEvents(profileName).catch(() => false);
-      await scanTerminalUsageEvents(profileName).catch(() => undefined);
+      if (profileName) await scanTerminalUsageEvents(profileName).catch(() => undefined);
       if (modelChanged) await persist();
     } catch {
       // The log or state file may not exist yet.
@@ -377,10 +384,11 @@ export async function supervise(args: string[]): Promise<number> {
     quotaMarkedScopes = new Set<QuotaScope>();
     currentModelLabel = undefined;
     currentQuotaScope = undefined;
+    sawAbnormalLogSignal = false;
     const state = await loadState();
     const launchArgs = buildAgyLaunchArgs(args, { conversationId, logPath, state });
     await cleanupRuntimeFile(terminalLogPath);
-    terminalLogOffset = 0;
+    terminalLogTail = new IncrementalFileTail(terminalLogPath);
     const launchCommand = await terminalTranscriptCommand(realAgy, launchArgs, terminalLogPath)
       ?? { command: realAgy, args: launchArgs };
     child = spawn(launchCommand.command, launchCommand.args, {
@@ -401,25 +409,7 @@ export async function supervise(args: string[]): Promise<number> {
       child = undefined;
       await persist();
       if (!intentionalStop && !paused) {
-        let isAbnormal = finalCode !== 0;
-        if (!isAbnormal) {
-          try {
-            const logContent = readFileSync(logPath, "utf8");
-            const keywords = [
-              "signal terminated",
-              "Got signal",
-              "model unreachable",
-              "context canceled",
-              "quota reached",
-              "quota exceeded",
-              "RESOURCE_EXHAUSTED",
-              "connection lost",
-              "connection closed",
-              "stream error",
-            ];
-            isAbnormal = keywords.some(kw => logContent.includes(kw));
-          } catch {}
-        }
+        const isAbnormal = finalCode !== 0 || sawAbnormalLogSignal;
         if (isAbnormal) {
           console.error(`\n[agyx] Session ended unexpectedly (exit code ${finalCode}). Restarting...`);
           setTimeout(() => { void startChild(); }, 1000);

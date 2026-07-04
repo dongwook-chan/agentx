@@ -1,5 +1,6 @@
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { readdir, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { readFirstLineBounded } from "@dong-/agentx-core";
 import { codexHome } from "./config.js";
 
 export const defaultSessionsDir = join(codexHome, "sessions");
@@ -20,14 +21,20 @@ async function walkJsonl(dir, out = []) {
 }
 
 async function readFirstJsonLine(path) {
-  const content = await readFile(path, "utf8").catch(() => "");
-  const line = content.split(/\r?\n/, 1)[0];
+  const result = await readFirstLineBounded(path).catch(() => undefined);
+  const line = result?.line;
   if (!line) return undefined;
   try {
     return JSON.parse(line);
   } catch {
-    return undefined;
+    return {};
   }
+}
+
+function emitFormatError(file, first, onFormatError) {
+  if (!onFormatError || !first) return;
+  const type = typeof first.type === "string" ? first.type : "unknown";
+  onFormatError(`[cdxx] Codex session format error: first line of ${file} is '${type}', expected 'session_meta'. Live quota failover cannot attach to this file.`);
 }
 
 export async function snapshotSessionFiles(sessionsDir = defaultSessionsDir) {
@@ -40,9 +47,12 @@ export async function snapshotSessionFiles(sessionsDir = defaultSessionsDir) {
   return snapshot;
 }
 
-export async function readSessionMeta(file) {
+export async function readSessionMeta(file, options = {}) {
   const first = await readFirstJsonLine(file);
-  if (first?.type !== "session_meta") return undefined;
+  if (first?.type !== "session_meta") {
+    emitFormatError(file, first, options.onFormatError);
+    return undefined;
+  }
   const payload = first.payload ?? {};
   const sessionId = payload.session_id ?? payload.id;
   const timestamp = payload.timestamp ?? first.timestamp;
@@ -89,6 +99,7 @@ export async function findMatchingSession({
   startMs,
   toleranceBeforeMs = 5000,
   includeExistingModified = true,
+  onFormatError,
 } = {}) {
   if (!startMs) throw new Error("findMatchingSession requires startMs.");
   const files = await walkJsonl(sessionsDir);
@@ -102,7 +113,7 @@ export async function findMatchingSession({
     const isModified = includeExistingModified && previousMtime !== undefined && info.mtimeMs > previousMtime + 1;
     if (!isNew && !isModified) continue;
 
-    const meta = await readSessionMeta(file);
+    const meta = await readSessionMeta(file, { onFormatError });
     if (!meta) continue;
     if (meta.cwd !== cwd) continue;
     if (meta.originator && meta.originator !== "codex-tui") continue;
@@ -118,6 +129,76 @@ export async function findMatchingSession({
   }
   candidates.sort((left, right) => left.score - right.score);
   return candidates[0];
+}
+
+export async function findSessionById(sessionId, {
+  sessionsDir = defaultSessionsDir,
+  before = new Map(),
+  onFormatError,
+} = {}) {
+  if (!sessionId) return undefined;
+  const files = await walkJsonl(sessionsDir);
+  const candidates = files.filter((file) => basename(file).includes(sessionId));
+  for (const file of candidates) {
+    const meta = await readSessionMeta(file, { onFormatError });
+    if (meta?.sessionId !== sessionId) continue;
+    const previous = before.get(file);
+    return {
+      ...meta,
+      isNew: !before.has(file),
+      isModified: before.has(file),
+      previousSize: before.has(file) ? snapshotSize(previous) : 0,
+      score: 0,
+    };
+  }
+  for (const file of files) {
+    if (candidates.includes(file)) continue;
+    const meta = await readSessionMeta(file, { onFormatError });
+    if (meta?.sessionId !== sessionId) continue;
+    const previous = before.get(file);
+    return {
+      ...meta,
+      isNew: !before.has(file),
+      isModified: before.has(file),
+      previousSize: before.has(file) ? snapshotSize(previous) : 0,
+      score: 0,
+    };
+  }
+  return undefined;
+}
+
+export async function waitForSessionFileChange({
+  sessionsDir = defaultSessionsDir,
+  before = new Map(),
+  intervalMs = 500,
+  signal,
+} = {}) {
+  while (!signal?.aborted) {
+    const files = await walkJsonl(sessionsDir);
+    for (const file of files) {
+      const info = await stat(file).catch(() => undefined);
+      if (!info) continue;
+      const previous = before.get(file);
+      const previousMtime = snapshotMtime(previous);
+      const previousSize = snapshotSize(previous) ?? 0;
+      const isNew = !before.has(file);
+      const grew = info.size > previousSize;
+      const modified = previousMtime !== undefined && info.mtimeMs > previousMtime + 1;
+      if ((isNew || modified) && grew) {
+        return { file, info, isNew, previousSize };
+      }
+    }
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, intervalMs);
+      if (signal) {
+        signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      }
+    });
+  }
+  return undefined;
 }
 
 export async function waitForMatchingSession(options = {}) {

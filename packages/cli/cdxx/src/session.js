@@ -11,8 +11,15 @@ import { runNativeSupervisor } from "./native.js";
 import { findRealCodex, isInteractiveCodex } from "./processes.js";
 import { QuotaTail, wait } from "./quota_tail.js";
 import { recordQuotaForProfile, scanCodexQuota } from "./quota.js";
-import { snapshotSessionFiles, waitForMatchingSession, findMatchingSession } from "./session_match.js";
+import {
+  findMatchingSession,
+  findSessionById,
+  snapshotSessionFiles,
+  waitForSessionFileChange,
+} from "./session_match.js";
 export { pickNextProfile } from "./selection.js";
+
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function spawnCodex(command, args) {
   const child = spawn(command, args, { stdio: "inherit", cwd: process.cwd(), env: process.env });
@@ -68,6 +75,17 @@ async function stopChild(child) {
 
 function writeJSON(socket, value) {
   socket.end(`${JSON.stringify(value)}\n`);
+}
+
+function requestedResumeSessionId(args) {
+  const resumeIndex = args.indexOf("resume");
+  if (resumeIndex < 0) return undefined;
+  for (const arg of args.slice(resumeIndex + 1)) {
+    if (arg.startsWith("-")) continue;
+    if (SESSION_ID_RE.test(arg)) return arg;
+    return undefined;
+  }
+  return undefined;
 }
 
 async function monitorMatchedSession(matchedSession, child, profileName, signal) {
@@ -229,14 +247,15 @@ export async function runCodexSession(args) {
       let matchedSession;
       let monitorPromise;
       let failover;
-
-      const matchPromise = waitForMatchingSession({
-        before,
-        cwd: process.cwd(),
-        startMs: started,
-        timeoutMs: 30000,
-        signal: matchAbort.signal,
-      }).then(async (match) => {
+      const warnedSessionFormatFiles = new Set();
+      const onFormatError = (message) => {
+        const file = message.match(/first line of (.+?) is/)?.[1];
+        const key = file ?? message;
+        if (warnedSessionFormatFiles.has(key)) return;
+        warnedSessionFormatFiles.add(key);
+        console.error(message);
+      };
+      const attachMatch = async (match) => {
         matchedSession = match;
         activeMatchedSession = match;
         await saveMatchedSession(match);
@@ -249,7 +268,39 @@ export async function runCodexSession(args) {
           });
         }
         return match;
-      }).catch(() => undefined);
+      };
+
+      const matchPromise = (async () => {
+        const resumeSessionId = requestedResumeSessionId(currentArgs);
+        let match = resumeSessionId
+          ? await findSessionById(resumeSessionId, { before, onFormatError })
+          : await findMatchingSession({
+            before,
+            cwd: process.cwd(),
+            startMs: started,
+            onFormatError,
+          });
+        if (match?.sessionId) return await attachMatch(match);
+
+        await waitForSessionFileChange({
+          before,
+          signal: matchAbort.signal,
+        });
+        if (matchAbort.signal.aborted) return undefined;
+        await wait(100, matchAbort.signal);
+        if (matchAbort.signal.aborted) return undefined;
+
+        match = resumeSessionId
+          ? await findSessionById(resumeSessionId, { before, onFormatError })
+          : await findMatchingSession({
+            before,
+            cwd: process.cwd(),
+            startMs: started,
+            onFormatError,
+          });
+        if (match?.sessionId) return await attachMatch(match);
+        return undefined;
+      })().catch(() => undefined);
 
       const code = await spawned.exit;
       child = undefined;
@@ -268,24 +319,6 @@ export async function runCodexSession(args) {
       if (matchedSession?.sessionId) lastSessionId = matchedSession.sessionId;
 
       await refreshActiveProfileCredential();
-      const summary = await scanCodexQuota({ sinceMs: started - 5000, reason: "session-exit" });
-      const profile = await recordQuotaForProfile(summary, profileName);
-      if (!failover && profile?.quotaStatus === "exhausted") {
-        console.error(`[cdxx] Profile '${profile.name}' reached quota${describeReset(profile)}.`);
-        const action = await decideCodexFailover({
-          profileName: profile.name,
-          sessionId: matchedSession?.sessionId,
-          summary,
-        });
-        if (action.message) console.error(action.message);
-        if (action.kind === "switch_and_resume" && action.profile && matchedSession?.sessionId) {
-          failover = {
-            sessionId: matchedSession.sessionId,
-            fromProfile: profile.name,
-            toProfile: action.profile,
-          };
-        }
-      }
 
       await persist();
 

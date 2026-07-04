@@ -7,8 +7,10 @@ import {
   pickNextProfile,
 } from "../src/session.js";
 import {
+  findSessionById,
   findMatchingSession,
   snapshotSessionFiles,
+  waitForSessionFileChange,
   waitForMatchingSession,
 } from "../src/session_match.js";
 
@@ -128,6 +130,81 @@ test("waitForMatchingSession notices a session created after polling starts", as
     const match = await pending;
 
     assert.equal(match.sessionId, "00000000-0000-0000-0000-000000000004");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("findSessionById matches resumed sessions that existed before launch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-match-"));
+  try {
+    const id = "00000000-0000-0000-0000-000000000006";
+    const file = await writeSession(root, `rollout-${id}.jsonl`, sessionMeta({
+      id,
+      timestamp: "2026-06-28T04:00:00.000Z",
+      cwd: "/tmp/original",
+    }));
+    const before = await snapshotSessionFiles(root);
+
+    const match = await findSessionById(id, { sessionsDir: root, before });
+
+    assert.equal(match.sessionId, id);
+    assert.equal(match.file, file);
+    assert.equal(match.previousSize, before.get(file).size);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("findMatchingSession reports non-session_meta first line without scanning whole file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-match-"));
+  try {
+    const before = await snapshotSessionFiles(root);
+    await writeSession(
+      root,
+      "bad.jsonl",
+      `${JSON.stringify({ type: "event_msg", payload: {} })}\n${"x".repeat(128 * 1024)}`,
+    );
+    const errors = [];
+
+    const match = await findMatchingSession({
+      sessionsDir: root,
+      before,
+      cwd: "/tmp/project",
+      startMs: Date.now() - 1000,
+      onFormatError: (message) => errors.push(message),
+    });
+
+    assert.equal(match, undefined);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /expected 'session_meta'/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("waitForSessionFileChange waits for a real append after snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-match-"));
+  try {
+    const file = await writeSession(root, "pending.jsonl", "");
+    const before = await snapshotSessionFiles(root);
+    const pending = waitForSessionFileChange({
+      sessionsDir: root,
+      before,
+      intervalMs: 50,
+    });
+    setTimeout(() => {
+      void writeFile(file, sessionMeta({
+        id: "00000000-0000-0000-0000-000000000007",
+        timestamp: new Date().toISOString(),
+        cwd: "/tmp/live",
+      }));
+    }, 100);
+
+    const changed = await pending;
+
+    assert.equal(changed.file, file);
+    assert.equal(changed.previousSize, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

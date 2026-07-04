@@ -1,3 +1,101 @@
+import { open, stat } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
+
+export interface FirstLineReadResult {
+  line?: string;
+  truncated: boolean;
+}
+
+export async function readFirstLineBounded(
+  path: string,
+  options: { maxBytes?: number; chunkSize?: number } = {},
+): Promise<FirstLineReadResult> {
+  const maxBytes = options.maxBytes ?? 64 * 1024;
+  const chunkSize = Math.max(1, Math.min(options.chunkSize ?? 4096, maxBytes));
+  const handle = await open(path, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let bytesReadTotal = 0;
+    while (bytesReadTotal < maxBytes) {
+      const remaining = maxBytes - bytesReadTotal;
+      const buffer = Buffer.alloc(Math.min(chunkSize, remaining));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, bytesReadTotal);
+      if (bytesRead <= 0) break;
+      const chunk = buffer.subarray(0, bytesRead);
+      const newlineAt = chunk.indexOf(0x0a);
+      if (newlineAt >= 0) {
+        chunks.push(chunk.subarray(0, newlineAt));
+        const line = Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
+        return { line, truncated: false };
+      }
+      chunks.push(chunk);
+      bytesReadTotal += bytesRead;
+    }
+    const line = Buffer.concat(chunks).toString("utf8").replace(/\r$/, "");
+    return { line: line || undefined, truncated: bytesReadTotal >= maxBytes };
+  } finally {
+    await handle.close();
+  }
+}
+
+export interface IncrementalFileTailRead {
+  text: string;
+  lines: string[];
+  offset: number;
+  lineNumber: number;
+}
+
+export class IncrementalFileTail {
+  readonly file: string;
+  offset: number;
+  lineNumber: number;
+  private carry = "";
+  private decoder = new StringDecoder("utf8");
+
+  constructor(file: string, options: { offset?: number; lineNumber?: number } = {}) {
+    this.file = file;
+    this.offset = options.offset ?? 0;
+    this.lineNumber = options.lineNumber ?? 0;
+  }
+
+  async readAdded(): Promise<IncrementalFileTailRead | undefined> {
+    const info = await stat(this.file).catch(() => undefined);
+    if (!info) return undefined;
+    if (info.size < this.offset) {
+      this.offset = 0;
+      this.lineNumber = 0;
+      this.carry = "";
+      this.decoder = new StringDecoder("utf8");
+    }
+    if (info.size === this.offset) return undefined;
+
+    const size = info.size - this.offset;
+    const buffer = Buffer.alloc(size);
+    const handle = await open(this.file, "r");
+    try {
+      await handle.read(buffer, 0, size, this.offset);
+    } finally {
+      await handle.close();
+    }
+    this.offset = info.size;
+
+    const rawText = this.carry + this.decoder.write(buffer);
+    const split = rawText.split(/\r?\n/);
+    const ended = rawText.endsWith("\n") || rawText.endsWith("\r");
+    if (ended) {
+      split.pop();
+      this.carry = "";
+    } else {
+      this.carry = split.pop() ?? "";
+    }
+    const lines = split;
+    if (!lines.length) return undefined;
+    const text = lines.length ? `${lines.join("\n")}${ended ? "\n" : ""}` : "";
+    this.lineNumber += lines.length;
+    return { text, lines, offset: this.offset, lineNumber: this.lineNumber };
+  }
+}
+
 export interface LaunchPolicy {
   productName: string;
   yoloEnabled: boolean;
