@@ -139,3 +139,271 @@ export const agentCliManifests = {
     },
   },
 } as const satisfies Record<string, AgentCliManifest>;
+
+export interface ManagedSessionRecord {
+  id: string;
+  pid?: number;
+  childPid?: number;
+  cwd?: string;
+  args?: readonly string[];
+  socketPath?: string;
+  paused?: boolean;
+  restartable?: boolean;
+  startedAt?: string;
+}
+
+export interface SessionControlAdapter<TRecord extends ManagedSessionRecord> {
+  sessionRecords(): Promise<TRecord[]>;
+  pause(record: TRecord): Promise<TRecord>;
+  resume?(record: TRecord): Promise<void>;
+  afterPause?(paused: readonly TRecord[]): Promise<void>;
+  onResumeError?(record: TRecord, error: unknown): void;
+}
+
+export async function pauseAllSessions<TRecord extends ManagedSessionRecord>(
+  adapter: SessionControlAdapter<TRecord>,
+): Promise<TRecord[]> {
+  const records = await adapter.sessionRecords();
+  const paused: TRecord[] = [];
+  for (const record of records) {
+    paused.push(await adapter.pause(record));
+  }
+  await adapter.afterPause?.(paused);
+  return paused;
+}
+
+export async function resumeAllSessions<TRecord extends ManagedSessionRecord>(
+  adapter: SessionControlAdapter<TRecord>,
+  records: readonly TRecord[],
+): Promise<void> {
+  for (const record of records) {
+    try {
+      if (!adapter.resume) throw new Error("Session adapter does not implement resume.");
+      await adapter.resume(record);
+    } catch (error) {
+      if (adapter.onResumeError) adapter.onResumeError(record, error);
+      else throw error;
+    }
+  }
+}
+
+export interface AuthSwitchTransactionAdapter<TRecord extends ManagedSessionRecord> {
+  sessionControl: SessionControlAdapter<TRecord>;
+  withLock?<T>(operation: () => Promise<T>): Promise<T>;
+}
+
+export async function runAuthSwitchTransaction<TRecord extends ManagedSessionRecord, TResult>(
+  adapter: AuthSwitchTransactionAdapter<TRecord>,
+  operation: () => Promise<TResult>,
+  options: { resume?: boolean } = {},
+): Promise<TResult> {
+  const run = async (): Promise<TResult> => {
+    const records = await pauseAllSessions(adapter.sessionControl);
+    try {
+      return await operation();
+    } finally {
+      if (options.resume ?? true) {
+        await resumeAllSessions(adapter.sessionControl, records);
+      }
+    }
+  };
+  return adapter.withLock ? await adapter.withLock(run) : await run();
+}
+
+export type UsageCheckReason =
+  | "explicit-scan"
+  | "manual-record"
+  | "live-quota-trigger"
+  | "session-exit"
+  | "list"
+  | "use";
+
+export type UsageCheckMode = "refresh" | "local-scan" | "state-only";
+
+export interface UsageScopeSnapshot {
+  status: "available" | "exhausted" | "unknown";
+  usedPercent?: number;
+  remainingPercent?: number;
+  resetAt?: string;
+  resetText?: string;
+  reason?: string;
+  checkedAt?: string;
+}
+
+export interface UsageSnapshot<TScope extends string = string> {
+  source: string;
+  scopes?: Partial<Record<TScope, UsageScopeSnapshot>>;
+  exhausted?: boolean;
+  resetAt?: string;
+  reason?: string;
+}
+
+export interface UsageRefreshAdapter<TSnapshot extends UsageSnapshot = UsageSnapshot> {
+  refreshUsage(reason: UsageCheckReason): Promise<TSnapshot | undefined>;
+  scanLocalUsage?(reason: UsageCheckReason): Promise<TSnapshot | undefined>;
+}
+
+export function usageCheckMode(reason: UsageCheckReason): UsageCheckMode {
+  switch (reason) {
+    case "explicit-scan":
+    case "manual-record":
+    case "live-quota-trigger":
+      return "refresh";
+    case "session-exit":
+      return "local-scan";
+    case "list":
+    case "use":
+      return "state-only";
+  }
+}
+
+export async function runUsageCheck<TSnapshot extends UsageSnapshot>(
+  adapter: UsageRefreshAdapter<TSnapshot>,
+  reason: UsageCheckReason,
+  options: { allowLocalFallback?: boolean } = {},
+): Promise<TSnapshot | undefined> {
+  const mode = usageCheckMode(reason);
+  if (mode === "state-only") return undefined;
+  if (mode === "local-scan") return await adapter.scanLocalUsage?.(reason);
+
+  try {
+    return await adapter.refreshUsage(reason);
+  } catch (error) {
+    if (options.allowLocalFallback ?? true) {
+      const snapshot = await adapter.scanLocalUsage?.(reason);
+      if (snapshot && typeof snapshot === "object") {
+        return {
+          ...snapshot,
+          refreshError: error instanceof Error ? error.message : String(error),
+        } as TSnapshot;
+      }
+    }
+    throw error;
+  }
+}
+
+export interface GenericProfileRecord {
+  name: string;
+  updatedAt?: string;
+  lastActivatedAt?: string;
+  selectionCount?: number;
+  quotaStatus?: "unknown" | "available" | "exhausted";
+  quotaResetAt?: string;
+  lastQuotaReason?: string;
+}
+
+export interface GenericProfileState<TProfile extends GenericProfileRecord> {
+  activeProfile?: string;
+  profiles: TProfile[];
+}
+
+export function validateProfileName(input: unknown): string {
+  const name = String(input ?? "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+    throw new Error("Profile names must be 1-64 chars: letters, numbers, dot, underscore, dash.");
+  }
+  return name;
+}
+
+export function profileNameFromIdentity(identity: unknown): string {
+  const source = String(identity ?? "").split("@")[0] ?? "";
+  const normalized = source
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .replace(/[._-]{2,}/g, "-")
+    .slice(0, 64);
+  return validateProfileName(normalized || "account");
+}
+
+export function uniqueProfileName<TProfile extends GenericProfileRecord>(
+  baseName: string,
+  state: GenericProfileState<TProfile>,
+  options: { aliases?: (profile: TProfile) => readonly string[] | undefined } = {},
+): string {
+  const base = validateProfileName(baseName);
+  const names = new Set(
+    state.profiles.flatMap((profile) => [
+      profile.name,
+      ...(options.aliases?.(profile) ?? []),
+    ]),
+  );
+  if (!names.has(base)) return base;
+  for (let suffix = 2; suffix < 10000; suffix += 1) {
+    const candidate = `${base.slice(0, Math.max(1, 64 - String(suffix).length - 1))}-${suffix}`;
+    if (!names.has(candidate)) return candidate;
+  }
+  throw new Error(`Could not find an unused profile name for '${base}'.`);
+}
+
+export function clearExpiredProfileQuota<TProfile extends GenericProfileRecord>(
+  profile: TProfile,
+  now = new Date(),
+): void {
+  if (
+    profile.quotaStatus === "exhausted"
+    && profile.quotaResetAt
+    && Date.parse(profile.quotaResetAt) <= now.getTime()
+  ) {
+    profile.quotaStatus = "available";
+    profile.quotaResetAt = undefined;
+    profile.lastQuotaReason = undefined;
+  }
+}
+
+export function markActiveProfile<TProfile extends GenericProfileRecord>(
+  state: GenericProfileState<TProfile>,
+  name: string,
+  options: { now?: Date; incrementSelection?: boolean } = {},
+): TProfile {
+  const profile = state.profiles.find((entry) => entry.name === name);
+  if (!profile) throw new Error(`Profile not found: ${name}`);
+  const now = options.now ?? new Date();
+  const nowString = now.toISOString();
+  state.activeProfile = name;
+  profile.lastActivatedAt = nowString;
+  profile.updatedAt = nowString;
+  if (options.incrementSelection ?? true) {
+    profile.selectionCount = (profile.selectionCount ?? 0) + 1;
+  }
+  clearExpiredProfileQuota(profile, now);
+  return profile;
+}
+
+export interface NativeSupervisorHostStatus {
+  supported: boolean;
+  platform: string;
+  arch: string;
+  expected: string;
+  binaryName?: string;
+  message?: string;
+}
+
+export function nativeSupervisorBinaryName(
+  binariesByHost: Readonly<Record<string, string>>,
+  platform = process.platform,
+  arch = process.arch,
+): string | undefined {
+  return binariesByHost[`${platform}:${arch}`];
+}
+
+export function nativeSupervisorHostStatus(
+  productName: string,
+  binariesByHost: Readonly<Record<string, string>>,
+  expected: string,
+  platform = process.platform,
+  arch = process.arch,
+): NativeSupervisorHostStatus {
+  const binaryName = nativeSupervisorBinaryName(binariesByHost, platform, arch);
+  const supported = Boolean(binaryName);
+  return {
+    supported,
+    platform,
+    arch,
+    expected,
+    binaryName,
+    message: supported
+      ? undefined
+      : `${productName} native supervisor supports ${expected} only; current host is ${platform}/${arch}.`,
+  };
+}
