@@ -1,6 +1,13 @@
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  clearExpiredProfileQuota,
+  markActiveProfile,
+  profileNameFromIdentity,
+  uniqueProfileName as coreUniqueProfileName,
+  validateProfileName as coreValidateProfileName,
+} from "@dong-/agentx-core";
 import { QuotaScope } from "./quota.js";
 
 export interface ScopedQuotaRecord {
@@ -167,24 +174,7 @@ export function markProfileActivated(
   now = new Date(),
   incrementSelection = true,
 ): void {
-  const profile = state.profiles.find((entry) => entry.name === name);
-  if (!profile) throw new Error(`Profile not found: ${name}`);
-  const nowString = now.toISOString();
-  state.activeProfile = name;
-  profile.lastActivatedAt = nowString;
-  profile.updatedAt = nowString;
-  if (incrementSelection) {
-    profile.selectionCount = (profile.selectionCount ?? 0) + 1;
-  }
-  if (
-    profile.quotaStatus === "exhausted"
-    && profile.quotaResetAt
-    && Date.parse(profile.quotaResetAt) <= now.getTime()
-  ) {
-    profile.quotaStatus = "available";
-    profile.quotaResetAt = undefined;
-    profile.lastQuotaReason = undefined;
-  }
+  const profile = markActiveProfile(state, name, { now, incrementSelection });
   clearExpiredScopedQuotas(profile, now);
 }
 
@@ -385,35 +375,17 @@ export async function cleanupRuntimeFile(path: string): Promise<void> {
 }
 
 export function validateProfileName(name: string): string {
-  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
-    throw new Error(
-      `Invalid profile name '${name}'. Use letters, numbers, '.', '_' or '-'.`,
-    );
-  }
-  return name;
+  return coreValidateProfileName(name);
 }
 
 export function profileNameFromEmail(email: string): string {
-  const localPart = email.split("@")[0] ?? "";
-  const normalized = localPart
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^[._-]+|[._-]+$/g, "")
-    .replace(/[._-]{2,}/g, "-");
-  return validateProfileName(normalized || "account");
+  return profileNameFromIdentity(email);
 }
 
 export function uniqueProfileName(baseName: string, state: State): string {
-  const base = validateProfileName(baseName);
-  const names = new Set(
-    state.profiles.flatMap((profile) => [profile.name, ...(profile.previousNames ?? [])]),
-  );
-  if (!names.has(base)) return base;
-  for (let suffix = 2; suffix < 10000; suffix += 1) {
-    const candidate = `${base}-${suffix}`;
-    if (!names.has(candidate)) return candidate;
-  }
-  throw new Error(`Could not find an unused profile name for '${base}'.`);
+  return coreUniqueProfileName(baseName, state, {
+    aliases: (profile) => profile.previousNames,
+  });
 }
 
 export async function ensureParent(path: string): Promise<void> {

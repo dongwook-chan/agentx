@@ -1,5 +1,11 @@
 import { spawn } from "node:child_process";
 import {
+  pauseAllSessions,
+  resumeAllSessions,
+  runAuthSwitchTransaction,
+  SessionControlAdapter,
+} from "@dong-/agentx-core";
+import {
   chmod,
   mkdir,
   readdir,
@@ -224,40 +230,58 @@ export async function withAuthSwitchLock<T>(
   }
 }
 
-export async function pauseAll(): Promise<SessionRecord[]> {
-  const records = await sessionRecords();
-  const paused: SessionRecord[] = [];
-  for (const record of records) {
-    const reply = await send(record.socketPath, "pause");
-    if (!reply.ok) {
-      if (!reply.error?.includes("Unexpected non-whitespace character after JSON")) {
-        throw new Error(reply.error ?? `Failed to pause ${record.id}`);
+function sessionControlAdapter(): SessionControlAdapter<SessionRecord> {
+  return {
+    sessionRecords,
+    pause: async (record) => {
+      const reply = await send(record.socketPath, "pause");
+      if (!reply.ok) {
+        if (!reply.error?.includes("Unexpected non-whitespace character after JSON")) {
+          throw new Error(reply.error ?? `Failed to pause ${record.id}`);
+        }
+        return {
+          ...record,
+          childPid: undefined,
+          paused: true,
+        };
       }
-      paused.push({
-        ...record,
-        childPid: undefined,
-        paused: true,
-      });
-      continue;
-    }
-    paused.push(reply.record ?? { ...record, childPid: undefined, paused: true });
-  }
+      return reply.record ?? { ...record, childPid: undefined, paused: true };
+    },
+    afterPause: async (paused) => {
+      const managedPIDs = new Set(paused.map((record) => record.childPid).filter(Boolean));
+      const unmanaged = (await runningAgy()).filter(({ pid }) => !managedPIDs.has(pid));
+      if (unmanaged.length) await stopProcesses(unmanaged);
+    },
+    resume: async (record) => {
+      const reply = await send(record.socketPath, "resume");
+      if (!reply.ok) throw new Error(reply.error);
+    },
+    onResumeError: (record, error) => {
+      console.error(`agyx: failed to resume session ${record.id}: ${(error as Error).message}`);
+    },
+  };
+}
 
-  const managedPIDs = new Set(paused.map((record) => record.childPid).filter(Boolean));
-  const unmanaged = (await runningAgy()).filter(({ pid }) => !managedPIDs.has(pid));
-  if (unmanaged.length) await stopProcesses(unmanaged);
-  return paused;
+async function withPausedAuthSwitch<T>(
+  operation: () => Promise<T>,
+  options: { resume?: boolean } = {},
+): Promise<T> {
+  return await runAuthSwitchTransaction(
+    {
+      sessionControl: sessionControlAdapter(),
+      withLock: withAuthSwitchLock,
+    },
+    operation,
+    options,
+  );
+}
+
+export async function pauseAll(): Promise<SessionRecord[]> {
+  return await pauseAllSessions(sessionControlAdapter());
 }
 
 export async function resumeAll(records: SessionRecord[]): Promise<void> {
-  for (const record of records) {
-    try {
-      const reply = await send(record.socketPath, "resume");
-      if (!reply.ok) throw new Error(reply.error);
-    } catch (error) {
-      console.error(`agyx: failed to resume session ${record.id}: ${(error as Error).message}`);
-    }
-  }
+  await resumeAllSessions(sessionControlAdapter(), records);
 }
 
 export interface ProfileCaptureResult {
@@ -375,7 +399,7 @@ export async function activateProfile(
 }
 
 export async function switchProfile(name: string): Promise<ProfileSwitchResult> {
-  return await withAuthSwitchLock(async () => {
+  return await withPausedAuthSwitch(async () => {
     const initialState = await loadState();
     const quotaScopes = await activeQuotaScopes();
     const profile = initialState.profiles.find((entry) => entry.name === name);
@@ -395,21 +419,18 @@ export async function switchProfile(name: string): Promise<ProfileSwitchResult> 
       const status = effectiveProfileStatus(profile, new Date(), selectionOptions);
       throw new Error(`Profile '${name}' is not selectable: ${status}.`);
     }
-    const sessions = await pauseAll();
     const previousCredential = await keychain.readActive().catch(() => undefined);
     try {
       return await activateProfile(name, { verify: true });
     } catch (error) {
       if (previousCredential) await keychain.writeActive(previousCredential);
       throw error;
-    } finally {
-      await resumeAll(sessions);
     }
   });
 }
 
 export async function switchToNextProfile(): Promise<ProfileSwitchResult> {
-  return await withAuthSwitchLock(async () => {
+  return await withPausedAuthSwitch(async () => {
     const initialState = await loadState();
     const quotaScopes = await activeQuotaScopes();
     const initialCandidate = selectNextProfile(initialState, new Date(), { quotaScopes });
@@ -420,7 +441,6 @@ export async function switchToNextProfile(): Promise<ProfileSwitchResult> {
         alreadyActive: true,
       };
     }
-    const sessions = await pauseAll();
     const previousCredential = await keychain.readActive().catch(() => undefined);
     let lastError: Error | undefined;
     try {
@@ -448,8 +468,6 @@ export async function switchToNextProfile(): Promise<ProfileSwitchResult> {
     } catch (error) {
       if (previousCredential) await keychain.writeActive(previousCredential);
       throw error;
-    } finally {
-      await resumeAll(sessions);
     }
   });
 }
@@ -472,7 +490,7 @@ export async function autoSwitchAfterQuota(
   quotaScope: QuotaScope,
 ): Promise<ProfileSwitchResult | undefined> {
   return await withAutoSwitchLock(async () => {
-    return await withAuthSwitchLock(async () => {
+    return await withPausedAuthSwitch(async () => {
       const initialState = await loadState();
       const mode = effectiveAutoSwitchMode(initialState);
       if (mode === "off") return undefined;
@@ -482,7 +500,6 @@ export async function autoSwitchAfterQuota(
       if (!shouldAutoSwitchAfterQuota(activeProfile, mode, quotaScope)) return undefined;
 
       const initialCandidate = selectAutoSwitchProfile(initialState, mode, quotaScope);
-      const sessions = await pauseAll();
       const previousCredential = await keychain.readActive().catch(() => undefined);
       let lastError: Error | undefined;
       try {
@@ -507,8 +524,6 @@ export async function autoSwitchAfterQuota(
       } catch (error) {
         if (previousCredential) await keychain.writeActive(previousCredential);
         throw error;
-      } finally {
-        await resumeAll(sessions);
       }
     });
   });
@@ -537,8 +552,7 @@ export async function autoSwitchAfterQuotaAction(
 }
 
 export async function verifyAllProfiles(): Promise<State> {
-  return await withAuthSwitchLock(async () => {
-    const sessions = await pauseAll();
+  return await withPausedAuthSwitch(async () => {
     const previousCredential = await keychain.readActive().catch(() => undefined);
     try {
       const names = (await loadState()).profiles.map((profile) => profile.name);
@@ -567,7 +581,6 @@ export async function verifyAllProfiles(): Promise<State> {
       return await loadState();
     } finally {
       if (previousCredential) await keychain.writeActive(previousCredential);
-      await resumeAll(sessions);
     }
   });
 }
@@ -667,8 +680,7 @@ export async function loginProfile(
   explicitEmail?: string,
   resume = true,
 ): Promise<ProfileCaptureResult> {
-  return await withAuthSwitchLock(async () => {
-    const sessions = await pauseAll();
+  return await withPausedAuthSwitch(async () => {
     const state = await loadState();
     const previousCredential = await keychain.readActive().catch(() => undefined);
     if (state.activeProfile && previousCredential) {
@@ -692,8 +704,6 @@ export async function loginProfile(
       if (previousCredential) await keychain.writeActive(previousCredential);
       await saveState(state);
       throw error;
-    } finally {
-      if (resume) await resumeAll(sessions);
     }
-  });
+  }, { resume });
 }

@@ -1,4 +1,5 @@
 import { ChildProcess, spawn } from "node:child_process";
+import { usageCheckMode } from "@dong-/agentx-core";
 import { createServer, Socket } from "node:net";
 import { access, chmod, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
@@ -251,6 +252,7 @@ export async function supervise(args: string[]): Promise<number> {
     profileName: string,
     event: { reason: string; resetAt?: string; scope: QuotaScope; modelLabel?: string },
   ): Promise<void> => {
+    if (usageCheckMode("live-quota-trigger") !== "refresh") return;
     const scope = event.scope;
     if (autoSwitchStoppedScopes.has(scope)) return;
     if (quotaMarkedScopes.has(scope)) return;
@@ -305,17 +307,12 @@ export async function supervise(args: string[]): Promise<number> {
         await recordProfileQuotaAvailable(profileName, aggregate.scope);
         continue;
       }
-      await recordProfileQuotaExhausted(profileName, {
+      await handleQuotaExhausted(profileName, {
         reason: aggregate.reason ?? "usage quota exhausted",
         resetAt: aggregate.resetAt,
         scope: aggregate.scope,
         modelLabel: aggregate.modelLabel,
       });
-      if (autoSwitchStoppedScopes.has(aggregate.scope)) continue;
-      if (quotaMarkedScopes.has(aggregate.scope)) continue;
-      quotaMarkedScopes.add(aggregate.scope);
-      const action = await triggerAutoSwitch(aggregate.scope);
-      if (action?.kind === "stop_retrying") autoSwitchStoppedScopes.add(aggregate.scope);
     }
   };
 

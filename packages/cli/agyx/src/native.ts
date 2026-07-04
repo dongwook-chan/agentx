@@ -2,6 +2,11 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  nativeSupervisorBinaryName as coreNativeSupervisorBinaryName,
+  nativeSupervisorHostStatus as coreNativeSupervisorHostStatus,
+  NativeSupervisorHostStatus,
+} from "@dong-/agentx-core";
 
 export const nativeSupervisorBinaryByHost = {
   "darwin:arm64": "agyx-supervisor-darwin-arm64",
@@ -10,40 +15,24 @@ export const nativeSupervisorBinaryByHost = {
 
 export type NativeSupervisorHost = keyof typeof nativeSupervisorBinaryByHost;
 
-export interface NativeHostStatus {
-  supported: boolean;
-  platform: string;
-  arch: string;
-  expected: "darwin/arm64 or linux/arm64";
-  binaryName?: string;
-  message?: string;
-}
-
 export function nativeSupervisorBinaryName(
   platform = process.platform,
   arch = process.arch,
 ): string | undefined {
-  return nativeSupervisorBinaryByHost[
-    `${platform}:${arch}` as NativeSupervisorHost
-  ];
+  return coreNativeSupervisorBinaryName(nativeSupervisorBinaryByHost, platform, arch);
 }
 
 export function nativeSupervisorHostStatus(
   platform = process.platform,
   arch = process.arch,
-): NativeHostStatus {
-  const binaryName = nativeSupervisorBinaryName(platform, arch);
-  const supported = Boolean(binaryName);
-  return {
-    supported,
+): NativeSupervisorHostStatus {
+  return coreNativeSupervisorHostStatus(
+    "agyx",
+    nativeSupervisorBinaryByHost,
+    "darwin/arm64 or linux/arm64",
     platform,
     arch,
-    expected: "darwin/arm64 or linux/arm64",
-    binaryName,
-    message: supported
-      ? undefined
-      : `agyx native supervisor supports darwin/arm64 and linux/arm64 only; current host is ${platform}/${arch}.`,
-  };
+  );
 }
 
 export function nativeSupervisorPath(): string {
