@@ -238,6 +238,9 @@ export async function runCodexSession(args) {
       try {
         const request = JSON.parse(input);
         if (request.command === "pause") {
+          if (request.reason === "profile-switch") {
+            console.error("[cdxx] Profile switch requested; this Codex session will restart with the active profile.");
+          }
           paused = true;
           pauseRequested = true;
           resumePending = false;
@@ -246,6 +249,9 @@ export async function runCodexSession(args) {
           await persist();
           writeJSON(socket, { ok: true, record: currentRecord() });
         } else if (request.command === "resume") {
+          if (request.reason === "profile-switch") {
+            console.error("[cdxx] Resuming Codex session after profile switch.");
+          }
           paused = false;
           resumePending = true;
           const resolve = resumeRequested;

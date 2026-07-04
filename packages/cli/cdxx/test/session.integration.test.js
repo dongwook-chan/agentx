@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +36,18 @@ async function runCli(args, env) {
   });
 }
 
+async function send(socketPath, payload) {
+  return await new Promise((resolve, reject) => {
+    const socket = connect(socketPath);
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.end(`${JSON.stringify(payload)}\n`));
+    socket.on("data", (chunk) => { input += chunk; });
+    socket.on("error", reject);
+    socket.on("close", () => resolve(JSON.parse(input)));
+  });
+}
+
 test("session resumes even when resume command arrives before pause loop waits", async () => {
   const root = await mkdtemp(join(tmpdir(), "cdxx-session-integration-"));
   const fakeCodex = join(root, "codex");
@@ -56,8 +69,11 @@ while :; do sleep 1; done
   const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {
     cwd: root,
     env,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
   });
+  let supervisorStderr = "";
+  supervisor.stderr.setEncoding("utf8");
+  supervisor.stderr.on("data", (chunk) => { supervisorStderr += chunk; });
 
   try {
     await waitFor(async () => {
@@ -77,6 +93,61 @@ while :; do sleep 1; done
       const lines = (await readFile(launches, "utf8")).trim().split("\n");
       return lines.length >= 2;
     });
+    assert.doesNotMatch(supervisorStderr, /Profile switch requested/);
+  } finally {
+    if (supervisor.exitCode === null && supervisor.signalCode === null) {
+      supervisor.kill("SIGTERM");
+      await new Promise((resolve) => supervisor.once("exit", resolve));
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("profile switch restart notice is printed in the supervised Codex terminal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-session-notice-"));
+  const fakeCodex = join(root, "codex");
+  const launches = join(root, "launches.txt");
+  await writeFile(fakeCodex, `#!/bin/sh
+printf '%s\\n' "$*" >> "$CDXX_TEST_LAUNCHES"
+trap 'exit 0' INT TERM
+while :; do sleep 1; done
+`);
+  await chmod(fakeCodex, 0o755);
+
+  const env = {
+    ...process.env,
+    CDXX_CONFIG_DIR: join(root, "config"),
+    CODEX_HOME: join(root, "codex-home"),
+    CDXX_REAL_CODEX: fakeCodex,
+    CDXX_TEST_LAUNCHES: launches,
+  };
+  const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {
+    cwd: root,
+    env,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let supervisorStderr = "";
+  supervisor.stderr.setEncoding("utf8");
+  supervisor.stderr.on("data", (chunk) => { supervisorStderr += chunk; });
+
+  try {
+    await waitFor(async () => {
+      try {
+        return (await readFile(launches, "utf8")).trim().split("\n").length === 1;
+      } catch {
+        return false;
+      }
+    });
+    const socketPath = join(root, "config", "run", `${supervisor.pid}.sock`);
+    const paused = await send(socketPath, { command: "pause", reason: "profile-switch" });
+    assert.equal(paused.ok, true);
+    const resumed = await send(socketPath, { command: "resume", reason: "profile-switch" });
+    assert.equal(resumed.ok, true);
+
+    await waitFor(async () =>
+      /Profile switch requested/.test(supervisorStderr)
+      && /Resuming Codex session after profile switch/.test(supervisorStderr)
+    );
   } finally {
     if (supervisor.exitCode === null && supervisor.signalCode === null) {
       supervisor.kill("SIGTERM");

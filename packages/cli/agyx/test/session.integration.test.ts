@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { connect } from "node:net";
 import {
   chmod,
   mkdtemp,
@@ -42,6 +43,21 @@ function runCLI(
   });
 }
 
+function sendSession(
+  socketPath: string,
+  payload: Record<string, unknown>,
+): Promise<{ ok: boolean; error?: string; record?: unknown }> {
+  return new Promise((resolvePromise, reject) => {
+    const socket = connect(socketPath);
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("connect", () => socket.end(`${JSON.stringify(payload)}\n`));
+    socket.on("data", (chunk) => { input += chunk; });
+    socket.on("error", reject);
+    socket.on("close", () => resolvePromise(JSON.parse(input)));
+  });
+}
+
 test("supervisor pauses and resumes in place with conversation UUID", async () => {
   const root = await mkdtemp(join(tmpdir(), "agyx-integration-"));
   const fakeAgy = join(root, "agy");
@@ -71,8 +87,11 @@ while :; do sleep 1; done
   const supervisor = spawn(
     process.execPath,
     [resolve("dist/src/cli.js"), "session", "--", "--model", "test"],
-    { env: environment, stdio: "ignore" },
+    { env: environment, stdio: ["ignore", "ignore", "pipe"] },
   );
+  let supervisorStderr = "";
+  supervisor.stderr.setEncoding("utf8");
+  supervisor.stderr.on("data", (chunk) => { supervisorStderr += chunk; });
 
   try {
     await waitFor(async () => {
@@ -99,6 +118,59 @@ while :; do sleep 1; done
     const lines = (await readFile(launches, "utf8")).trim().split("\n");
     assert.match(lines[1]!, /--model test/);
     assert.match(lines[1]!, new RegExp(`--conversation ${conversation}`));
+    assert.doesNotMatch(supervisorStderr, /Profile switch requested/);
+  } finally {
+    if (supervisor.exitCode === null && supervisor.signalCode === null) {
+      supervisor.kill("SIGTERM");
+      await new Promise<void>((resolvePromise) =>
+        supervisor.once("exit", () => resolvePromise())
+      );
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("profile switch restart notice is printed in the supervised agy terminal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agyx-integration-"));
+  const fakeAgy = join(root, "agy");
+  const launches = join(root, "launches.txt");
+  await writeFile(fakeAgy, `#!/bin/sh
+printf '%s\\n' "$*" >> "$AGYX_TEST_LAUNCHES"
+trap 'exit 0' INT TERM
+while :; do sleep 1; done
+`);
+  await chmod(fakeAgy, 0o755);
+
+  const environment = {
+    ...process.env,
+    AGYX_CONFIG_DIR: join(root, "config"),
+    AGYX_REAL_AGY: fakeAgy,
+    AGYX_TEST_LAUNCHES: launches,
+  };
+  const supervisor = spawn(
+    process.execPath,
+    [resolve("dist/src/cli.js"), "session", "--"],
+    { env: environment, stdio: ["ignore", "ignore", "pipe"] },
+  );
+  let supervisorStderr = "";
+  supervisor.stderr.setEncoding("utf8");
+  supervisor.stderr.on("data", (chunk) => { supervisorStderr += chunk; });
+
+  try {
+    await waitFor(async () => {
+      try { return (await readFile(launches, "utf8")).trim().split("\n").length === 1; }
+      catch { return false; }
+    });
+    const socketPath = join(root, "config", "run", `${supervisor.pid}.sock`);
+    const paused = await sendSession(socketPath, { command: "pause", reason: "profile-switch" });
+    assert.equal(paused.ok, true);
+    const resumed = await sendSession(socketPath, { command: "resume", reason: "profile-switch" });
+    assert.equal(resumed.ok, true);
+
+    await waitFor(async () =>
+      /Profile switch requested/.test(supervisorStderr)
+      && /Resuming agy session after profile switch/.test(supervisorStderr)
+    );
   } finally {
     if (supervisor.exitCode === null && supervisor.signalCode === null) {
       supervisor.kill("SIGTERM");

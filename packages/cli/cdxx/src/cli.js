@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { profileSwitchRestartNotice, runAuthSwitchTransaction } from "@dong-/agentx-core";
+import { runAuthSwitchTransaction } from "@dong-/agentx-core";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -141,11 +141,8 @@ async function loginProfile(name, loginArgs = []) {
 }
 
 async function withPausedSessions(operation) {
-  const sessions = await sessionRecords();
-  const notice = profileSwitchRestartNotice({ productName: "cdxx", sessionCount: sessions.length });
-  if (notice) console.error(notice);
   return await runAuthSwitchTransaction(
-    { sessionControl: sessionControlAdapter() },
+    { sessionControl: sessionControlAdapter({ reason: "profile-switch" }) },
     operation,
   );
 }

@@ -49,7 +49,10 @@ export interface SessionRecord {
   currentQuotaScope?: QuotaScope;
 }
 
-type SessionCommand = { command: "pause" | "resume" | "status" | "shutdown" };
+type SessionCommand = {
+  command: "pause" | "resume" | "status" | "shutdown";
+  reason?: string;
+};
 
 export function detectConversation(content: string): string | undefined {
   const patterns = [
@@ -448,11 +451,17 @@ export async function supervise(args: string[]): Promise<number> {
       try {
         const request = JSON.parse(input) as SessionCommand;
         if (request.command === "pause") {
+          if (request.reason === "profile-switch") {
+            console.error("[agyx] Profile switch requested; this agy session will restart with the active profile.");
+          }
           paused = true;
           await stopChild();
           const record = await persist();
           writeJSON(socket, { ok: true, record });
         } else if (request.command === "resume") {
+          if (request.reason === "profile-switch") {
+            console.error("[agyx] Resuming agy session after profile switch.");
+          }
           if (!child) await startChild();
           writeJSON(socket, { ok: true });
         } else if (request.command === "shutdown") {

@@ -67,12 +67,12 @@ export async function writeRuntimeRecord(path, record) {
   }
 }
 
-async function send(socketPath, command) {
+async function send(socketPath, command, payload = {}) {
   return await new Promise((resolve, reject) => {
     const socket = connect(socketPath);
     let input = "";
     socket.setEncoding("utf8");
-    socket.on("connect", () => socket.end(`${JSON.stringify({ command })}\n`));
+    socket.on("connect", () => socket.end(`${JSON.stringify({ command, ...payload })}\n`));
     socket.on("data", (chunk) => { input += chunk; });
     socket.on("error", reject);
     socket.on("close", () => {
@@ -106,16 +106,16 @@ export async function sessionRecords() {
   return records;
 }
 
-export function sessionControlAdapter() {
+export function sessionControlAdapter(options = {}) {
   return {
     sessionRecords,
     pause: async (record) => {
-      const reply = await send(record.socketPath, "pause");
+      const reply = await send(record.socketPath, "pause", { reason: options.reason });
       if (!reply.ok) throw new Error(reply.error ?? `Failed to pause ${record.id}`);
       return reply.record ?? { ...record, childPid: undefined, paused: true };
     },
     resume: async (record) => {
-      const reply = await send(record.socketPath, "resume");
+      const reply = await send(record.socketPath, "resume", { reason: options.reason });
       if (!reply.ok) throw new Error(reply.error ?? `Failed to resume ${record.id}`);
     },
     onResumeError: (record, error) => {

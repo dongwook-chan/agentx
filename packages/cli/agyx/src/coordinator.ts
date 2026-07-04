@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import {
   pauseAllSessions,
-  profileSwitchRestartNotice,
   resumeAllSessions,
   runAuthSwitchTransaction,
   SessionControlAdapter,
@@ -120,12 +119,12 @@ async function writeRuntimeRecord(path: string, record: SessionRecord): Promise<
   }
 }
 
-async function send(socketPath: string, command: string): Promise<SessionReply> {
+async function send(socketPath: string, command: string, payload: Record<string, unknown> = {}): Promise<SessionReply> {
   return await new Promise((resolvePromise, reject) => {
     const socket = connect(socketPath);
     let input = "";
     socket.setEncoding("utf8");
-    socket.on("connect", () => socket.end(`${JSON.stringify({ command })}\n`));
+    socket.on("connect", () => socket.end(`${JSON.stringify({ command, ...payload })}\n`));
     socket.on("data", (chunk) => { input += chunk; });
     socket.on("error", reject);
     socket.on("close", () => {
@@ -231,11 +230,11 @@ export async function withAuthSwitchLock<T>(
   }
 }
 
-function sessionControlAdapter(): SessionControlAdapter<SessionRecord> {
+function sessionControlAdapter(options: { reason?: string } = {}): SessionControlAdapter<SessionRecord> {
   return {
     sessionRecords,
     pause: async (record) => {
-      const reply = await send(record.socketPath, "pause");
+      const reply = await send(record.socketPath, "pause", { reason: options.reason });
       if (!reply.ok) {
         if (!reply.error?.includes("Unexpected non-whitespace character after JSON")) {
           throw new Error(reply.error ?? `Failed to pause ${record.id}`);
@@ -254,7 +253,7 @@ function sessionControlAdapter(): SessionControlAdapter<SessionRecord> {
       if (unmanaged.length) await stopProcesses(unmanaged);
     },
     resume: async (record) => {
-      const reply = await send(record.socketPath, "resume");
+      const reply = await send(record.socketPath, "resume", { reason: options.reason });
       if (!reply.ok) throw new Error(reply.error);
     },
     onResumeError: (record, error) => {
@@ -267,12 +266,9 @@ async function withPausedAuthSwitch<T>(
   operation: () => Promise<T>,
   options: { resume?: boolean } = {},
 ): Promise<T> {
-  const sessions = await sessionRecords();
-  const notice = profileSwitchRestartNotice({ productName: "agyx", sessionCount: sessions.length });
-  if (notice) console.error(notice);
   return await runAuthSwitchTransaction(
     {
-      sessionControl: sessionControlAdapter(),
+      sessionControl: sessionControlAdapter({ reason: "profile-switch" }),
       withLock: withAuthSwitchLock,
     },
     operation,

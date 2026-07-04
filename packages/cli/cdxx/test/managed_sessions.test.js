@@ -68,3 +68,36 @@ test("pauseAll and resumeAll use the managed session socket protocol", async () 
     await sessions.cleanupRuntimeFile(socketPath);
   }
 });
+
+test("profile-switch session adapter sends restart reason", async () => {
+  const socketPath = join(process.env.CDXX_CONFIG_DIR, "run", "reason.sock");
+  const recordPath = sessions.runtimeRecordPath("reason");
+  const requests = [];
+  const record = {
+    id: "reason",
+    pid: process.pid,
+    childPid: 12346,
+    cwd: root,
+    args: [],
+    socketPath,
+    paused: false,
+    restartable: true,
+    startedAt: new Date().toISOString(),
+  };
+  await sessions.writeRuntimeRecord(recordPath, record);
+  const server = await listen(socketPath, (request) => {
+    requests.push(request);
+    if (request.command === "pause") return { ok: true, record: { ...record, paused: true } };
+    if (request.command === "resume") return { ok: true };
+    return { ok: false, error: "unexpected" };
+  });
+  try {
+    const adapter = sessions.sessionControlAdapter({ reason: "profile-switch" });
+    const paused = await adapter.pause(record);
+    await adapter.resume(paused);
+    assert.deepEqual(requests.map((request) => request.reason), ["profile-switch", "profile-switch"]);
+  } finally {
+    server.close();
+    await sessions.cleanupRuntimeFile(socketPath);
+  }
+});
