@@ -161,7 +161,11 @@ while :; do sleep 1; done
       try { return (await readFile(launches, "utf8")).trim().split("\n").length === 1; }
       catch { return false; }
     });
-    const socketPath = join(root, "config", "run", `${supervisor.pid}.sock`);
+    const runtime = join(root, "config", "run");
+    const recordName = (await readdir(runtime)).find((name) => name.endsWith(".json"));
+    assert.ok(recordName);
+    const record = JSON.parse(await readFile(join(runtime, recordName), "utf8"));
+    const socketPath = record.socketPath as string;
     const paused = await sendSession(socketPath, { command: "pause", reason: "profile-switch" });
     assert.equal(paused.ok, true);
     const resumed = await sendSession(socketPath, { command: "resume", reason: "profile-switch" });

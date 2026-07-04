@@ -30,10 +30,6 @@ if [ -x "$binary" ]; then
   exec "$binary" "$@"
 fi
 
-if command -v agyx-agy >/dev/null 2>&1; then
-  echo "agyx: native supervisor binary not found: $binary; using Node supervisor fallback." >&2
-  exec agyx-agy "$@"
-fi
-
 echo "agyx: native supervisor binary not found: $binary" >&2
+echo "agyx: run 'npm run build:native --workspace agyx' from the agentx checkout." >&2
 exit 1

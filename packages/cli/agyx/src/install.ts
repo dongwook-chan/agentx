@@ -39,7 +39,8 @@ export function shellInit(): string {
     "  if command -v agyx-supervisor > /dev/null 2>&1; then",
     "    command agyx-supervisor \"$@\"",
     "  else",
-    "    command agyx-agy \"$@\"",
+    "    echo \"agyx: native supervisor command not found: agyx-supervisor\" >&2",
+    "    return 1",
     "  fi",
     "}",
   ].join("\n");

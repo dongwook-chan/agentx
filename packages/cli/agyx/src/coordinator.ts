@@ -50,7 +50,7 @@ import {
   selectNextProfile,
   shouldAutoSwitchAfterQuota,
 } from "./selection.js";
-import { SessionRecord } from "./session.js";
+import { SessionRecord } from "./session_record.js";
 
 interface SessionReply {
   ok: boolean;

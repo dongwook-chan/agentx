@@ -42,7 +42,7 @@ import {
   parsePS,
   withConversation,
 } from "../src/processes.js";
-import { detectConversation } from "../src/session.js";
+import { detectConversation } from "../src/session_record.js";
 
 test("activation keeps exhausted quota until reset time", () => {
   const now = new Date("2026-06-26T00:00:00.000Z");
@@ -64,11 +64,11 @@ test("activation keeps exhausted quota until reset time", () => {
   assert.equal(state.profiles[0]!.quotaResetAt, "2026-06-27T00:00:00.000Z");
 });
 
-test("shell integration uses the lightweight agy shim", () => {
+test("shell integration uses the native supervisor", () => {
   assert.match(shellInit(), /command agyx login "\$@"/);
   assert.match(shellInit(), /command agyx x "\$@"/);
   assert.match(shellInit(), /command agyx-supervisor "\$@"/);
-  assert.match(shellInit(), /command agyx-agy "\$@"/);
+  assert.doesNotMatch(shellInit(), /agyx-agy/);
 });
 
 test("buildAgyLaunchArgs injects the agy yolo flag once", () => {

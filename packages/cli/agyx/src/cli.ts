@@ -37,8 +37,13 @@ import {
   saveState,
   validateProfileName,
 } from "./config.js";
-import { QuotaScope } from "./quota.js";
-import { supervise } from "./session.js";
+import {
+  createUsageTranscriptState,
+  parseUsageTranscriptAggregates,
+  QuotaScope,
+  UsageTranscriptState,
+} from "./quota.js";
+import { runNativeSupervisor } from "./native.js";
 import { runUsageProbe } from "./usage_probe.js";
 import {
   confirmAction,
@@ -66,7 +71,7 @@ Preferred shell usage after 'agyx install':
 Usage:
   agyx dispatch -- [agy options]        Shell integration dispatcher
   agyx install                         Install agy shell function
-  agyx session -- [agy options]        Run agy under a restartable supervisor
+  agyx session -- [agy options]        Run agy under the native restartable supervisor
   agyx import-current [name] [--email EMAIL]
                                        Save the current active account
   agyx login [name] [--email EMAIL] [--no-resume]
@@ -619,7 +624,7 @@ async function dispatchAgy(args: string[]): Promise<number> {
     await printCombinedHelp();
     return 0;
   }
-  return await supervise(args);
+  return await runNativeSupervisor(args);
 }
 
 async function main(): Promise<number> {
@@ -659,7 +664,7 @@ async function main(): Promise<number> {
     }
     case "session":
       if (args[0] === "--") args.shift();
-      return await supervise(args);
+      return await runNativeSupervisor(args);
     case "save": {
       return await handleImportCurrentCommand(args, "save");
     }
@@ -811,6 +816,18 @@ async function main(): Promise<number> {
         cwd?: string;
       };
       console.log(JSON.stringify(await runUsageProbe(payload)));
+      return 0;
+    }
+    case "_usage-transcript-aggregates": {
+      const payload = JSON.parse(args[0] ?? "{}") as {
+        text?: string;
+        state?: UsageTranscriptState;
+        now?: string;
+      };
+      const state = payload.state ?? createUsageTranscriptState();
+      const now = payload.now ? new Date(payload.now) : new Date();
+      const aggregates = parseUsageTranscriptAggregates(payload.text ?? "", now, state);
+      console.log(JSON.stringify({ aggregates, state }));
       return 0;
     }
     default:

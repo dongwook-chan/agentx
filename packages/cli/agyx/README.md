@@ -35,11 +35,10 @@ Supported native supervisor architectures:
 | `darwin/arm64` | yes | yes |
 | `linux/arm64` | yes | yes |
 
-Because the launcher uses `exec`, the long-running process is normally the Rust
+Because the launcher uses `exec`, the long-running process is the Rust
 supervisor itself; Node is not kept alive for managed `agy` sessions. In a local
-development checkout, the launcher falls back to `agyx-agy` when the matching
-native binary has not been built. The native and Node supervisors are expected
-to match observable behavior, including restartability rules, `--log-file`
+development checkout, build the native supervisor before launching managed
+sessions. The native supervisor owns restartability rules, `--log-file`
 injection, conversation resume, quota detection, and the `agyx yolo` setting.
 
 The supervisor is deliberately kept out of account-selection policy. On quota
@@ -100,8 +99,8 @@ agy --native --help         # bypass agyx and run real agy
 
 The shell function routes `agy login` and `agy x ...` to `agyx`; all other
 interactive `agy` invocations still go directly to `agyx-supervisor`. If the
-native supervisor binary is not available in a development checkout, the shell
-function falls back to `agyx-agy`, which uses the Node supervisor.
+native supervisor binary is not available in a development checkout, build it
+with `npm run build:native --workspace agyx`.
 
 Verify the active terminal with:
 

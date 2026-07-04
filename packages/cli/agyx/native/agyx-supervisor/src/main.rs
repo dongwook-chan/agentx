@@ -7,7 +7,7 @@ use signal_hook::iterator::Signals;
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -43,6 +43,12 @@ struct SessionRecord {
 #[derive(Debug, Deserialize)]
 struct SessionCommand {
     command: String,
+    reason: Option<String>,
+}
+
+struct LaunchCommand {
+    command: String,
+    args: Vec<String>,
 }
 
 struct Supervisor {
@@ -60,6 +66,8 @@ struct Supervisor {
     intentional_stop: bool,
     conversation_id: Option<String>,
     log_offset: usize,
+    terminal_log_offset: usize,
+    usage_transcript_state: Value,
     profile_at_start: Option<String>,
     quota_marked_scopes: HashSet<String>,
     auto_switch_stopped_scopes: HashSet<String>,
@@ -110,12 +118,21 @@ impl Supervisor {
         self.quota_marked_scopes.clear();
         self.current_model_label = None;
         self.current_quota_scope = None;
+        self.terminal_log_offset = 0;
+        self.usage_transcript_state = json!({ "inUsageView": false });
+        let _ = fs::remove_file(&self.terminal_log_path);
         let probe_profile_name = self.profile_at_start.clone();
 
         let launch_args =
             supervisor_launch_args(&self.args, self.conversation_id.as_deref(), &self.log_path)?;
-        let child = Command::new(&self.real_agy)
-            .args(launch_args)
+        let launch_command =
+            terminal_transcript_command(&self.real_agy, &launch_args, &self.terminal_log_path)
+                .unwrap_or_else(|| LaunchCommand {
+                    command: self.real_agy.clone(),
+                    args: launch_args,
+                });
+        let child = Command::new(&launch_command.command)
+            .args(&launch_command.args)
             .current_dir(&self.cwd)
             .env("AGYX_MANAGED", "1")
             .env("AGYX_SESSION_ID", &self.id)
@@ -196,48 +213,50 @@ impl Supervisor {
         let Some(profile_name) = self.profile_at_start.clone() else {
             return auto_switch_scopes;
         };
-        let Ok(content) = fs::read_to_string(&self.log_path) else {
-            return auto_switch_scopes;
-        };
-        if content.len() < self.log_offset {
-            self.log_offset = 0;
-        }
-        let appended = &content[self.log_offset..];
-        self.log_offset = content.len();
         let mut model_changed = false;
 
-        if let Some(conversation) = detect_conversation(appended) {
-            self.conversation_id = Some(conversation);
+        if let Ok(content) = fs::read_to_string(&self.log_path) {
+            if content.len() < self.log_offset {
+                self.log_offset = 0;
+            }
+            let appended = &content[self.log_offset..];
+            self.log_offset = content.len();
+
+            if let Some(conversation) = detect_conversation(appended) {
+                self.conversation_id = Some(conversation);
+            }
+
+            for line in appended.lines() {
+                if let Some((label, scope)) = parse_model_event_line(line) {
+                    self.current_model_label = Some(label);
+                    self.current_quota_scope = Some(scope);
+                    model_changed = true;
+                }
+                if is_request_event_line(line) {
+                    let _ = record_profile_request(&profile_name);
+                }
+                if let Some(reason) = parse_eligibility_event_line(line) {
+                    let _ = record_profile_ineligible(&profile_name, &reason);
+                }
+                if let Some((reason, reset_at)) = parse_quota_event_line(line) {
+                    let scope = self
+                        .current_quota_scope
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let model_label = self.current_model_label.clone();
+                    self.record_quota_exhausted_from_event(
+                        &profile_name,
+                        &reason,
+                        reset_at.as_deref(),
+                        &scope,
+                        model_label.as_deref(),
+                        &mut auto_switch_scopes,
+                    );
+                }
+            }
         }
 
-        for line in appended.lines() {
-            if let Some((label, scope)) = parse_model_event_line(line) {
-                self.current_model_label = Some(label);
-                self.current_quota_scope = Some(scope);
-                model_changed = true;
-            }
-            if is_request_event_line(line) {
-                let _ = record_profile_request(&profile_name);
-            }
-            if let Some(reason) = parse_eligibility_event_line(line) {
-                let _ = record_profile_ineligible(&profile_name, &reason);
-            }
-            if let Some((reason, reset_at)) = parse_quota_event_line(line) {
-                let scope = self
-                    .current_quota_scope
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let model_label = self.current_model_label.clone();
-                self.record_quota_exhausted_from_event(
-                    &profile_name,
-                    &reason,
-                    reset_at.as_deref(),
-                    &scope,
-                    model_label.as_deref(),
-                    &mut auto_switch_scopes,
-                );
-            }
-        }
+        self.scan_terminal_usage_events(&profile_name, &mut auto_switch_scopes);
 
         if model_changed {
             let _ = self.persist();
@@ -245,6 +264,64 @@ impl Supervisor {
         auto_switch_scopes
     }
 
+    fn scan_terminal_usage_events(
+        &mut self,
+        profile_name: &str,
+        auto_switch_scopes: &mut Vec<String>,
+    ) {
+        let Ok(content) = fs::read_to_string(&self.terminal_log_path) else {
+            return;
+        };
+        if content.len() < self.terminal_log_offset {
+            self.terminal_log_offset = 0;
+            self.usage_transcript_state = json!({ "inUsageView": false });
+        }
+        let appended = &content[self.terminal_log_offset..];
+        self.terminal_log_offset = content.len();
+        if appended.is_empty() {
+            return;
+        }
+
+        let Some(result) = usage_transcript_result(appended, &self.usage_transcript_state) else {
+            return;
+        };
+        self.usage_transcript_state = result
+            .get("state")
+            .cloned()
+            .unwrap_or_else(|| json!({ "inUsageView": false }));
+        let Some(aggregates) = result.get("aggregates").and_then(Value::as_array) else {
+            return;
+        };
+
+        for aggregate in aggregates {
+            let scope = aggregate
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match aggregate.get("status").and_then(Value::as_str) {
+                Some("available") => {
+                    let _ = record_profile_quota_available(profile_name, scope);
+                }
+                Some("exhausted") => {
+                    let reason = aggregate
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("usage quota exhausted");
+                    let reset_at = aggregate.get("resetAt").and_then(Value::as_str);
+                    let model_label = aggregate.get("modelLabel").and_then(Value::as_str);
+                    self.record_quota_exhausted_from_event(
+                        profile_name,
+                        reason,
+                        reset_at,
+                        scope,
+                        model_label,
+                        auto_switch_scopes,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn main() {
@@ -301,6 +378,8 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         intentional_stop: false,
         conversation_id: None,
         log_offset: 0,
+        terminal_log_offset: 0,
+        usage_transcript_state: json!({ "inUsageView": false }),
         profile_at_start: None,
         quota_marked_scopes: HashSet::new(),
         auto_switch_stopped_scopes: HashSet::new(),
@@ -402,12 +481,20 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
     let mut guard = supervisor.lock().map_err(to_string)?;
     let reply = match request.command.as_str() {
         "pause" => {
+            if request.reason.as_deref() == Some("profile-switch") {
+                eprintln!(
+                    "[agyx] Profile switch requested; this agy session will restart with the active profile."
+                );
+            }
             guard.paused = true;
             guard.stop_child()?;
             let record = guard.persist()?;
             json!({ "ok": true, "record": record })
         }
         "resume" => {
+            if request.reason.as_deref() == Some("profile-switch") {
+                eprintln!("[agyx] Resuming agy session after profile switch.");
+            }
             if guard.child.is_none() {
                 guard.start_child()?;
             }
@@ -583,6 +670,86 @@ fn supervisor_launch_args(
         .collect())
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn find_script_executable() -> Option<String> {
+    for candidate in ["/usr/bin/script", "/bin/script"] {
+        if is_executable(Path::new(candidate)) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn terminal_transcript_command(
+    real_agy: &str,
+    launch_args: &[String],
+    terminal_log_path: &Path,
+) -> Option<LaunchCommand> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    let script = find_script_executable()?;
+    let terminal_log = terminal_log_path.to_string_lossy().to_string();
+    if env::consts::OS == "linux" {
+        let command = std::iter::once(real_agy.to_string())
+            .chain(launch_args.iter().cloned())
+            .map(|argument| shell_quote(&argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Some(LaunchCommand {
+            command: script,
+            args: vec![
+                "-q".to_string(),
+                "-f".to_string(),
+                "-c".to_string(),
+                command,
+                terminal_log,
+            ],
+        });
+    }
+    Some(LaunchCommand {
+        command: script,
+        args: std::iter::once("-q".to_string())
+            .chain(std::iter::once(terminal_log))
+            .chain(std::iter::once(real_agy.to_string()))
+            .chain(launch_args.iter().cloned())
+            .collect(),
+    })
+}
+
+fn usage_transcript_result(text: &str, state: &Value) -> Option<Value> {
+    let payload = json!({
+        "text": text,
+        "state": state,
+    });
+    let payload = serde_json::to_string(&payload).ok()?;
+    let output = if let Ok(cli_path) = env::var("AGYX_CLI_PATH") {
+        let node_path = env::var("AGYX_NODE_PATH").unwrap_or_else(|_| "node".to_string());
+        Command::new(node_path)
+            .arg(cli_path)
+            .arg("_usage-transcript-aggregates")
+            .arg(payload)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?
+    } else {
+        Command::new("agyx")
+            .arg("_usage-transcript-aggregates")
+            .arg(payload)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).ok()
+}
+
 fn usage_probe_result(profile_name: &str, real_agy: &str, cwd: &str) -> (Vec<String>, Vec<Value>) {
     let payload = json!({
         "profileName": profile_name,
@@ -749,7 +916,10 @@ fn find_real_agy() -> Result<String, String> {
             continue;
         }
         if let Ok(content) = fs::read_to_string(&candidate) {
-            if content.contains("agyx session") || content.contains("agyx-agy") {
+            if content.contains("agyx session")
+                || content.contains("agyx dispatch")
+                || content.contains("agyx-supervisor")
+            {
                 continue;
             }
         }
@@ -1010,6 +1180,43 @@ fn record_profile_quota_exhausted(
             }
         }
         profile["updatedAt"] = Value::String(now_iso());
+    }
+    save_state(&state)
+}
+
+fn record_profile_quota_available(name: &str, scope: &str) -> Result<(), String> {
+    let mut state = load_state()?;
+    let now = now_iso();
+    if let Some(profile) = find_profile_mut(&mut state, name) {
+        if scope == "unknown" {
+            profile["quotaStatus"] = Value::String("available".to_string());
+            remove_key(profile, "quotaResetAt");
+            remove_key(profile, "lastQuotaReason");
+            if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut) {
+                scopes.remove("unknown");
+            }
+        } else if let Some(scopes) = profile.get_mut("quotaScopes").and_then(Value::as_object_mut)
+        {
+            scopes.remove(scope);
+            scopes.remove("unknown");
+        }
+
+        let empty_scopes = profile
+            .get("quotaScopes")
+            .and_then(Value::as_object)
+            .map(|scopes| scopes.is_empty())
+            .unwrap_or(false);
+        if empty_scopes {
+            remove_key(profile, "quotaScopes");
+        }
+        if profile.get("quotaScopes").is_none()
+            && profile.get("quotaStatus").and_then(Value::as_str) == Some("exhausted")
+        {
+            profile["quotaStatus"] = Value::String("available".to_string());
+            remove_key(profile, "quotaResetAt");
+            remove_key(profile, "lastQuotaReason");
+        }
+        profile["updatedAt"] = Value::String(now);
     }
     save_state(&state)
 }

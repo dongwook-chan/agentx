@@ -52,7 +52,7 @@ async function executable(path: string): Promise<boolean> {
   }
 }
 
-export async function runNativeSupervisor(args: string[]): Promise<number | undefined> {
+export async function runNativeSupervisor(args: string[]): Promise<number> {
   const host = nativeSupervisorHostStatus();
   if (!host.supported) {
     throw new Error(host.message);
@@ -60,15 +60,9 @@ export async function runNativeSupervisor(args: string[]): Promise<number | unde
 
   const binary = nativeSupervisorPath();
   if (!await executable(binary)) {
-    if (process.env.AGYX_REQUIRE_NATIVE_SUPERVISOR === "1") {
-      throw new Error(
-        `Native supervisor binary not found: ${binary}. Run 'npm run build:native'.`,
-      );
-    }
-    console.error(
-      `agyx: native supervisor binary not found; using Node supervisor fallback. (${binary})`,
+    throw new Error(
+      `Native supervisor binary not found: ${binary}. Run 'npm run build:native'.`,
     );
-    return undefined;
   }
 
   return await new Promise((resolvePromise, reject) => {
@@ -81,7 +75,24 @@ export async function runNativeSupervisor(args: string[]): Promise<number | unde
         AGYX_NODE_PATH: process.execPath,
       },
     });
-    child.on("error", reject);
-    child.on("exit", (code, signal) => resolvePromise(code ?? (signal ? 128 : 1)));
+    const forward = (signal: NodeJS.Signals): void => {
+      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    };
+    const onSigint = (): void => forward("SIGINT");
+    const onSigterm = (): void => forward("SIGTERM");
+    process.once("SIGINT", onSigint);
+    process.once("SIGTERM", onSigterm);
+    const cleanup = (): void => {
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+    };
+    child.on("error", (error) => {
+      cleanup();
+      reject(error);
+    });
+    child.on("exit", (code, signal) => {
+      cleanup();
+      resolvePromise(code ?? (signal ? 128 : 1));
+    });
   });
 }

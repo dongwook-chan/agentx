@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-const { copyFileSync, mkdirSync, chmodSync } = require("node:fs");
+const { copyFileSync, mkdirSync, chmodSync, renameSync } = require("node:fs");
 const { join } = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
@@ -28,13 +28,16 @@ if (result.status !== 0) process.exit(result.status ?? 1);
 const binDir = join(__dirname, "..", "bin");
 mkdirSync(binDir, { recursive: true });
 const extension = process.platform === "win32" ? ".exe" : "";
+const binaryPath = join(binDir, binaryName);
+const temporaryBinaryPath = join(binDir, `.${binaryName}.${process.pid}.tmp`);
 copyFileSync(
   join(crateDir, "target", "release", `agyx-supervisor${extension}`),
-  join(binDir, binaryName),
+  temporaryBinaryPath,
 );
-chmodSync(join(binDir, binaryName), 0o755);
+chmodSync(temporaryBinaryPath, 0o755);
+renameSync(temporaryBinaryPath, binaryPath);
 if (process.platform === "darwin") {
-  const codesignResult = spawnSync("codesign", ["-f", "-s", "-", join(binDir, binaryName)], {
+  const codesignResult = spawnSync("codesign", ["-f", "-s", "-", binaryPath], {
     stdio: "inherit",
   });
   if (codesignResult.status !== 0) {

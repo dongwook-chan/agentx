@@ -5,7 +5,6 @@
   "type": "module",
   "bin": {
     "agyx": "dist/src/cli.js",
-    "agyx-agy": "dist/src/shim.js",
     "agyx-supervisor": "bin/agyx-supervisor"
   },
   "files": [
@@ -18,13 +17,13 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/src/cli.js dist/src/shim.js bin/agyx-supervisor",
+    "build": "tsc -p tsconfig.json && chmod +x dist/src/cli.js bin/agyx-supervisor",
     "build:native": "node scripts/build-native.cjs",
     "check:native-package": "node scripts/check-native-package.cjs",
     "clean": "rm -rf dist",
     "preinstall": "node scripts/preinstall.cjs",
     "prepack": "npm run clean && npm run build && AGYX_REQUIRE_ALL_NATIVE=1 npm run check:native-package",
-    "test": "npm run clean && npm run build && node --test dist/test/*.test.js"
+    "test": "npm run clean && npm run build && npm run build:native && node --test dist/test/*.test.js"
   },
   "keywords": [
     "antigravity",
