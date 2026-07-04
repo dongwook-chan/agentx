@@ -3,11 +3,41 @@ import {
   decideUseProfile,
   useProfileDisabledReason,
 } from "@dong-/agentx-core";
-import { formatReset } from "./quota.js";
+import { codexQuotaScopes, formatReset } from "./quota.js";
 
 function pad(value, width) {
   const text = String(value ?? "");
   return text.length >= width ? text : `${text}${" ".repeat(width - text.length)}`;
+}
+
+function activeQuotaScopes(profile) {
+  return Object.entries(profile.quotaScopes ?? {})
+    .filter(([, quota]) => quota?.status === "exhausted")
+    .map(([scope]) => scope);
+}
+
+function profileStatus(profile) {
+  if (profile.disabled) return "disabled";
+  const exhausted = activeQuotaScopes(profile);
+  if (exhausted.length) return `quota:${exhausted.join(",")}`;
+  return profile.quotaStatus === "available" ? "available" : (profile.quotaStatus ?? "unknown");
+}
+
+function profileReset(profile) {
+  const resets = Object.values(profile.quotaScopes ?? {})
+    .filter((quota) => quota?.status === "exhausted" && quota.resetAt)
+    .map((quota) => quota.resetAt)
+    .sort();
+  return formatReset(resets[0] ?? profile.quotaResetAt);
+}
+
+function quotaCell(profile, scope, fallbackUsed) {
+  const quota = profile.quotaScopes?.[scope];
+  const used = quota?.usedPercent ?? fallbackUsed;
+  const remaining = quota?.remainingPercent;
+  if (used === undefined && remaining === undefined) return "";
+  if (remaining !== undefined) return `${used ?? 100}%/${remaining}% left`;
+  return `${used}%`;
 }
 
 export function printProfiles(state) {
@@ -19,10 +49,10 @@ export function printProfiles(state) {
     active: state.activeProfile === profile.name ? "*" : "",
     name: profile.name,
     email: profile.email ?? profile.accountId ?? "",
-    status: profile.disabled ? "disabled" : (profile.quotaStatus ?? "unknown"),
-    reset: formatReset(profile.quotaResetAt),
-    fiveHour: profile.lastUsage?.maxPrimary ?? "",
-    weekly: profile.lastUsage?.maxSecondary ?? "",
+    status: profileStatus(profile),
+    reset: profileReset(profile),
+    fiveHour: quotaCell(profile, codexQuotaScopes.primary, profile.lastUsage?.maxPrimary),
+    weekly: quotaCell(profile, codexQuotaScopes.secondary, profile.lastUsage?.maxSecondary),
     selected: profile.selectionCount ?? 0,
   }));
   const headers = ["", "name", "account", "status", "reset", "5h", "weekly", "switches"];
@@ -39,6 +69,8 @@ export function printProfiles(state) {
 
 function selectableReason(profile, state) {
   if (profile.disabled) return "disabled";
+  const exhausted = activeQuotaScopes(profile);
+  if (exhausted.length) return `quota exhausted: ${exhausted.join(",")}`;
   if (profile.quotaStatus === "exhausted") return "quota exhausted";
   return undefined;
 }
@@ -58,16 +90,20 @@ function useCandidates(state) {
 function profileChoiceLabel(profile, state) {
   const marker = state.activeProfile === profile.name ? "*" : " ";
   const account = profile.email ?? profile.accountId ?? "";
-  const status = profile.disabled ? "disabled" : (profile.quotaStatus ?? "unknown");
-  const reset = formatReset(profile.quotaResetAt);
+  const status = profileStatus(profile);
+  const reset = profileReset(profile);
   return [
     marker,
     profile.name,
     account,
     status,
     reset,
-    profile.lastUsage?.maxPrimary ? `5h=${profile.lastUsage.maxPrimary}` : "",
-    profile.lastUsage?.maxSecondary ? `weekly=${profile.lastUsage.maxSecondary}` : "",
+    quotaCell(profile, codexQuotaScopes.primary, profile.lastUsage?.maxPrimary)
+      ? `5h=${quotaCell(profile, codexQuotaScopes.primary, profile.lastUsage?.maxPrimary)}`
+      : "",
+    quotaCell(profile, codexQuotaScopes.secondary, profile.lastUsage?.maxSecondary)
+      ? `weekly=${quotaCell(profile, codexQuotaScopes.secondary, profile.lastUsage?.maxSecondary)}`
+      : "",
   ].filter(Boolean).join("  ");
 }
 
@@ -128,11 +164,16 @@ export async function pickConfigValue(key, current) {
 }
 
 export function printScanSummary(summary) {
+  console.log(`source: ${summary.source ?? "jsonl"}`);
+  if (summary.statusProbeError) console.log(`status probe: failed (${summary.statusProbeError}); used jsonl fallback`);
+  if (summary.account) console.log(`account: ${summary.account}`);
   console.log(`files: ${summary.scannedFiles}`);
   console.log(`token_count records: ${summary.tokenCountRecords}`);
   if (summary.current) {
-    console.log(`current 5h: ${summary.current.primary}%`);
-    console.log(`current weekly: ${summary.current.secondary}%`);
+    const primaryLeft = summary.statusRemaining?.primary;
+    const secondaryLeft = summary.statusRemaining?.secondary;
+    console.log(`current 5h: ${summary.current.primary}%${primaryLeft === undefined ? "" : ` used (${primaryLeft}% left)`}`);
+    console.log(`current weekly: ${summary.current.secondary}%${secondaryLeft === undefined ? "" : ` used (${secondaryLeft}% left)`}`);
   }
   console.log(`historical max 5h: ${summary.maxPrimary}%`);
   console.log(`historical max weekly: ${summary.maxSecondary}%`);
@@ -149,7 +190,8 @@ export function printScanSummary(summary) {
     console.log("");
     console.log("recent high-water marks:");
     for (const event of recent) {
-      console.log(`${event.timestamp} 5h=${event.primary}% weekly=${event.secondary}% ${event.file}:${event.line}`);
+      const location = event.file ? `${event.file}:${event.line}` : (summary.source ?? "quota");
+      console.log(`${event.timestamp} 5h=${event.primary}% weekly=${event.secondary}% ${location}`);
     }
   }
 }

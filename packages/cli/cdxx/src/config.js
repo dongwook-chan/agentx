@@ -2,6 +2,13 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  clearExpiredProfileQuota,
+  markActiveProfile,
+  profileNameFromIdentity as coreProfileNameFromIdentity,
+  uniqueProfileName as coreUniqueProfileName,
+  validateProfileName as coreValidateProfileName,
+} from "@dong-/agentx-core";
 
 export const codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
 const defaultConfigDir = join(homedir(), ".config", "cdxx");
@@ -10,6 +17,7 @@ export const configDir = process.env.CDXX_CONFIG_DIR
   ?? process.env.CODEXX_CONFIG_DIR
   ?? (existsSync(defaultConfigDir) || !existsSync(legacyConfigDir) ? defaultConfigDir : legacyConfigDir);
 export const profilesDir = join(configDir, "profiles");
+export const runtimeDir = join(configDir, "run");
 export const statePath = join(configDir, "state.json");
 
 export function nowIso() {
@@ -28,6 +36,7 @@ export async function ensureParent(path) {
 export async function ensureConfig() {
   await ensureDir(configDir);
   await ensureDir(profilesDir);
+  await ensureDir(runtimeDir);
 }
 
 export function emptyState() {
@@ -73,33 +82,15 @@ export async function saveState(state) {
 }
 
 export function validateProfileName(input) {
-  const name = String(input ?? "").trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
-    throw new Error("Profile names must be 1-64 chars: letters, numbers, dot, underscore, dash.");
-  }
-  return name;
+  return coreValidateProfileName(input);
 }
 
 export function profileNameFromIdentity(identity) {
-  const source = String(identity ?? "").split("@")[0] ?? "";
-  const normalized = source
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^[._-]+|[._-]+$/g, "")
-    .replace(/[._-]{2,}/g, "-")
-    .slice(0, 64);
-  return validateProfileName(normalized || "account");
+  return coreProfileNameFromIdentity(identity);
 }
 
 export function uniqueProfileName(baseName, state) {
-  const base = validateProfileName(baseName);
-  const names = new Set(state.profiles.map((profile) => profile.name));
-  if (!names.has(base)) return base;
-  for (let suffix = 2; suffix < 10000; suffix += 1) {
-    const candidate = `${base.slice(0, Math.max(1, 64 - String(suffix).length - 1))}-${suffix}`;
-    if (!names.has(candidate)) return candidate;
-  }
-  throw new Error(`Could not find an unused profile name for '${base}'.`);
+  return coreUniqueProfileName(baseName, state);
 }
 
 export function getProfile(state, name) {
@@ -128,22 +119,34 @@ export function upsertProfile(state, name, patch = {}) {
 }
 
 export function markActive(state, name, increment = true) {
-  const profile = getProfile(state, name);
-  if (!profile) throw new Error(`Profile not found: ${name}`);
-  const now = nowIso();
-  state.activeProfile = name;
-  profile.lastActivatedAt = now;
-  profile.updatedAt = now;
-  if (increment) profile.selectionCount = (profile.selectionCount ?? 0) + 1;
-  clearExpiredQuota(profile);
+  markActiveProfile(state, name, { incrementSelection: increment });
 }
 
 export function clearExpiredQuota(profile, now = new Date()) {
-  if (profile.quotaStatus === "exhausted" && profile.quotaResetAt) {
-    if (Date.parse(profile.quotaResetAt) <= now.getTime()) {
-      profile.quotaStatus = "available";
-      profile.quotaResetAt = undefined;
-      profile.lastQuotaReason = undefined;
+  clearExpiredProfileQuota(profile, now);
+  if (!profile.quotaScopes) return;
+  const exhausted = [];
+  for (const quota of Object.values(profile.quotaScopes)) {
+    if (!quota || quota.status !== "exhausted") continue;
+    if (quota.resetAt && Date.parse(quota.resetAt) <= now.getTime()) {
+      quota.status = "available";
+      quota.resetAt = undefined;
+      quota.reason = undefined;
+    } else {
+      exhausted.push(quota);
     }
+  }
+  if (exhausted.length) {
+    const nextReset = exhausted
+      .map((quota) => quota.resetAt)
+      .filter(Boolean)
+      .sort()[0];
+    profile.quotaStatus = "exhausted";
+    profile.quotaResetAt = nextReset;
+    profile.lastQuotaReason = exhausted.find((quota) => quota.reason)?.reason ?? "quota exhausted";
+  } else if (profile.quotaStatus === "exhausted") {
+    profile.quotaStatus = "available";
+    profile.quotaResetAt = undefined;
+    profile.lastQuotaReason = undefined;
   }
 }

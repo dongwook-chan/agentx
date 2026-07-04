@@ -1,8 +1,14 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { runUsageCheck } from "@dong-/agentx-core";
 import { codexHome, clearExpiredQuota, loadState, saveState } from "./config.js";
+import { probeCodexStatusQuota } from "./status_probe.js";
 
 export const sessionsDir = join(codexHome, "sessions");
+export const codexQuotaScopes = {
+  primary: "5h",
+  secondary: "weekly",
+};
 
 async function walkJsonl(dir, out = []) {
   let entries = [];
@@ -34,6 +40,7 @@ function pickReset(rateLimits) {
 
 export function createQuotaSummary() {
   return {
+    source: "jsonl",
     scannedFiles: 0,
     tokenCountRecords: 0,
     maxPrimary: 0,
@@ -50,6 +57,151 @@ export function createQuotaSummary() {
     reachedTypes: new Set(),
     current: undefined,
     highWatermarks: [],
+  };
+}
+
+function limitValue(status, name, key) {
+  const value = status?.limits?.[name]?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function statusReason(status) {
+  const primaryRemaining = limitValue(status, "primary", "remainingPercent");
+  const secondaryRemaining = limitValue(status, "secondary", "remainingPercent");
+  if (primaryRemaining !== undefined && primaryRemaining <= 0) return "primary status limit reached";
+  if (secondaryRemaining !== undefined && secondaryRemaining <= 0) return "secondary status limit reached";
+  return undefined;
+}
+
+function statusResetAt(status, exhausted) {
+  if (!exhausted) return undefined;
+  const primaryRemaining = limitValue(status, "primary", "remainingPercent");
+  const secondaryRemaining = limitValue(status, "secondary", "remainingPercent");
+  if (primaryRemaining !== undefined && primaryRemaining <= 0) return status.limits.primary?.resetAt;
+  if (secondaryRemaining !== undefined && secondaryRemaining <= 0) return status.limits.secondary?.resetAt;
+  return status.limits.primary?.resetAt ?? status.limits.secondary?.resetAt;
+}
+
+function quotaScopeRecord({ status, usedPercent, remainingPercent, resetAt, resetText, reason, checkedAt }) {
+  return {
+    status,
+    usedPercent,
+    remainingPercent,
+    resetAt,
+    resetText,
+    reason,
+    checkedAt,
+  };
+}
+
+export function createQuotaSummaryFromStatus(status, nowMs = Date.now()) {
+  const now = new Date(nowMs).toISOString();
+  const primary = limitValue(status, "primary", "usedPercent") ?? 0;
+  const secondary = limitValue(status, "secondary", "usedPercent") ?? 0;
+  const primaryRemaining = limitValue(status, "primary", "remainingPercent");
+  const secondaryRemaining = limitValue(status, "secondary", "remainingPercent");
+  const exhausted = Boolean(
+    (primaryRemaining !== undefined && primaryRemaining <= 0)
+    || (secondaryRemaining !== undefined && secondaryRemaining <= 0),
+  );
+  const reason = statusReason(status);
+  const resetAt = statusResetAt(status, exhausted);
+  const highWatermarks = primary >= 90 || secondary >= 90 || exhausted
+    ? [{
+      file: undefined,
+      line: undefined,
+      timestamp: now,
+      primary,
+      secondary,
+      reachedType: undefined,
+      resetAt,
+      credits: undefined,
+    }]
+    : [];
+
+  return {
+    source: "status",
+    scannedFiles: 0,
+    tokenCountRecords: 0,
+    statusRecords: 1,
+    maxPrimary: primary,
+    maxSecondary: secondary,
+    firstAt: now,
+    lastAt: now,
+    planType: status.planType,
+    account: status.account,
+    lastCredits: undefined,
+    exhausted,
+    historicalExhausted: exhausted,
+    exhaustedEvents: exhausted ? 1 : 0,
+    reason,
+    resetAt,
+    reachedTypes: [],
+    statusRemaining: {
+      primary: primaryRemaining,
+      secondary: secondaryRemaining,
+    },
+    statusResetText: {
+      primary: status.limits?.primary?.resetText,
+      secondary: status.limits?.secondary?.resetText,
+    },
+    statusResetAt: {
+      primary: status.limits?.primary?.resetAt,
+      secondary: status.limits?.secondary?.resetAt,
+    },
+    current: {
+      file: undefined,
+      line: undefined,
+      timestamp: now,
+      primary,
+      secondary,
+      reachedType: undefined,
+      resetAt,
+      credits: undefined,
+      planType: status.planType,
+    },
+    highWatermarks,
+  };
+}
+
+export function quotaScopesFromSummary(summary) {
+  if (!summary?.current) return undefined;
+  const checkedAt = summary.lastAt ?? summary.current.timestamp ?? new Date().toISOString();
+  const primaryRemaining = summary.statusRemaining?.primary
+    ?? (typeof summary.current.primary === "number" ? Math.max(0, 100 - summary.current.primary) : undefined);
+  const secondaryRemaining = summary.statusRemaining?.secondary
+    ?? (typeof summary.current.secondary === "number" ? Math.max(0, 100 - summary.current.secondary) : undefined);
+  const primaryExhausted = primaryRemaining !== undefined
+    ? primaryRemaining <= 0
+    : summary.current.primary >= 100;
+  const secondaryExhausted = secondaryRemaining !== undefined
+    ? secondaryRemaining <= 0
+    : summary.current.secondary >= 100;
+  const primaryResetAt = summary.statusResetAt?.primary
+    ?? summary.current.resetAtByScope?.primary
+    ?? (primaryExhausted ? summary.current.resetAt : undefined);
+  const secondaryResetAt = summary.statusResetAt?.secondary
+    ?? summary.current.resetAtByScope?.secondary
+    ?? (secondaryExhausted ? summary.current.resetAt : undefined);
+  return {
+    [codexQuotaScopes.primary]: quotaScopeRecord({
+      status: primaryExhausted ? "exhausted" : "available",
+      usedPercent: summary.current.primary,
+      remainingPercent: primaryRemaining,
+      resetAt: primaryResetAt,
+      resetText: summary.statusResetText?.primary,
+      reason: primaryExhausted ? "5h quota exhausted" : undefined,
+      checkedAt,
+    }),
+    [codexQuotaScopes.secondary]: quotaScopeRecord({
+      status: secondaryExhausted ? "exhausted" : "available",
+      usedPercent: summary.current.secondary,
+      remainingPercent: secondaryRemaining,
+      resetAt: secondaryResetAt,
+      resetText: summary.statusResetText?.secondary,
+      reason: secondaryExhausted ? "weekly quota exhausted" : undefined,
+      checkedAt,
+    }),
   };
 }
 
@@ -75,6 +227,10 @@ function updateSummary(summary, file, lineNumber, event) {
       secondary,
       reachedType,
       resetAt: pickReset(rateLimits),
+      resetAtByScope: {
+        primary: epochSecondsToIso(rateLimits.primary?.resets_at),
+        secondary: epochSecondsToIso(rateLimits.secondary?.resets_at),
+      },
       credits: rateLimits.credits,
       planType: rateLimits.plan_type,
     };
@@ -118,6 +274,38 @@ export function ingestQuotaLine(summary, file, lineNumber, line) {
     // Ignore partial or malformed JSONL records.
   }
   return false;
+}
+
+function collectStrings(value, out = []) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out);
+  } else if (value && typeof value === "object") {
+    for (const item of Object.values(value)) collectStrings(item, out);
+  }
+  return out;
+}
+
+export function parseQuotaTriggerLine(line) {
+  if (!/(usage limit|purchase more credits|upgrade to pro|try again at)/i.test(line)) return undefined;
+  let text = line;
+  let timestamp;
+  try {
+    const event = JSON.parse(line);
+    timestamp = event.timestamp;
+    text = collectStrings(event.payload ?? event).join("\n");
+  } catch {
+    // Plain text lines can still be used as a wake-up trigger.
+  }
+  const hitUsageLimit = /you(?:'|’)?ve hit your usage limit/i.test(text);
+  const purchaseCredits = /purchase more credits/i.test(text);
+  const retryLater = /try again at\s+[^.\n]+/i.test(text);
+  if (!hitUsageLimit && !purchaseCredits && !retryLater) return undefined;
+  return {
+    type: "usage_limit_message",
+    timestamp,
+    reason: hitUsageLimit ? "usage limit reached" : "quota warning",
+  };
 }
 
 export function finalizeQuotaSummary(summary, nowMs = Date.now()) {
@@ -164,6 +352,22 @@ export async function scanCodexSessions(options = {}) {
   return finalizeQuotaSummary(summary);
 }
 
+export async function scanCodexQuota(options = {}) {
+  if (options.preferStatus === false) return await scanCodexSessions(options);
+  const adapter = {
+    refreshUsage: async () => {
+      const status = options.status ?? await probeCodexStatusQuota(options.statusOptions ?? {});
+      return status ? createQuotaSummaryFromStatus(status, options.nowMs) : undefined;
+    },
+    scanLocalUsage: async () => await scanCodexSessions(options),
+  };
+  const summary = await runUsageCheck(adapter, options.reason ?? "explicit-scan", {
+    allowLocalFallback: options.allowLocalFallback ?? true,
+  });
+  if (summary?.refreshError) summary.statusProbeError = summary.refreshError;
+  return summary ?? createQuotaSummary();
+}
+
 export async function recordQuotaForProfile(summary, profileName) {
   const state = await loadState();
   const profile = state.profiles.find((entry) => entry.name === profileName);
@@ -172,18 +376,24 @@ export async function recordQuotaForProfile(summary, profileName) {
   const now = new Date().toISOString();
   profile.lastScanAt = now;
   profile.lastUsage = {
+    source: summary.source,
     maxPrimary: summary.maxPrimary,
     maxSecondary: summary.maxSecondary,
+    statusRemaining: summary.statusRemaining,
+    statusResetAt: summary.statusResetAt,
+    statusResetText: summary.statusResetText,
     planType: summary.planType,
     lastAt: summary.lastAt,
     credits: summary.lastCredits,
   };
+  const quotaScopes = quotaScopesFromSummary(summary);
+  if (quotaScopes) profile.quotaScopes = quotaScopes;
   if (summary.exhausted) {
     profile.quotaStatus = "exhausted";
     profile.quotaResetAt = summary.resetAt;
     profile.lastQuotaReason = summary.reason;
     profile.lastQuotaErrorAt = summary.lastAt ?? now;
-  } else if (summary.tokenCountRecords > 0) {
+  } else if (summary.tokenCountRecords > 0 || summary.source === "status") {
     profile.quotaStatus = "available";
     profile.quotaResetAt = undefined;
     profile.lastQuotaReason = undefined;

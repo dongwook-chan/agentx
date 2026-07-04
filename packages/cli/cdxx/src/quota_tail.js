@@ -1,5 +1,5 @@
 import { open, stat } from "node:fs/promises";
-import { createQuotaSummary, finalizeQuotaSummary, ingestQuotaLine } from "./quota.js";
+import { createQuotaSummary, finalizeQuotaSummary, ingestQuotaLine, parseQuotaTriggerLine } from "./quota.js";
 
 function cloneFinalSummary(summary) {
   return finalizeQuotaSummary({
@@ -46,11 +46,17 @@ export class QuotaTail {
     this.carry = text.endsWith("\n") || text.endsWith("\r") ? "" : (lines.pop() ?? "");
 
     let changed = false;
+    let quotaTrigger;
     for (const line of lines) {
       this.lineNumber += 1;
-      if (line && ingestQuotaLine(this.summary, this.file, this.lineNumber, line)) changed = true;
+      if (!line) continue;
+      if (ingestQuotaLine(this.summary, this.file, this.lineNumber, line)) changed = true;
+      quotaTrigger = quotaTrigger ?? parseQuotaTriggerLine(line);
     }
-    return changed ? cloneFinalSummary(this.summary) : undefined;
+    if (!changed && !quotaTrigger) return undefined;
+    const summary = cloneFinalSummary(this.summary);
+    if (quotaTrigger) summary.quotaTrigger = quotaTrigger;
+    return summary;
   }
 }
 

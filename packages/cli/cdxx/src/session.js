@@ -1,13 +1,16 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
+import { createServer } from "node:net";
 import { refreshActiveProfileCredential } from "./auth.js";
-import { loadState, saveState } from "./config.js";
+import { ensureConfig, loadState, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
+import { cleanupRuntimeFile, runtimeRecordPath, runtimeSocketPath, writeRuntimeRecord } from "./managed_sessions.js";
 import { runNativeSupervisor } from "./native.js";
 import { findRealCodex, isInteractiveCodex } from "./processes.js";
 import { QuotaTail, wait } from "./quota_tail.js";
-import { recordQuotaForProfile, scanCodexSessions } from "./quota.js";
+import { recordQuotaForProfile, scanCodexQuota } from "./quota.js";
 import { snapshotSessionFiles, waitForMatchingSession, findMatchingSession } from "./session_match.js";
 export { pickNextProfile } from "./selection.js";
 
@@ -47,6 +50,26 @@ function stopChildForFailover(child) {
   }, 5000).unref();
 }
 
+async function stopChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, 5000);
+    const finish = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    child.once("exit", finish);
+    if (child.exitCode !== null || child.signalCode !== null) finish();
+  });
+}
+
+function writeJSON(socket, value) {
+  socket.end(`${JSON.stringify(value)}\n`);
+}
+
 async function monitorMatchedSession(matchedSession, child, profileName, signal) {
   if (!matchedSession?.file) return undefined;
   const tail = new QuotaTail(matchedSession.file, {
@@ -55,13 +78,37 @@ async function monitorMatchedSession(matchedSession, child, profileName, signal)
   while (!signal.aborted) {
     const summary = await tail.readAdded();
     if (summary?.tokenCountRecords) {
-      const profile = await recordQuotaForProfile(summary, profileName);
+      const effectiveSummary = summary.exhausted || summary.quotaTrigger
+        ? await scanCodexQuota({ sinceMs: Date.now() - 60000, reason: "live-quota-trigger" })
+        : summary;
+      const profile = await recordQuotaForProfile(effectiveSummary, profileName);
       if (profile?.quotaStatus === "exhausted") {
         console.error(`[cdxx] Profile '${profile.name}' reached quota${describeReset(profile)}.`);
         const action = await decideCodexFailover({
           profileName: profile.name,
           sessionId: matchedSession.sessionId,
-          summary,
+          summary: effectiveSummary,
+        });
+        if (action.message) console.error(action.message);
+        if (action.kind === "switch_and_resume" && action.profile && matchedSession.sessionId) {
+          stopChildForFailover(child);
+          return {
+            sessionId: matchedSession.sessionId,
+            fromProfile: profile.name,
+            toProfile: action.profile,
+          };
+        }
+        return undefined;
+      }
+    } else if (summary?.quotaTrigger) {
+      const effectiveSummary = await scanCodexQuota({ sinceMs: Date.now() - 60000, reason: "live-quota-trigger" });
+      const profile = await recordQuotaForProfile(effectiveSummary, profileName);
+      if (profile?.quotaStatus === "exhausted") {
+        console.error(`[cdxx] Profile '${profile.name}' reached quota${describeReset(profile)}.`);
+        const action = await decideCodexFailover({
+          profileName: profile.name,
+          sessionId: matchedSession.sessionId,
+          summary: effectiveSummary,
         });
         if (action.message) console.error(action.message);
         if (action.kind === "switch_and_resume" && action.profile && matchedSession.sessionId) {
@@ -80,72 +127,6 @@ async function monitorMatchedSession(matchedSession, child, profileName, signal)
   return undefined;
 }
 
-async function runCodexOnce(realCodex, args) {
-  const started = Date.now();
-  const profileName = (await loadState()).activeProfile;
-  const before = await snapshotSessionFiles();
-  const launchArgs = await buildCodexLaunchArgsFromState(args);
-  const { child, exit } = spawnCodex(realCodex, launchArgs);
-  const matchAbort = new AbortController();
-  const monitorAbort = new AbortController();
-  let matchedSession;
-  let monitorPromise;
-  let failover;
-
-  const matchPromise = waitForMatchingSession({
-    before,
-    cwd: process.cwd(),
-    startMs: started,
-    timeoutMs: 30000,
-    signal: matchAbort.signal,
-  }).then(async (match) => {
-    matchedSession = match;
-    await saveMatchedSession(match);
-    if (match?.file) {
-      monitorPromise = monitorMatchedSession(match, child, profileName, monitorAbort.signal).then((result) => {
-        failover = result;
-        return result;
-      });
-    }
-    return match;
-  }).catch(() => undefined);
-
-  const code = await exit;
-  matchAbort.abort();
-  monitorAbort.abort();
-  await matchPromise.catch(() => undefined);
-  if (monitorPromise) await monitorPromise.catch(() => undefined);
-
-  matchedSession = await findMatchingSession({
-    before,
-    cwd: process.cwd(),
-    startMs: started,
-  }).catch(() => matchedSession);
-  await saveMatchedSession(matchedSession);
-
-  await refreshActiveProfileCredential();
-  const summary = await scanCodexSessions({ sinceMs: started - 5000 });
-  const profile = await recordQuotaForProfile(summary, profileName);
-  if (!failover && profile?.quotaStatus === "exhausted") {
-    console.error(`[cdxx] Profile '${profile.name}' reached quota${describeReset(profile)}.`);
-    const action = await decideCodexFailover({
-      profileName: profile.name,
-      sessionId: matchedSession?.sessionId,
-      summary,
-    });
-    if (action.message) console.error(action.message);
-    if (action.kind === "switch_and_resume" && action.profile && matchedSession?.sessionId) {
-      failover = {
-        sessionId: matchedSession.sessionId,
-        fromProfile: profile.name,
-        toProfile: action.profile,
-      };
-    }
-  }
-
-  return { code, failover };
-}
-
 export async function runCodexSession(args) {
   const realCodex = await findRealCodex();
   try {
@@ -158,17 +139,176 @@ export async function runCodexSession(args) {
   if (!isInteractiveCodex(args)) {
     return await spawnCodex(realCodex, args).exit;
   }
+
+  await ensureConfig();
+  const id = randomUUID();
+  const socketPath = runtimeSocketPath();
+  const recordPath = runtimeRecordPath(id);
+  const startedAt = new Date().toISOString();
   let currentArgs = args;
   let attempts = 0;
-  for (;;) {
-    const { code, failover } = await runCodexOnce(realCodex, currentArgs);
-    if (!failover) return code;
-    attempts += 1;
-    if (attempts > 10) {
-      console.error("[cdxx] Stopping after 10 quota failover attempts.");
-      return code;
+  let child;
+  let paused = false;
+  let activeMatchedSession;
+  let lastSessionId;
+  let resumeRequested;
+
+  const currentRecord = () => ({
+    id,
+    pid: process.pid,
+    childPid: child?.pid,
+    cwd: process.cwd(),
+    args: currentArgs,
+    codexSessionId: activeMatchedSession?.sessionId ?? lastSessionId,
+    socketPath,
+    paused,
+    restartable: true,
+    startedAt,
+  });
+
+  const persist = async () => {
+    await writeRuntimeRecord(recordPath, currentRecord());
+  };
+
+  const waitForResume = async () => {
+    if (!paused) return;
+    await new Promise((resolve) => {
+      resumeRequested = resolve;
+    });
+  };
+
+  const server = createServer({ allowHalfOpen: true }, (socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => { input += chunk; });
+    socket.on("end", async () => {
+      try {
+        const request = JSON.parse(input);
+        if (request.command === "pause") {
+          paused = true;
+          await stopChild(child);
+          child = undefined;
+          await persist();
+          writeJSON(socket, { ok: true, record: currentRecord() });
+        } else if (request.command === "resume") {
+          paused = false;
+          const resolve = resumeRequested;
+          resumeRequested = undefined;
+          if (resolve) resolve();
+          await persist();
+          writeJSON(socket, { ok: true });
+        } else {
+          await persist();
+          writeJSON(socket, { ok: true, record: currentRecord() });
+        }
+      } catch (error) {
+        writeJSON(socket, { ok: false, error: error.message });
+      }
+    });
+  });
+
+  await cleanupRuntimeFile(socketPath);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+
+  try {
+    for (;;) {
+      const started = Date.now();
+      const profileName = (await loadState()).activeProfile;
+      const before = await snapshotSessionFiles();
+      const launchArgs = await buildCodexLaunchArgsFromState(currentArgs);
+      const spawned = spawnCodex(realCodex, launchArgs);
+      child = spawned.child;
+      activeMatchedSession = undefined;
+      await persist();
+
+      const matchAbort = new AbortController();
+      const monitorAbort = new AbortController();
+      let matchedSession;
+      let monitorPromise;
+      let failover;
+
+      const matchPromise = waitForMatchingSession({
+        before,
+        cwd: process.cwd(),
+        startMs: started,
+        timeoutMs: 30000,
+        signal: matchAbort.signal,
+      }).then(async (match) => {
+        matchedSession = match;
+        activeMatchedSession = match;
+        await saveMatchedSession(match);
+        if (match?.sessionId) lastSessionId = match.sessionId;
+        await persist();
+        if (match?.file) {
+          monitorPromise = monitorMatchedSession(match, child, profileName, monitorAbort.signal).then((result) => {
+            failover = result;
+            return result;
+          });
+        }
+        return match;
+      }).catch(() => undefined);
+
+      const code = await spawned.exit;
+      child = undefined;
+      matchAbort.abort();
+      monitorAbort.abort();
+      await matchPromise.catch(() => undefined);
+      if (monitorPromise) await monitorPromise.catch(() => undefined);
+
+      matchedSession = await findMatchingSession({
+        before,
+        cwd: process.cwd(),
+        startMs: started,
+      }).catch(() => matchedSession);
+      activeMatchedSession = matchedSession;
+      await saveMatchedSession(matchedSession);
+      if (matchedSession?.sessionId) lastSessionId = matchedSession.sessionId;
+
+      await refreshActiveProfileCredential();
+      const summary = await scanCodexQuota({ sinceMs: started - 5000, reason: "session-exit" });
+      const profile = await recordQuotaForProfile(summary, profileName);
+      if (!failover && profile?.quotaStatus === "exhausted") {
+        console.error(`[cdxx] Profile '${profile.name}' reached quota${describeReset(profile)}.`);
+        const action = await decideCodexFailover({
+          profileName: profile.name,
+          sessionId: matchedSession?.sessionId,
+          summary,
+        });
+        if (action.message) console.error(action.message);
+        if (action.kind === "switch_and_resume" && action.profile && matchedSession?.sessionId) {
+          failover = {
+            sessionId: matchedSession.sessionId,
+            fromProfile: profile.name,
+            toProfile: action.profile,
+          };
+        }
+      }
+
+      await persist();
+
+      if (paused) {
+        if (matchedSession?.sessionId) currentArgs = ["resume", matchedSession.sessionId];
+        await persist();
+        await waitForResume();
+        continue;
+      }
+
+      if (!failover) return code;
+      attempts += 1;
+      if (attempts > 10) {
+        console.error("[cdxx] Stopping after 10 quota failover attempts.");
+        return code;
+      }
+      currentArgs = ["resume", failover.sessionId];
     }
-    currentArgs = ["resume", failover.sessionId];
+  } finally {
+    await stopChild(child);
+    server.close();
+    await cleanupRuntimeFile(socketPath);
+    await cleanupRuntimeFile(recordPath);
   }
 }
 

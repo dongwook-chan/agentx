@@ -3,8 +3,16 @@ import assert from "node:assert/strict";
 import { appendFile, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { scanCodexSessions } from "../src/quota.js";
+import {
+  createQuotaSummaryFromStatus,
+  parseQuotaTriggerLine,
+  quotaScopesFromSummary,
+  scanCodexQuota,
+  scanCodexSessions,
+} from "../src/quota.js";
 import { QuotaTail } from "../src/quota_tail.js";
+import { parseCodexStatusOutput } from "../src/status_probe.js";
+import { clearExpiredQuota } from "../src/config.js";
 
 function tokenCount(timestamp, primary, secondary, resetsAt) {
   return JSON.stringify({
@@ -74,6 +82,171 @@ test("scanCodexSessions marks current future reset exhaustion", async () => {
   }
 });
 
+test("parseCodexStatusOutput extracts account and remaining limits", () => {
+  const status = parseCodexStatusOutput(`
+Account: user@example.com (Plus)
+5h limit: [######--------------] 29% left (resets 15:29)
+Weekly limit: [############--------] 62% left
+(resets 09:13 on 7 Jul)
+`, Date.parse("2026-07-03T12:00:00.000Z"));
+
+  assert.equal(status.account, "user@example.com");
+  assert.equal(status.planType, "plus");
+  assert.equal(status.limits.primary.remainingPercent, 29);
+  assert.equal(status.limits.primary.usedPercent, 71);
+  assert.equal(status.limits.secondary.remainingPercent, 62);
+  assert.equal(status.limits.secondary.usedPercent, 38);
+  assert.ok(status.limits.primary.resetAt);
+  assert.ok(status.limits.secondary.resetAt);
+});
+
+test("scanCodexQuota prefers status probe over jsonl fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-quota-"));
+  try {
+    const sessions = join(root, "sessions");
+    await mkdir(sessions, { recursive: true });
+    const futureReset = Math.floor(Date.now() / 1000) + 3600;
+    await writeFile(
+      join(sessions, "rollout.jsonl"),
+      `${tokenCount("2026-06-28T02:00:00.000Z", 100, 20, futureReset)}\n`,
+    );
+
+    const summary = await scanCodexQuota({
+      sessionsDir: sessions,
+      nowMs: Date.parse("2026-07-03T12:00:00.000Z"),
+      status: {
+        account: "user@example.com",
+        planType: "plus",
+        limits: {
+          primary: { remainingPercent: 40, usedPercent: 60 },
+          secondary: { remainingPercent: 70, usedPercent: 30 },
+        },
+      },
+    });
+
+    assert.equal(summary.source, "status");
+    assert.equal(summary.exhausted, false);
+    assert.equal(summary.current.primary, 60);
+    assert.equal(summary.statusRemaining.primary, 40);
+    assert.equal(summary.scannedFiles, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("createQuotaSummaryFromStatus marks zero remaining as exhausted", () => {
+  const summary = createQuotaSummaryFromStatus({
+    account: "user@example.com",
+    planType: "plus",
+    limits: {
+      primary: { remainingPercent: 0, usedPercent: 100, resetAt: "2026-07-03T15:29:00.000Z" },
+      secondary: { remainingPercent: 62, usedPercent: 38 },
+    },
+  }, Date.parse("2026-07-03T12:00:00.000Z"));
+
+  assert.equal(summary.source, "status");
+  assert.equal(summary.exhausted, true);
+  assert.equal(summary.reason, "primary status limit reached");
+  assert.equal(summary.resetAt, "2026-07-03T15:29:00.000Z");
+});
+
+test("quotaScopesFromSummary preserves both Codex status windows", () => {
+  const summary = createQuotaSummaryFromStatus({
+    account: "user@example.com",
+    planType: "plus",
+    limits: {
+      primary: {
+        remainingPercent: 0,
+        usedPercent: 100,
+        resetAt: "2026-07-03T15:29:00.000Z",
+        resetText: "15:29",
+      },
+      secondary: {
+        remainingPercent: 62,
+        usedPercent: 38,
+        resetAt: "2026-07-07T09:13:00.000Z",
+        resetText: "09:13 on 7 Jul",
+      },
+    },
+  }, Date.parse("2026-07-03T12:00:00.000Z"));
+
+  const scopes = quotaScopesFromSummary(summary);
+
+  assert.equal(scopes["5h"].status, "exhausted");
+  assert.equal(scopes["5h"].remainingPercent, 0);
+  assert.equal(scopes["5h"].resetAt, "2026-07-03T15:29:00.000Z");
+  assert.equal(scopes.weekly.status, "available");
+  assert.equal(scopes.weekly.remainingPercent, 62);
+  assert.equal(scopes.weekly.resetAt, "2026-07-07T09:13:00.000Z");
+});
+
+test("clearExpiredQuota clears expired scoped Codex quota", () => {
+  const profile = {
+    name: "user",
+    quotaStatus: "exhausted",
+    quotaResetAt: "2026-07-03T15:29:00.000Z",
+    lastQuotaReason: "5h quota exhausted",
+    quotaScopes: {
+      "5h": {
+        status: "exhausted",
+        resetAt: "2026-07-03T15:29:00.000Z",
+        reason: "5h quota exhausted",
+      },
+      weekly: {
+        status: "available",
+        resetAt: "2026-07-07T09:13:00.000Z",
+      },
+    },
+  };
+
+  clearExpiredQuota(profile, new Date("2026-07-03T15:30:00.000Z"));
+
+  assert.equal(profile.quotaStatus, "available");
+  assert.equal(profile.quotaScopes["5h"].status, "available");
+  assert.equal(profile.quotaScopes["5h"].resetAt, undefined);
+  assert.equal(profile.quotaScopes.weekly.status, "available");
+});
+
+test("clearExpiredQuota recomputes aggregate status from active scoped quota", () => {
+  const profile = {
+    name: "user",
+    quotaStatus: "available",
+    quotaScopes: {
+      "5h": {
+        status: "exhausted",
+        resetAt: "2026-07-03T15:29:00.000Z",
+        reason: "5h quota exhausted",
+      },
+      weekly: { status: "available" },
+    },
+  };
+
+  clearExpiredQuota(profile, new Date("2026-07-03T15:00:00.000Z"));
+
+  assert.equal(profile.quotaStatus, "exhausted");
+  assert.equal(profile.quotaResetAt, "2026-07-03T15:29:00.000Z");
+  assert.equal(profile.lastQuotaReason, "5h quota exhausted");
+});
+
+test("parseQuotaTriggerLine treats usage-limit messages as status refresh triggers", () => {
+  const line = JSON.stringify({
+    timestamp: "2026-07-03T14:52:00.000Z",
+    type: "response_item",
+    payload: {
+      type: "message",
+      content: [{
+        type: "output_text",
+        text: "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:29 PM.",
+      }],
+    },
+  });
+
+  const trigger = parseQuotaTriggerLine(line);
+
+  assert.equal(trigger.type, "usage_limit_message");
+  assert.equal(trigger.reason, "usage limit reached");
+});
+
 test("QuotaTail reads only appended quota records after offset", async () => {
   const root = await mkdtemp(join(tmpdir(), "cdxx-tail-"));
   try {
@@ -91,6 +264,34 @@ test("QuotaTail reads only appended quota records after offset", async () => {
     assert.equal(summary.tokenCountRecords, 1);
     assert.equal(summary.current.primary, 100);
     assert.equal(summary.exhausted, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("QuotaTail returns usage-limit trigger even without token_count", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-tail-"));
+  try {
+    const file = join(root, "rollout.jsonl");
+    await writeFile(file, "");
+    const tail = new QuotaTail(file);
+
+    await appendFile(file, `${JSON.stringify({
+      timestamp: "2026-07-03T14:52:00.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        content: [{
+          type: "output_text",
+          text: "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:29 PM.",
+        }],
+      },
+    })}\n`);
+
+    const summary = await tail.readAdded();
+
+    assert.equal(summary.tokenCountRecords, 0);
+    assert.equal(summary.quotaTrigger.type, "usage_limit_message");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

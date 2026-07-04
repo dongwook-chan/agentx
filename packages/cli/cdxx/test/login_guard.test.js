@@ -146,9 +146,9 @@ test("guardedLoginProfile restores from the saved active profile when active aut
   }
 });
 
-test("guardedLoginProfile prefers the saved active profile over stale active auth on failure", async () => {
+test("guardedLoginProfile preserves previous active auth over the saved active profile on failure", async () => {
   await resetState("old");
-  await writeFile(auth.activeAuthPath, codexAuth("stale-active"), { mode: 0o600 });
+  await writeFile(auth.activeAuthPath, codexAuth("current-active"), { mode: 0o600 });
   const errors = [];
   const originalError = console.error;
   console.error = (message) => errors.push(String(message));
@@ -159,7 +159,7 @@ test("guardedLoginProfile prefers the saved active profile over stale active aut
     });
 
     assert.equal(code, 130);
-    assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("old"));
+    assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("current-active"));
     assert.match(errors.join("\n"), /Restored previous active profile 'old'/);
   } finally {
     console.error = originalError;

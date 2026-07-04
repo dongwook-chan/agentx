@@ -78,7 +78,7 @@ export async function guardedLoginProfile(inputName, runLogin, options = {}) {
       : undefined;
     const backupDir = await mkdtemp(join(tmpdir(), "cdxx-login-"));
     const backupPath = join(backupDir, "auth.json");
-    const restoreAuth = previousProfileAuth ?? previousAuth;
+    const restoreAuth = previousAuth ?? previousProfileAuth;
     if (restoreAuth) await writeFile(backupPath, restoreAuth, { mode: 0o600 });
     try {
       const code = await runLogin();

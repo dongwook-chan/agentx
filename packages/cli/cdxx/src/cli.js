@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { runAuthSwitchTransaction } from "@dong-/agentx-core";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,9 +9,10 @@ import { clearExpiredQuota, effectiveYoloMode, loadState, saveState } from "./co
 import { decideCodexFailover } from "./failover_policy.js";
 import { installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
+import { pauseAll, resumeAll, sessionControlAdapter, sessionRecords } from "./managed_sessions.js";
 import { findRealCodex } from "./processes.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
-import { recordQuotaForActiveProfile, scanCodexSessions } from "./quota.js";
+import { recordQuotaForActiveProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
 import { pickConfigKey, pickConfigValue, pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
 
 const help = `cdxx - Codex CLI profile and quota helper
@@ -20,7 +22,10 @@ Preferred shell usage after 'cdxx install':
   codex x list                   List saved profiles
   codex x use [name]             Activate a saved profile
   codex x next                   Switch to next selectable profile
+  codex x sessions               List supervised Codex sessions
+  codex x pause | resume         Pause or resume supervised sessions
   codex x status                 Show wrapper status
+  codex x scan                   Check Codex quota (/status, jsonl fallback)
   codex x config                 Configure wrapper settings interactively
   codex x config <key> [value]   Configure autoswitch/yolo
   codex x remove <name>          Delete a saved profile
@@ -36,9 +41,11 @@ Usage:
   cdxx login [name]               Run 'codex login', then save as profile
   cdxx use [name]                 Activate a saved profile
   cdxx next                       Switch to next selectable profile
+  cdxx sessions                   List supervised Codex sessions
+  cdxx pause | resume             Pause or resume supervised sessions
   cdxx list                       List profiles
-  cdxx scan [--json] [--full] [--record]
-                                  Scan local Codex sessions
+  cdxx scan [--json] [--full] [--record] [--jsonl]
+                                  Check Codex quota (/status, jsonl fallback)
   cdxx config [key] [value]       Configure wrapper settings
   cdxx remove <name>              Delete a saved profile
   cdxx status                     Show wrapper status`;
@@ -48,7 +55,10 @@ const wrapperHelp = `cdxx wrapper commands:
   codex x list                   List saved profiles
   codex x use [name]             Activate a saved profile
   codex x next                   Switch to next selectable profile
+  codex x sessions               List supervised Codex sessions
+  codex x pause | resume         Pause or resume supervised sessions
   codex x status                 Show wrapper status
+  codex x scan                   Check Codex quota (/status, jsonl fallback)
   codex x config                 Configure wrapper settings interactively
   codex x config list            Print wrapper settings
   codex x config get <key>       Print one setting
@@ -116,16 +126,25 @@ async function loginProfile(name, loginArgs = []) {
   const realCodex = await findRealCodex();
   const loginHome = await mkdtemp(join(tmpdir(), "cdxx-codex-login-"));
   try {
-    return await guardedLoginProfile(
-      name,
-      async () => await spawnInherited(realCodex, ["login", ...loginArgs], {
-        env: { ...process.env, CODEX_HOME: loginHome },
-      }),
-      { candidateAuthPath: join(loginHome, "auth.json") },
+    return await withPausedSessions(async () =>
+      await guardedLoginProfile(
+        name,
+        async () => await spawnInherited(realCodex, ["login", ...loginArgs], {
+          env: { ...process.env, CODEX_HOME: loginHome },
+        }),
+        { candidateAuthPath: join(loginHome, "auth.json") },
+      )
     );
   } finally {
     await rm(loginHome, { recursive: true, force: true });
   }
+}
+
+async function withPausedSessions(operation) {
+  return await runAuthSwitchTransaction(
+    { sessionControl: sessionControlAdapter() },
+    operation,
+  );
 }
 
 async function chooseProfileForUse() {
@@ -141,7 +160,7 @@ async function switchNext() {
   for (const profile of state.profiles) clearExpiredQuota(profile);
   const next = pickNextProfile(state);
   if (!next) throw new Error("No selectable profile found.");
-  const result = await useProfile(next.name);
+  const result = await withPausedSessions(async () => await useProfile(next.name));
   console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
 }
 
@@ -273,6 +292,31 @@ async function printStatus() {
   console.log(`yolo: ${effectiveYoloMode(state) ? "on" : "off"}`);
   console.log(`real codex: ${await findRealCodex().catch(() => "(not found)")}`);
   console.log(`shell integration file: ${shellIntegrationPath()}`);
+  console.log(`supervised sessions: ${(await sessionRecords()).length}`);
+}
+
+async function loadStateForDisplay() {
+  const state = await loadState();
+  for (const profile of state.profiles) clearExpiredQuota(profile);
+  await saveState(state);
+  return state;
+}
+
+async function printSessions() {
+  const sessions = await sessionRecords();
+  if (!sessions.length) {
+    console.log("No supervised Codex sessions.");
+    return;
+  }
+  for (const record of sessions) {
+    console.log(
+      `${record.id}  pid=${record.pid}`
+      + `${record.childPid ? ` child=${record.childPid}` : ""}`
+      + `  ${record.paused ? "paused" : "running"}`
+      + `  cwd=${record.cwd}`
+      + `${record.codexSessionId ? `  session=${record.codexSessionId}` : ""}`,
+    );
+  }
 }
 
 async function runNativeCodex(args) {
@@ -299,15 +343,29 @@ async function runWrapperCommand(command, args) {
     case "use": {
       const name = optionalName(args, "cdxx use [name]") ?? await chooseProfileForUse();
       if (!name) return 0;
-      const result = await useProfile(name);
+      const result = await withPausedSessions(async () => await useProfile(name));
       console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
       return 0;
     }
     case "next":
       await switchNext();
       return 0;
+    case "sessions":
+      await printSessions();
+      return 0;
+    case "pause": {
+      const records = await pauseAll();
+      console.log(`Paused ${records.length} supervised session(s).`);
+      return 0;
+    }
+    case "resume": {
+      const records = await sessionRecords();
+      await resumeAll(records);
+      console.log(`Resumed ${records.length} supervised session(s).`);
+      return 0;
+    }
     case "list":
-      printProfiles(await loadState());
+      printProfiles(await loadStateForDisplay());
       return 0;
     case "current": {
       const state = await loadState();
@@ -318,8 +376,9 @@ async function runWrapperCommand(command, args) {
       const asJson = takeFlag(args, "--json");
       const full = takeFlag(args, "--full");
       const record = takeFlag(args, "--record");
-      if (args.length) throw new Error("Usage: cdxx scan [--json] [--full] [--record]");
-      const summary = await scanCodexSessions();
+      const jsonl = takeFlag(args, "--jsonl");
+      if (args.length) throw new Error("Usage: cdxx scan [--json] [--full] [--record] [--jsonl]");
+      const summary = jsonl ? await scanCodexSessions() : await scanCodexQuota({ reason: record ? "manual-record" : "explicit-scan" });
       if (record) await recordQuotaForActiveProfile(summary);
       if (asJson) {
         const payload = full ? summary : {
@@ -415,15 +474,29 @@ async function main() {
     case "use": {
       const name = optionalName(args, "cdxx use [name]") ?? await chooseProfileForUse();
       if (!name) return 0;
-      const result = await useProfile(name);
+      const result = await withPausedSessions(async () => await useProfile(name));
       console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
       return 0;
     }
     case "next":
       await switchNext();
       return 0;
+    case "sessions":
+      await printSessions();
+      return 0;
+    case "pause": {
+      const records = await pauseAll();
+      console.log(`Paused ${records.length} supervised session(s).`);
+      return 0;
+    }
+    case "resume": {
+      const records = await sessionRecords();
+      await resumeAll(records);
+      console.log(`Resumed ${records.length} supervised session(s).`);
+      return 0;
+    }
     case "list":
-      printProfiles(await loadState());
+      printProfiles(await loadStateForDisplay());
       return 0;
     case "current": {
       const state = await loadState();
@@ -434,8 +507,9 @@ async function main() {
       const asJson = takeFlag(args, "--json");
       const full = takeFlag(args, "--full");
       const record = takeFlag(args, "--record");
-      if (args.length) throw new Error("Usage: cdxx scan [--json] [--full] [--record]");
-      const summary = await scanCodexSessions();
+      const jsonl = takeFlag(args, "--jsonl");
+      if (args.length) throw new Error("Usage: cdxx scan [--json] [--full] [--record] [--jsonl]");
+      const summary = jsonl ? await scanCodexSessions() : await scanCodexQuota({ reason: record ? "manual-record" : "explicit-scan" });
       if (record) await recordQuotaForActiveProfile(summary);
       if (asJson) {
         const payload = full ? summary : {

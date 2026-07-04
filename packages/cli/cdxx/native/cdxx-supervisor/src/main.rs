@@ -7,6 +7,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -45,10 +46,15 @@ struct QuotaEvent {
 }
 
 struct Supervisor {
+    id: String,
     cwd: String,
     real_codex: String,
+    socket_path: PathBuf,
+    record_path: PathBuf,
+    started_at: String,
     child: Option<Child>,
     intentional_stop: bool,
+    paused: bool,
     profile_at_start: Option<String>,
     before: HashMap<PathBuf, FileSnapshot>,
     start_ms: i64,
@@ -60,8 +66,28 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    fn record(&self) -> Value {
+        json!({
+            "id": self.id,
+            "pid": std::process::id(),
+            "childPid": self.child.as_ref().map(|child| child.id()),
+            "cwd": self.cwd,
+            "args": self.current_args,
+            "codexSessionId": self.matched_session.as_ref().map(|session| session.session_id.clone()),
+            "socketPath": self.socket_path.to_string_lossy(),
+            "paused": self.paused,
+            "restartable": true,
+            "startedAt": self.started_at,
+        })
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        write_json_file(&self.record_path, &self.record())
+    }
+
     fn start_child(&mut self) -> Result<(), String> {
         self.intentional_stop = false;
+        self.paused = false;
         self.profile_at_start = active_profile()?;
         self.before = snapshot_session_files()?;
         self.start_ms = now_millis() as i64;
@@ -79,6 +105,7 @@ impl Supervisor {
             .spawn()
             .map_err(to_string)?;
         self.child = Some(child);
+        self.persist()?;
         Ok(())
     }
 
@@ -97,6 +124,15 @@ impl Supervisor {
         kill_process(child.id());
         let status = child.wait().map_err(to_string)?;
         Ok(status.code().unwrap_or(1))
+    }
+
+    fn capture_matched_session(&mut self) -> Result<(), String> {
+        if let Some(matched) = find_matching_session(&self.before, &self.cwd, self.start_ms)? {
+            save_last_session(&matched)?;
+            self.current_args = vec!["resume".to_string(), matched.session_id.clone()];
+            self.matched_session = Some(matched);
+        }
+        self.persist()
     }
 
     fn tick(&mut self) -> Result<(), String> {
@@ -226,12 +262,21 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         .map_err(to_string)?
         .to_string_lossy()
         .to_string();
+    let id = format!("{}-{}", std::process::id(), now_millis());
+    let socket_path = runtime_dir().join(format!("{}.sock", std::process::id()));
+    let record_path = runtime_dir().join(format!("{id}.json"));
+    let _ = fs::remove_file(&socket_path);
     let supervisor = Arc::new(Mutex::new(Supervisor {
+        id,
         current_args: args.clone(),
         cwd,
         real_codex,
+        socket_path: socket_path.clone(),
+        record_path: record_path.clone(),
+        started_at: now_iso(),
         child: None,
         intentional_stop: false,
+        paused: false,
         profile_at_start: None,
         before: HashMap::new(),
         start_ms: now_millis() as i64,
@@ -242,9 +287,10 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     }));
 
     supervisor.lock().map_err(to_string)?.start_child()?;
-    start_signal_handler(supervisor.clone())?;
+    start_socket_server(supervisor.clone(), socket_path.clone())?;
+    start_signal_handler(supervisor.clone(), socket_path.clone(), record_path.clone())?;
 
-    loop {
+    let code = loop {
         thread::sleep(Duration::from_millis(500));
         let mut guard = supervisor.lock().map_err(to_string)?;
         guard.tick()?;
@@ -257,8 +303,9 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         };
         if let Some(code) = exited {
             guard.child = None;
+            let _ = guard.persist();
             if guard.intentional_stop {
-                return Ok(code);
+                break code;
             }
             let _ = find_matching_session(&guard.before, &guard.cwd, guard.start_ms).and_then(
                 |matched| {
@@ -268,22 +315,84 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                     Ok(())
                 },
             );
-            return Ok(code);
+            break code;
         }
-    }
+    };
+    cleanup_paths(&socket_path, &record_path);
+    Ok(code)
 }
 
-fn start_signal_handler(supervisor: Arc<Mutex<Supervisor>>) -> Result<(), String> {
+fn start_signal_handler(
+    supervisor: Arc<Mutex<Supervisor>>,
+    socket_path: PathBuf,
+    record_path: PathBuf,
+) -> Result<(), String> {
     let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(to_string)?;
     thread::spawn(move || {
         if let Some(signal) = signals.forever().next() {
             if let Ok(mut guard) = supervisor.lock() {
                 let _ = guard.stop_child();
             }
+            cleanup_paths(&socket_path, &record_path);
             std::process::exit(if signal == SIGINT { 130 } else { 143 });
         }
     });
     Ok(())
+}
+
+fn start_socket_server(
+    supervisor: Arc<Mutex<Supervisor>>,
+    socket_path: PathBuf,
+) -> Result<(), String> {
+    let listener = UnixListener::bind(socket_path).map_err(to_string)?;
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let supervisor = supervisor.clone();
+            thread::spawn(move || {
+                let _ = handle_socket(supervisor, stream);
+            });
+        }
+    });
+    Ok(())
+}
+
+fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> Result<(), String> {
+    let mut input = String::new();
+    stream.read_to_string(&mut input).map_err(to_string)?;
+    let request: Value = serde_json::from_str(&input).map_err(to_string)?;
+    let command = request
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("status");
+    let mut guard = supervisor.lock().map_err(to_string)?;
+    let reply = match command {
+        "pause" => {
+            guard.paused = true;
+            guard.stop_child()?;
+            guard.capture_matched_session()?;
+            json!({ "ok": true, "record": guard.record() })
+        }
+        "resume" => {
+            guard.paused = false;
+            if guard.child.is_none() {
+                guard.start_child()?;
+            }
+            json!({ "ok": true })
+        }
+        "status" => {
+            guard.persist()?;
+            json!({ "ok": true, "record": guard.record() })
+        }
+        _ => json!({ "ok": false, "error": format!("unknown command: {command}") }),
+    };
+    stream
+        .write_all(format!("{}\n", serde_json::to_string(&reply).map_err(to_string)?).as_bytes())
+        .map_err(to_string)
+}
+
+fn cleanup_paths(socket_path: &Path, record_path: &Path) {
+    let _ = fs::remove_file(socket_path);
+    let _ = fs::remove_file(record_path);
 }
 
 fn supervisor_launch_args(args: &[String]) -> Result<Vec<String>, String> {

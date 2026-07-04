@@ -2,6 +2,10 @@ import { constants } from "node:fs";
 import { access } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  nativeSupervisorBinaryName as coreNativeSupervisorBinaryName,
+  nativeSupervisorHostStatus as coreNativeSupervisorHostStatus,
+} from "@dong-/agentx-core";
 
 export const nativeSupervisorBinaryByHost = {
   "darwin:arm64": "cdxx-supervisor-darwin-arm64",
@@ -12,25 +16,20 @@ export function nativeSupervisorBinaryName(
   platform = process.platform,
   arch = process.arch,
 ) {
-  return nativeSupervisorBinaryByHost[`${platform}:${arch}`];
+  return coreNativeSupervisorBinaryName(nativeSupervisorBinaryByHost, platform, arch);
 }
 
 export function nativeSupervisorHostStatus(
   platform = process.platform,
   arch = process.arch,
 ) {
-  const binaryName = nativeSupervisorBinaryName(platform, arch);
-  const supported = Boolean(binaryName);
-  return {
-    supported,
+  return coreNativeSupervisorHostStatus(
+    "cdxx",
+    nativeSupervisorBinaryByHost,
+    "darwin/arm64 or linux/arm64",
     platform,
     arch,
-    expected: "darwin/arm64 or linux/arm64",
-    binaryName,
-    message: supported
-      ? undefined
-      : `cdxx native supervisor supports darwin/arm64 and linux/arm64 only; current host is ${platform}/${arch}.`,
-  };
+  );
 }
 
 export function nativeSupervisorPath() {
@@ -49,6 +48,13 @@ async function executable(path) {
 }
 
 export async function runNativeSupervisor(args, realCodex) {
+  if (
+    process.env.CDXX_ENABLE_NATIVE_SUPERVISOR !== "1"
+    && process.env.CDXX_REQUIRE_NATIVE_SUPERVISOR !== "1"
+  ) {
+    return undefined;
+  }
+
   const host = nativeSupervisorHostStatus();
   if (!host.supported) {
     if (process.env.CDXX_REQUIRE_NATIVE_SUPERVISOR === "1") {

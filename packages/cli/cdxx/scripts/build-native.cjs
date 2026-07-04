@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-const { copyFileSync, mkdirSync, chmodSync, writeFileSync } = require("node:fs");
+const { copyFileSync, mkdirSync, chmodSync, writeFileSync, renameSync, rmSync } = require("node:fs");
 const { join } = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
@@ -27,11 +27,20 @@ if (result.status !== 0) process.exit(result.status ?? 1);
 
 const binDir = join(__dirname, "..", "bin");
 mkdirSync(binDir, { recursive: true });
-copyFileSync(
-  join(crateDir, "target", "release", "cdxx-supervisor"),
-  join(binDir, binaryName),
-);
-chmodSync(join(binDir, binaryName), 0o755);
+const sourceBinary = join(crateDir, "target", "release", "cdxx-supervisor");
+const targetBinary = join(binDir, binaryName);
+const replacedBinary = `${targetBinary}.old-${process.pid}`;
+try {
+  renameSync(targetBinary, replacedBinary);
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+try {
+  copyFileSync(sourceBinary, targetBinary);
+  chmodSync(targetBinary, 0o755);
+} finally {
+  rmSync(replacedBinary, { force: true });
+}
 
 const launcher = `#!/usr/bin/env node
 import { existsSync } from "node:fs";
