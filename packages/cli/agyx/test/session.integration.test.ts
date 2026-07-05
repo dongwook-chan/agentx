@@ -59,6 +59,15 @@ function sendSession(
   });
 }
 
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 test("supervisor pauses and resumes in place with conversation UUID", async () => {
   const root = await mkdtemp(join(tmpdir(), "agyx-integration-"));
   const fakeAgy = join(root, "agy");
@@ -242,6 +251,61 @@ test("auto switch does not pause sessions before quota policy allows switching",
     assert.equal(result.code, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout), { kind: "none" });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("usage probe timeout cleans up the probed agy process", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agyx-integration-"));
+  const config = join(root, "config");
+  const fakeAgy = join(root, "agy");
+  const pidFile = join(root, "agy.pid");
+  const now = "2026-07-05T00:00:00.000Z";
+  await mkdir(config, { recursive: true });
+  await writeFile(join(config, "state.json"), `${JSON.stringify({
+    version: 1,
+    activeProfile: "p",
+    profiles: [
+      {
+        name: "p",
+        email: "p@example.com",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+  }, null, 2)}\n`);
+  await writeFile(fakeAgy, `#!/bin/sh
+printf '%s\\n' "$$" > "$AGYX_TEST_PROBE_PID"
+trap 'exit 0' HUP INT TERM
+while :; do sleep 1; done
+`);
+  await chmod(fakeAgy, 0o755);
+
+  let pid: number | undefined;
+  try {
+    const result = await runCLI([
+      "_usage-probe",
+      JSON.stringify({
+        profileName: "p",
+        realAgy: fakeAgy,
+        cwd: root,
+        timeoutMs: 500,
+      }),
+    ], {
+      ...process.env,
+      AGYX_CONFIG_DIR: config,
+      AGYX_TEST_PROBE_PID: pidFile,
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).ok, true);
+    pid = Number((await readFile(pidFile, "utf8")).trim());
+    assert.ok(Number.isInteger(pid));
+    await waitFor(async () => !processAlive(pid!), 5000);
+  } finally {
+    if (pid && processAlive(pid)) {
+      try { process.kill(pid, "SIGKILL"); }
+      catch { /* already gone */ }
+    }
     await rm(root, { recursive: true, force: true });
   }
 });

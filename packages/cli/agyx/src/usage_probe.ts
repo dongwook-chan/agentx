@@ -177,6 +177,18 @@ async function readTranscript(path: string): Promise<string> {
   return await readFile(path, "utf8").catch(() => "");
 }
 
+function terminateProbeProcessGroup(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      try { child.kill(signal); }
+      catch { /* The process may have exited between checks. */ }
+    }
+  }
+}
+
 async function captureUsageTranscript(options: {
   realAgy: string;
   cwd: string;
@@ -196,6 +208,7 @@ async function captureUsageTranscript(options: {
   await new Promise<void>((resolvePromise) => {
     const child = spawn(command.command, command.args, {
       cwd: options.cwd,
+      detached: true,
       stdio: command.input ? ["pipe", "ignore", "ignore"] : "ignore",
       env: {
         ...process.env,
@@ -207,16 +220,25 @@ async function captureUsageTranscript(options: {
     });
     if (command.input && child.stdin) child.stdin.end(command.input);
 
+    let killDeadline: NodeJS.Timeout | undefined;
     const deadline = setTimeout(() => {
-      if (child.exitCode === null) child.kill("SIGTERM");
+      terminateProbeProcessGroup(child, "SIGTERM");
+      killDeadline = setTimeout(() => {
+        terminateProbeProcessGroup(child, "SIGKILL");
+      }, 2000);
     }, options.timeoutMs);
 
-    child.on("error", () => {
+    const cleanup = (): void => {
       clearTimeout(deadline);
+      if (killDeadline) clearTimeout(killDeadline);
+    };
+
+    child.on("error", () => {
+      cleanup();
       resolvePromise();
     });
     child.on("close", () => {
-      clearTimeout(deadline);
+      cleanup();
       resolvePromise();
     });
   });
