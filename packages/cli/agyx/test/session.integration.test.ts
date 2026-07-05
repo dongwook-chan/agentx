@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { connect } from "node:net";
 import {
   chmod,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -83,6 +84,7 @@ while :; do sleep 1; done
     AGYX_CONFIG_DIR: join(root, "config"),
     AGYX_REAL_AGY: fakeAgy,
     AGYX_TEST_LAUNCHES: launches,
+    AGYX_SKIP_UNMANAGED_AGY_STOP: "1",
   };
   const supervisor = spawn(
     process.execPath,
@@ -146,6 +148,7 @@ while :; do sleep 1; done
     AGYX_CONFIG_DIR: join(root, "config"),
     AGYX_REAL_AGY: fakeAgy,
     AGYX_TEST_LAUNCHES: launches,
+    AGYX_SKIP_UNMANAGED_AGY_STOP: "1",
   };
   const supervisor = spawn(
     process.execPath,
@@ -182,6 +185,63 @@ while :; do sleep 1; done
         supervisor.once("exit", () => resolvePromise())
       );
     }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("auto switch does not pause sessions before quota policy allows switching", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agyx-integration-"));
+  const config = join(root, "config");
+  const runtime = join(config, "run");
+  const now = "2026-07-05T00:00:00.000Z";
+  await mkdir(runtime, { recursive: true });
+  await writeFile(join(config, "state.json"), `${JSON.stringify({
+    version: 1,
+    activeProfile: "a",
+    settings: { autoSwitchMode: "all-providers" },
+    profiles: [
+      {
+        name: "a",
+        email: "a@example.com",
+        createdAt: now,
+        updatedAt: now,
+        quotaScopes: {
+          claude: {
+            status: "exhausted",
+            resetAt: "2026-07-06T00:00:00.000Z",
+            reason: "RESOURCE_EXHAUSTED",
+          },
+        },
+      },
+      {
+        name: "b",
+        email: "b@example.com",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+  }, null, 2)}\n`);
+  await writeFile(join(runtime, "dummy.json"), `${JSON.stringify({
+    id: "dummy",
+    pid: process.pid,
+    cwd: root,
+    args: [],
+    socketPath: join(runtime, "missing.sock"),
+    logPath: join(config, "logs", "dummy.log"),
+    paused: false,
+    restartable: true,
+    startedAt: now,
+  }, null, 2)}\n`);
+
+  try {
+    const result = await runCLI(["_auto-next", "claude"], {
+      ...process.env,
+      AGYX_CONFIG_DIR: config,
+      AGYX_SKIP_UNMANAGED_AGY_STOP: "1",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { kind: "none" });
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

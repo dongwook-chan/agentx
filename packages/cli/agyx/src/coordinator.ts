@@ -248,6 +248,7 @@ function sessionControlAdapter(options: { reason?: string } = {}): SessionContro
       return reply.record ?? { ...record, childPid: undefined, paused: true };
     },
     afterPause: async (paused) => {
+      if (process.env.AGYX_SKIP_UNMANAGED_AGY_STOP === "1") return;
       const managedPIDs = new Set(paused.map((record) => record.childPid).filter(Boolean));
       const unmanaged = (await runningAgy()).filter(({ pid }) => !managedPIDs.has(pid));
       if (unmanaged.length) await stopProcesses(unmanaged);
@@ -490,6 +491,14 @@ export async function autoSwitchAfterQuota(
   quotaScope: QuotaScope,
 ): Promise<ProfileSwitchResult | undefined> {
   return await withAutoSwitchLock(async () => {
+    const initialState = await loadState();
+    const mode = effectiveAutoSwitchMode(initialState);
+    if (mode === "off") return undefined;
+    const activeProfile = initialState.profiles.find((profile) =>
+      profile.name === initialState.activeProfile
+    );
+    if (!shouldAutoSwitchAfterQuota(activeProfile, mode, quotaScope)) return undefined;
+
     return await withPausedAuthSwitch(async () => {
       const initialState = await loadState();
       const mode = effectiveAutoSwitchMode(initialState);
