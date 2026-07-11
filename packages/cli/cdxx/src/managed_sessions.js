@@ -1,8 +1,9 @@
-import { pauseAllSessions, resumeAllSessions } from "@dong-/agentx-core";
+import { pauseAllSessions, resumeAllSessions, runAuthSwitchTransaction } from "@dong-/agentx-core";
 import { chmod, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { join } from "node:path";
 import { ensureConfig, runtimeDir } from "./config.js";
+import { withAuthSwitchLock } from "./lock.js";
 
 export function runtimeRecordPath(id) {
   return join(runtimeDir, `${id}.json`);
@@ -130,4 +131,15 @@ export async function pauseAll() {
 
 export async function resumeAll(records) {
   await resumeAllSessions(sessionControlAdapter(), records);
+}
+
+export async function withPausedAuthSwitch(operation, options = {}) {
+  return await runAuthSwitchTransaction(
+    {
+      sessionControl: sessionControlAdapter({ reason: "profile-switch" }),
+      withLock: withAuthSwitchLock,
+    },
+    operation,
+    options,
+  );
 }

@@ -54,8 +54,14 @@ test("session resumes even when resume command arrives before pause loop waits",
   const launches = join(root, "launches.txt");
   await writeFile(fakeCodex, `#!/bin/sh
 printf '%s\\n' "$*" >> "$CDXX_TEST_LAUNCHES"
-trap 'exit 0' INT TERM
-while :; do sleep 1; done
+parent_pid=$PPID
+sleep_pid=
+trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; exit 0' INT TERM
+while kill -0 "$parent_pid" 2>/dev/null; do
+  sleep 1 &
+  sleep_pid=$!
+  wait "$sleep_pid"
+done
 `);
   await chmod(fakeCodex, 0o755);
 
@@ -109,8 +115,14 @@ test("profile switch restart notice is printed in the supervised Codex terminal"
   const launches = join(root, "launches.txt");
   await writeFile(fakeCodex, `#!/bin/sh
 printf '%s\\n' "$*" >> "$CDXX_TEST_LAUNCHES"
-trap 'exit 0' INT TERM
-while :; do sleep 1; done
+parent_pid=$PPID
+sleep_pid=
+trap '[ -n "$sleep_pid" ] && kill "$sleep_pid" 2>/dev/null; exit 0' INT TERM
+while kill -0 "$parent_pid" 2>/dev/null; do
+  sleep 1 &
+  sleep_pid=$!
+  wait "$sleep_pid"
+done
 `);
   await chmod(fakeCodex, 0o755);
 

@@ -2,6 +2,7 @@ import { loadState } from "./config.js";
 import { recordQuotaForProfile } from "./quota.js";
 import { useProfile } from "./auth.js";
 import { pickNextProfile } from "./selection.js";
+import { withPausedAuthSwitch } from "./managed_sessions.js";
 
 export function quotaSummaryFromSupervisorPayload(payload) {
   const now = new Date().toISOString();
@@ -79,12 +80,12 @@ export async function decideCodexFailover(payload) {
     );
   }
 
-  await useProfile(next.name);
+  const switched = await withPausedAuthSwitch(async () => await useProfile(next.name));
   return {
     ok: true,
-    kind: "switch_and_resume",
-    profile: next.name,
+    kind: "sessions_restarted",
+    profile: switched.name ?? next.name,
     sessionId: payload.sessionId,
-    message: `[cdxx] Switching to '${next.name}' and resuming ${payload.sessionId}.`,
+    message: `[cdxx] Switched to '${switched.name ?? next.name}' after quota was reached; supervised Codex sessions are restarting with the active profile.`,
   };
 }

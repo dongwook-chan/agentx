@@ -4,6 +4,7 @@ import { configDir, ensureConfig } from "./config.js";
 import { wait } from "./quota_tail.js";
 
 const lockDir = join(configDir, "auth-switch.lock");
+let lockDepth = 0;
 
 async function lockOwnerIsDead() {
   const owner = await readFile(join(lockDir, "owner"), "utf8").catch(() => undefined);
@@ -18,8 +19,9 @@ async function lockOwnerIsDead() {
 }
 
 export async function withAuthSwitchLock(fn, options = {}) {
-  const timeoutMs = options.timeoutMs ?? 30000;
-  const staleMs = options.staleMs ?? 120000;
+  if (lockDepth > 0) return await fn();
+  const timeoutMs = options.timeoutMs ?? 10 * 60_000;
+  const staleMs = options.staleMs ?? 30 * 60_000;
   const deadline = Date.now() + timeoutMs;
   let acquired = false;
 
@@ -46,9 +48,13 @@ export async function withAuthSwitchLock(fn, options = {}) {
   }
 
   if (!acquired) throw new Error("Timed out waiting for cdxx auth switch lock.");
+  lockDepth += 1;
   try {
     return await fn();
   } finally {
-    await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+    lockDepth -= 1;
+    if (lockDepth === 0) {
+      await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }

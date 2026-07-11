@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { runAuthSwitchTransaction } from "@dong-/agentx-core";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +8,7 @@ import { clearExpiredQuota, effectiveYoloMode, loadState, saveState } from "./co
 import { decideCodexFailover } from "./failover_policy.js";
 import { installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
-import { pauseAll, resumeAll, sessionControlAdapter, sessionRecords } from "./managed_sessions.js";
+import { pauseAll, resumeAll, sessionRecords, withPausedAuthSwitch } from "./managed_sessions.js";
 import { findRealCodex } from "./processes.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
 import { recordQuotaForActiveProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
@@ -141,10 +140,7 @@ async function loginProfile(name, loginArgs = []) {
 }
 
 async function withPausedSessions(operation) {
-  return await runAuthSwitchTransaction(
-    { sessionControl: sessionControlAdapter({ reason: "profile-switch" }) },
-    operation,
-  );
+  return await withPausedAuthSwitch(operation);
 }
 
 async function chooseProfileForUse() {
