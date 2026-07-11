@@ -261,7 +261,11 @@ async function recordUsageAggregates(
   const exhaustedScopes: QuotaScope[] = [];
   for (const aggregate of aggregates) {
     if (aggregate.status === "available") {
-      await recordProfileQuotaAvailable(profileName, aggregate.scope);
+      await recordProfileQuotaAvailable(profileName, aggregate.scope, {
+        resetAt: aggregate.resetAt,
+        modelLabel: aggregate.modelLabel,
+        remainingPercent: aggregate.remainingPercent,
+      });
       continue;
     }
     await recordProfileQuotaExhausted(profileName, {

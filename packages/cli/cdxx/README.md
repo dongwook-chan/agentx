@@ -136,17 +136,20 @@ Manual scan uses Codex's interactive `/status` view:
 ```bash
 codex x scan
 codex x scan --json
-codex x scan --record
+codex x scan --all
+codex x scan --no-record
 codex x scan --json --full
 ```
 
-By default, `scan` prints the current `/status` result without mutating profile
-state. Use `--record` to persist the active profile's 5-hour and weekly quota
-windows and reset times. `--jsonl` remains available as a diagnostic fallback
-for local transcript scanning. Codex `/status` can briefly lag right after a
-fresh TUI starts or a quota event, so live quota exhaustion is still triggered
-from appended JSONL events; `/status` is the preferred refresh source for
-current windows and `resetAt` when it is available.
+By default, `scan` records the active profile's 5-hour and weekly quota windows
+and reset times from the current `/status` result. Use `--no-record` only when
+you want a dry run. Use `--all` to run isolated `/status` probes for every saved
+profile and record their reset windows without replacing the active auth file.
+`--jsonl` remains available as a diagnostic fallback for local transcript
+scanning. Codex `/status` can briefly lag right after a fresh TUI starts or a
+quota event, so live quota exhaustion is still triggered from appended JSONL
+events; `/status` is the preferred refresh source for current windows and
+`resetAt` when it is available.
 
 `cdxx` defaults to yolo mode for supervised Codex sessions. It injects Codex's
 own dangerous flag, `--dangerously-bypass-approvals-and-sandbox`, unless you

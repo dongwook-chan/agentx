@@ -77,6 +77,7 @@ done
     CODEX_HOME: join(root, "codex-home"),
     CDXX_REAL_CODEX: fakeCodex,
     CDXX_TEST_LAUNCHES: launches,
+    CDXX_DISABLE_STARTUP_STATUS_PROBE: "1",
   };
   const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {
     cwd: root,
@@ -138,6 +139,7 @@ done
     CODEX_HOME: join(root, "codex-home"),
     CDXX_REAL_CODEX: fakeCodex,
     CDXX_TEST_LAUNCHES: launches,
+    CDXX_DISABLE_STARTUP_STATUS_PROBE: "1",
   };
   const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {
     cwd: root,

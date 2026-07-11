@@ -26,7 +26,7 @@ function profileStatus(profile) {
 
 function profileReset(profile) {
   const resets = Object.values(profile.quotaScopes ?? {})
-    .filter((quota) => quota?.status === "exhausted" && quota.resetAt)
+    .filter((quota) => quota?.resetAt)
     .map((quota) => quota.resetAt)
     .sort();
   return formatReset(resets[0] ?? profile.quotaResetAt);

@@ -471,6 +471,32 @@ test("builds one shared profile view for list and picker", () => {
   );
 });
 
+test("profile view shows reset time for available scoped usage windows", () => {
+  const now = new Date("2026-06-26T00:00:00.000Z");
+  const views = buildProfileViews({
+    activeProfile: "b",
+    profiles: [
+      {
+        name: "b",
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+        quotaStatus: "available",
+        quotaScopes: {
+          claude: {
+            status: "available",
+            resetAt: "2026-06-27T00:00:00.000Z",
+            remainingPercent: 42,
+          },
+        },
+      },
+    ],
+  }, now, { quotaScopes: ["claude"] });
+
+  assert.equal(views[0]!.status, "ready/claude");
+  assert.equal(views[0]!.quotaReset, "in 1d");
+  assert.equal(views[0]!.selectable, true);
+});
+
 test("parses quota reset hints from agy logs", () => {
   const event = parseQuotaEventLine(
     "RESOURCE_EXHAUSTED: Individual quota reached. Resets in 1h30m10s",
@@ -577,11 +603,41 @@ test("usage availability overrides stale unknown quota from logs", () => {
     ],
   };
 
-  markProfileQuotaAvailable(state, "a", "gemini", now);
+  markProfileQuotaAvailable(state, "a", "gemini", {}, now);
 
   assert.equal(state.profiles[0]!.quotaScopes, undefined);
   assert.equal(state.profiles[0]!.quotaStatus, "available");
   assert.equal(effectiveProfileStatus(state.profiles[0]!, now, { quotaScopes: ["gemini"] }), "ready");
+});
+
+test("usage availability records scoped reset windows", () => {
+  const now = new Date("2026-06-26T00:00:00.000Z");
+  const state: State = {
+    version: 1,
+    activeProfile: "a",
+    profiles: [
+      {
+        name: "a",
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      },
+    ],
+  };
+
+  markProfileQuotaAvailable(state, "a", "claude", {
+    resetAt: "2026-06-27T00:00:00.000Z",
+    remainingPercent: 58,
+    modelLabel: "Claude Sonnet 4.6",
+  }, now);
+
+  assert.deepEqual(state.profiles[0]!.quotaScopes?.claude, {
+    status: "available",
+    resetAt: "2026-06-27T00:00:00.000Z",
+    modelLabel: "Claude Sonnet 4.6",
+    remainingPercent: 58,
+    checkedAt: "2026-06-26T00:00:00.000Z",
+  });
+  assert.equal(effectiveProfileStatus(state.profiles[0]!, now, { quotaScopes: ["claude"] }), "ready");
 });
 
 test("tracks provider-scoped quota only from model log context", () => {

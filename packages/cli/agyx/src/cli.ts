@@ -79,7 +79,7 @@ Usage:
                                        Pause all sessions and add an account
   agyx use [name]                      Switch account and resume every session
   agyx next                            Rotate to the next selectable account
-  agyx scan [--json] [--record]        Check quota via /usage
+  agyx scan [--json] [--no-record]     Check quota via /usage
   agyx config [key] [value]            Configure wrapper settings
   agyx list [--verify]                 List profiles; optionally verify saved credentials
   agyx status                          Show wrapper status
@@ -498,8 +498,9 @@ async function handleUseCommand(args: string[]): Promise<number> {
 
 async function handleScanCommand(args: string[]): Promise<number> {
   const asJson = takeFlag(args, "--json");
-  const record = takeFlag(args, "--record");
-  if (args.length) throw new Error("Usage: agyx scan [--json] [--record]");
+  takeFlag(args, "--record");
+  const record = !takeFlag(args, "--no-record");
+  if (args.length) throw new Error("Usage: agyx scan [--json] [--no-record]");
   const result = await runUsageProbe({ record });
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else printUsageScanResult(result);

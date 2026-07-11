@@ -11,11 +11,13 @@ import {
 import { QuotaScope } from "./quota.js";
 
 export interface ScopedQuotaRecord {
-  status: "exhausted";
+  status: "available" | "exhausted";
   resetAt?: string;
   reason?: string;
   errorAt?: string;
   modelLabel?: string;
+  remainingPercent?: number;
+  checkedAt?: string;
 }
 
 export type AutoSwitchMode = "off" | "provider-first" | "all-providers";
@@ -232,6 +234,7 @@ export function markProfileQuotaAvailable(
   state: State,
   name: string,
   scope: QuotaScope,
+  event: { resetAt?: string; modelLabel?: string; remainingPercent?: number } = {},
   now = new Date(),
 ): void {
   const profile = state.profiles.find((entry) =>
@@ -244,7 +247,18 @@ export function markProfileQuotaAvailable(
     profile.lastQuotaReason = undefined;
     delete profile.quotaScopes?.unknown;
   } else {
-    delete profile.quotaScopes?.[scope];
+    if (event.resetAt || event.remainingPercent !== undefined || event.modelLabel) {
+      profile.quotaScopes = profile.quotaScopes ?? {};
+      profile.quotaScopes[scope] = {
+        status: "available",
+        resetAt: event.resetAt,
+        modelLabel: event.modelLabel,
+        remainingPercent: event.remainingPercent,
+        checkedAt: now.toISOString(),
+      };
+    } else {
+      delete profile.quotaScopes?.[scope];
+    }
     delete profile.quotaScopes?.unknown;
   }
   if (profile.quotaScopes && !Object.keys(profile.quotaScopes).length) {
@@ -267,6 +281,8 @@ export function clearExpiredScopedQuotas(
     [QuotaScope, ScopedQuotaRecord]
   >) {
     if (quota.resetAt && Date.parse(quota.resetAt) <= now.getTime()) {
+      delete profile.quotaScopes[scope];
+    } else if (quota.status === "available" && !quota.resetAt) {
       delete profile.quotaScopes[scope];
     } else if (!quota.resetAt) {
       const checkedAt = quota.errorAt ?? profile.lastQuotaErrorAt ?? profile.updatedAt;
@@ -361,9 +377,10 @@ export async function recordProfileQuotaExhausted(
 export async function recordProfileQuotaAvailable(
   name: string,
   scope: QuotaScope,
+  event: { resetAt?: string; modelLabel?: string; remainingPercent?: number } = {},
 ): Promise<void> {
   const state = await loadState();
-  markProfileQuotaAvailable(state, name, scope);
+  markProfileQuotaAvailable(state, name, scope, event);
   await saveState(state);
 }
 

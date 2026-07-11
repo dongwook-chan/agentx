@@ -54,7 +54,7 @@ export function isScopeQuotaExhausted(
   if (scope === "unknown") return hasProfileWideQuota(profile, now);
   if (hasProfileWideQuota(profile, now)) return true;
   const quota = profile.quotaScopes?.[scope];
-  return Boolean(quota && quotaActive(quota.resetAt, now));
+  return Boolean(quota?.status === "exhausted" && quotaActive(quota.resetAt, now));
 }
 
 function allowIneligibleActivation(options: EffectiveStatusOptions): boolean {

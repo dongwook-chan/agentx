@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
-import { clearExpiredQuota, effectiveYoloMode, loadState, saveState } from "./config.js";
+import { clearExpiredQuota, effectiveYoloMode, loadState, profilesDir, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
 import { installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
@@ -12,7 +12,7 @@ import { pauseAll, resumeAll, sessionRecords, withPausedAuthSwitch } from "./man
 import { findRealCodex } from "./processes.js";
 import { profileSelectableReason } from "./selection.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
-import { recordQuotaForActiveProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
+import { formatReset, recordQuotaForActiveProfile, recordQuotaForProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
 import { confirmProfileUse, pickConfigKey, pickConfigValue, pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
 
 const help = `cdxx - Codex CLI profile and quota helper
@@ -25,7 +25,7 @@ Preferred shell usage after 'cdxx install':
   codex x sessions               List supervised Codex sessions
   codex x pause | resume         Pause or resume supervised sessions
   codex x status                 Show wrapper status
-  codex x scan                   Check quota via /status
+  codex x scan [--all]           Check quota via /status
   codex x config                 Configure wrapper settings interactively
   codex x config <key> [value]   Configure autoswitch/yolo
   codex x remove <name>          Delete a saved profile
@@ -44,7 +44,7 @@ Usage:
   cdxx sessions                   List supervised Codex sessions
   cdxx pause | resume             Pause or resume supervised sessions
   cdxx list                       List profiles
-  cdxx scan [--json] [--record] [--full] [--jsonl]
+  cdxx scan [--json] [--no-record] [--full] [--jsonl] [--all]
                                   Check quota via /status
   cdxx config [key] [value]       Configure wrapper settings
   cdxx remove <name>              Delete a saved profile
@@ -58,7 +58,7 @@ const wrapperHelp = `cdxx wrapper commands:
   codex x sessions               List supervised Codex sessions
   codex x pause | resume         Pause or resume supervised sessions
   codex x status                 Show wrapper status
-  codex x scan                   Check quota via /status
+  codex x scan [--all]           Check quota via /status
   codex x config                 Configure wrapper settings interactively
   codex x config list            Print wrapper settings
   codex x config get <key>       Print one setting
@@ -334,12 +334,81 @@ async function printSessions() {
   }
 }
 
+const fastStatusOptions = {
+  commandDelayMs: 2000,
+  commandRepeatMs: 1500,
+  commandRepeats: 3,
+  stopDelayMs: 9000,
+  timeoutMs: 12000,
+};
+
+function profileMatchesStatusAccount(profile, account) {
+  if (!account || !profile.email) return true;
+  return String(account).toLowerCase() === String(profile.email).toLowerCase();
+}
+
+async function scanAllProfiles({ record }) {
+  const state = await loadState();
+  const results = [];
+  for (const profile of state.profiles) {
+    const name = profile.name;
+    try {
+      const summary = await scanCodexQuota({
+        reason: record ? "manual-record-all" : "explicit-scan-all",
+        allowLocalFallback: false,
+        statusOptions: {
+          ...fastStatusOptions,
+          codexHome: join(profilesDir, name),
+        },
+      });
+      if (!profileMatchesStatusAccount(profile, summary.account)) {
+        results.push({
+          name,
+          ok: false,
+          error: `status account '${summary.account}' does not match profile email '${profile.email}'`,
+          summary,
+        });
+        continue;
+      }
+      if (record) await recordQuotaForProfile(summary, name);
+      results.push({ name, ok: true, summary });
+    } catch (error) {
+      results.push({ name, ok: false, error: error?.message ?? String(error) });
+    }
+  }
+  return results;
+}
+
+function printScanAllResults(results) {
+  for (const result of results) {
+    if (!result.ok) {
+      console.log(`${result.name}: failed - ${result.error}`);
+      continue;
+    }
+    const summary = result.summary;
+    const windows = Object.entries(summary.statusResetAt ?? {})
+      .filter(([, resetAt]) => resetAt)
+      .map(([scope, resetAt]) => `${scope}=${formatReset(resetAt)}`);
+    const account = summary.account ? ` ${summary.account}` : "";
+    console.log(`${result.name}:${account} ${summary.exhausted ? "exhausted" : "available"}${windows.length ? ` (${windows.join(", ")})` : ""}`);
+  }
+}
+
 async function handleScanCommand(args) {
   const asJson = takeFlag(args, "--json");
   const full = takeFlag(args, "--full");
-  const record = takeFlag(args, "--record");
+  const all = takeFlag(args, "--all");
+  takeFlag(args, "--record");
+  const record = !takeFlag(args, "--no-record");
   const jsonl = takeFlag(args, "--jsonl");
-  if (args.length) throw new Error("Usage: cdxx scan [--json] [--record] [--full] [--jsonl]");
+  if (args.length) throw new Error("Usage: cdxx scan [--json] [--no-record] [--full] [--jsonl] [--all]");
+  if (all && jsonl) throw new Error("Usage: cdxx scan --all cannot be combined with --jsonl.");
+  if (all) {
+    const results = await scanAllProfiles({ record });
+    if (asJson) console.log(JSON.stringify(results, null, 2));
+    else printScanAllResults(results);
+    return results.every((result) => result.ok) ? 0 : 1;
+  }
   const summary = jsonl
     ? await scanCodexSessions()
     : await scanCodexQuota({ reason: record ? "manual-record" : "explicit-scan" });
@@ -359,6 +428,22 @@ async function handleScanCommand(args) {
 
 async function runNativeCodex(args) {
   return await spawnInherited(await findRealCodex(), args);
+}
+
+async function statusProbeRecord() {
+  const summary = await scanCodexQuota({
+    reason: "session-start",
+    allowLocalFallback: false,
+    statusOptions: {
+      commandDelayMs: 2000,
+      commandRepeatMs: 1500,
+      commandRepeats: 3,
+      stopDelayMs: 9000,
+      timeoutMs: 12000,
+    },
+  });
+  await recordQuotaForActiveProfile(summary);
+  return 0;
 }
 
 async function printCombinedHelp() {
@@ -552,6 +637,8 @@ async function main() {
       return await supervisorFailover(args.shift());
     case "_supervisor-launch-args":
       return await supervisorLaunchArgs(args.shift());
+    case "_status-probe-record":
+      return await statusProbeRecord();
     default:
       throw new Error(`Unknown command: ${command}\n\n${help}`);
   }
