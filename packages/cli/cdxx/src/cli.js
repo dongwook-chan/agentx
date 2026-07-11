@@ -10,16 +10,17 @@ import { installShellIntegration, shellInit, shellIntegrationPath } from "./inst
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
 import { pauseAll, resumeAll, sessionRecords, withPausedAuthSwitch } from "./managed_sessions.js";
 import { findRealCodex } from "./processes.js";
+import { profileSelectableReason } from "./selection.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
 import { recordQuotaForActiveProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
-import { pickConfigKey, pickConfigValue, pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
+import { confirmProfileUse, pickConfigKey, pickConfigValue, pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
 
 const help = `cdxx - Codex CLI profile and quota helper
 
 Preferred shell usage after 'cdxx install':
   codex login                    Protected Codex login; auto-save and activate profile
   codex x list                   List saved profiles
-  codex x use [name]             Activate a saved profile
+  codex x use [name] [--force]   Activate a saved profile
   codex x next                   Switch to next selectable profile
   codex x sessions               List supervised Codex sessions
   codex x pause | resume         Pause or resume supervised sessions
@@ -38,7 +39,7 @@ Usage:
   cdxx session -- [codex args]    Run Codex with live quota failover
   cdxx import-current [name]      Save current $CODEX_HOME/auth.json as a profile
   cdxx login [name]               Run 'codex login', then save as profile
-  cdxx use [name]                 Activate a saved profile
+  cdxx use [name] [--force]       Activate a saved profile
   cdxx next                       Switch to next selectable profile
   cdxx sessions                   List supervised Codex sessions
   cdxx pause | resume             Pause or resume supervised sessions
@@ -52,7 +53,7 @@ Usage:
 const wrapperHelp = `cdxx wrapper commands:
   codex login                    Protected login; auto-save and activate profile
   codex x list                   List saved profiles
-  codex x use [name]             Activate a saved profile
+  codex x use [name] [--force]   Activate a saved profile
   codex x next                   Switch to next selectable profile
   codex x sessions               List supervised Codex sessions
   codex x pause | resume         Pause or resume supervised sessions
@@ -158,6 +159,24 @@ async function switchNext() {
   if (!next) throw new Error("No selectable profile found.");
   const result = await withPausedSessions(async () => await useProfile(next.name));
   console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
+}
+
+async function useProfileCommand(name, { force = false } = {}) {
+  const state = await loadState();
+  const profile = state.profiles.find((entry) => entry.name === name);
+  const blocked = profile ? profileSelectableReason(profile) : undefined;
+  let allowBlockedQuota = force;
+  if (blocked && !force) {
+    if (!blocked.startsWith("quota exhausted")) {
+      throw new Error(`Profile '${name}' is not selectable: ${blocked}.`);
+    }
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error(`Profile '${name}' is marked ${blocked}. Re-run with --force to switch anyway.`);
+    }
+    allowBlockedQuota = await confirmProfileUse(profile ?? { name }, blocked);
+    if (!allowBlockedQuota) return undefined;
+  }
+  return await withPausedSessions(async () => await useProfile(name, { force: allowBlockedQuota }));
 }
 
 async function setAutoswitch(value) {
@@ -360,9 +379,11 @@ async function runWrapperCommand(command, args) {
       return 0;
     }
     case "use": {
+      const force = takeFlag(args, "--force") || takeFlag(args, "-f");
       const name = optionalName(args, "cdxx use [name]") ?? await chooseProfileForUse();
       if (!name) return 0;
-      const result = await withPausedSessions(async () => await useProfile(name));
+      const result = await useProfileCommand(name, { force });
+      if (!result) return 0;
       console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
       return 0;
     }
@@ -475,9 +496,11 @@ async function main() {
     case "login":
       return await loginProfile(optionalName(args, "cdxx login [name]"));
     case "use": {
+      const force = takeFlag(args, "--force") || takeFlag(args, "-f");
       const name = optionalName(args, "cdxx use [name]") ?? await chooseProfileForUse();
       if (!name) return 0;
-      const result = await withPausedSessions(async () => await useProfile(name));
+      const result = await useProfileCommand(name, { force });
+      if (!result) return 0;
       console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
       return 0;
     }

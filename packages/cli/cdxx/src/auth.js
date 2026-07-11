@@ -186,7 +186,7 @@ export async function refreshActiveProfileCredential() {
   });
 }
 
-export async function useProfile(inputName) {
+export async function useProfile(inputName, options = {}) {
   return await withAuthSwitchLock(async () => {
     const name = validateProfileName(inputName);
     const source = profileAuthPath(name);
@@ -196,7 +196,7 @@ export async function useProfile(inputName) {
     const state = await loadState();
     const profile = state.profiles.find((entry) => entry.name === name);
     const blocked = profile ? profileSelectableReason(profile) : undefined;
-    if (blocked) throw new Error(`Profile '${name}' is not selectable: ${blocked}.`);
+    if (blocked && !options.force) throw new Error(`Profile '${name}' is not selectable: ${blocked}.`);
     await ensureDir(codexHome);
     await copyFile(source, activeAuthPath);
     await chmod(activeAuthPath, 0o600).catch(() => undefined);

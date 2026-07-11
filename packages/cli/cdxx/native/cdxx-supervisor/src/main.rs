@@ -767,7 +767,11 @@ fn find_matching_session(
         if meta.cwd.as_deref() != Some(cwd) {
             continue;
         }
-        let event_ms = meta.timestamp_ms.unwrap_or(mtime_ms as i64);
+        let event_ms = if is_modified {
+            mtime_ms as i64
+        } else {
+            meta.timestamp_ms.unwrap_or(mtime_ms as i64)
+        };
         if event_ms < start_ms - 5000 {
             continue;
         }

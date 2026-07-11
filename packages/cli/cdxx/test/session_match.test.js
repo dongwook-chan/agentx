@@ -77,7 +77,7 @@ test("findMatchingSession selects a new matching cwd session after snapshot", as
   }
 });
 
-test("findMatchingSession preserves previous size for modified existing session", async () => {
+test("findMatchingSession preserves previous size for modified existing session with old metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "cdxx-match-"));
   try {
     const file = await writeSession(root, "existing.jsonl", sessionMeta({
@@ -90,7 +90,7 @@ test("findMatchingSession preserves previous size for modified existing session"
     await new Promise((resolve) => setTimeout(resolve, 20));
     await writeFile(file, `${sessionMeta({
       id: "00000000-0000-0000-0000-000000000005",
-      timestamp: "2026-06-28T03:00:01.000Z",
+      timestamp: "2026-06-28T03:00:00.000Z",
       cwd: "/tmp/project",
     })}{"type":"event_msg","payload":{"type":"token_count","rate_limits":{}}}\n`);
 
@@ -98,7 +98,7 @@ test("findMatchingSession preserves previous size for modified existing session"
       sessionsDir: root,
       before,
       cwd: "/tmp/project",
-      startMs: Date.parse("2026-06-28T03:00:00.000Z"),
+      startMs: Date.now(),
     });
 
     assert.equal(match.sessionId, "00000000-0000-0000-0000-000000000005");

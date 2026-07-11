@@ -123,7 +123,7 @@ export async function findMatchingSession({
     if (!meta) continue;
     if (meta.cwd !== cwd) continue;
     if (meta.originator && meta.originator !== "codex-tui") continue;
-    const eventMs = meta.timestampMs ?? meta.recordTimestampMs ?? info.mtimeMs;
+    const eventMs = isModified ? info.mtimeMs : meta.timestampMs ?? meta.recordTimestampMs ?? info.mtimeMs;
     if (eventMs < startMs - toleranceBeforeMs) continue;
     candidates.push({
       ...meta,

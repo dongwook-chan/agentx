@@ -1,4 +1,4 @@
-import { select } from "@inquirer/prompts";
+import { confirm, select } from "@inquirer/prompts";
 import {
   agentProfileTableHeaders,
   decideUseProfile,
@@ -124,6 +124,13 @@ export async function pickProfileForUse(state) {
     choices,
     pageSize: 7,
     loop: true,
+  });
+}
+
+export async function confirmProfileUse(profile, reason) {
+  return await confirm({
+    message: `Profile '${profile.name}' is marked ${reason}. Switch anyway?`,
+    default: false,
   });
 }
 

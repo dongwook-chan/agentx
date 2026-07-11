@@ -197,3 +197,28 @@ test("useProfile refuses exhausted profiles before replacing active auth", async
   assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("old"));
   assert.equal((await config.loadState()).activeProfile, "old");
 });
+
+test("useProfile can force an exhausted profile after CLI confirmation", async () => {
+  await resetState("old");
+  await mkdir(join(process.env.CDXX_CONFIG_DIR, "profiles", "exhausted"), { recursive: true });
+  await writeFile(auth.profileAuthPath("exhausted"), codexAuth("exhausted"), { mode: 0o600 });
+  const state = await config.loadState();
+  state.profiles.push({
+    name: "exhausted",
+    accountId: "exhausted",
+    quotaStatus: "exhausted",
+    quotaScopes: {
+      unknown: {
+        status: "exhausted",
+        reason: "credits exhausted",
+      },
+    },
+  });
+  await config.saveState(state);
+
+  const result = await auth.useProfile("exhausted", { force: true });
+
+  assert.equal(result.name, "exhausted");
+  assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("exhausted"));
+  assert.equal((await config.loadState()).activeProfile, "exhausted");
+});
