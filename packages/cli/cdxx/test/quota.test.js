@@ -127,6 +127,7 @@ test("scanCodexSessions treats depleted premium credits as exhaustion", async ()
 test("parseCodexStatusOutput extracts account and remaining limits", () => {
   const status = parseCodexStatusOutput(`
 Account: user@example.com (Plus)
+Session: 019f50a5-cc11-78e3-8681-e8be2cadc5f5
 5h limit: [######--------------] 29% left (resets 15:29)
 Weekly limit: [############--------] 62% left
 (resets 09:13 on 7 Jul)
@@ -134,12 +135,30 @@ Weekly limit: [############--------] 62% left
 
   assert.equal(status.account, "user@example.com");
   assert.equal(status.planType, "plus");
+  assert.equal(status.sessionId, "019f50a5-cc11-78e3-8681-e8be2cadc5f5");
   assert.equal(status.limits.primary.remainingPercent, 29);
   assert.equal(status.limits.primary.usedPercent, 71);
   assert.equal(status.limits.secondary.remainingPercent, 62);
   assert.equal(status.limits.secondary.usedPercent, 38);
   assert.ok(status.limits.primary.resetAt);
   assert.ok(status.limits.secondary.resetAt);
+});
+
+test("parseCodexStatusOutput extracts free monthly limit", () => {
+  const status = parseCodexStatusOutput(`
+Account:              dongwook.chan@gmail.com (Free)
+Collaboration mode:   Default
+Session:              019f50a5-cc11-78e3-8681-e8be2cadc5f5
+
+Monthly limit:        [###-----------------] 15% left (resets 09:52 on 10 Aug)
+`, Date.parse("2026-07-11T09:52:00.000Z"));
+
+  assert.equal(status.account, "dongwook.chan@gmail.com");
+  assert.equal(status.planType, "free");
+  assert.equal(status.sessionId, "019f50a5-cc11-78e3-8681-e8be2cadc5f5");
+  assert.equal(status.limits.monthly.remainingPercent, 15);
+  assert.equal(status.limits.monthly.usedPercent, 85);
+  assert.ok(status.limits.monthly.resetAt);
 });
 
 test("scanCodexQuota prefers status probe over jsonl fallback", async () => {
@@ -220,6 +239,30 @@ test("quotaScopesFromSummary preserves both Codex status windows", () => {
   assert.equal(scopes.weekly.status, "available");
   assert.equal(scopes.weekly.remainingPercent, 62);
   assert.equal(scopes.weekly.resetAt, "2026-07-07T09:13:00.000Z");
+});
+
+test("quotaScopesFromSummary preserves free monthly status window", () => {
+  const summary = createQuotaSummaryFromStatus({
+    account: "user@example.com",
+    planType: "free",
+    limits: {
+      monthly: {
+        remainingPercent: 15,
+        usedPercent: 85,
+        resetAt: "2026-08-10T09:52:00.000Z",
+        resetText: "09:52 on 10 Aug",
+      },
+    },
+  }, Date.parse("2026-07-11T09:52:00.000Z"));
+
+  const scopes = quotaScopesFromSummary(summary);
+
+  assert.equal(scopes.monthly.status, "available");
+  assert.equal(scopes.monthly.remainingPercent, 15);
+  assert.equal(scopes.monthly.usedPercent, 85);
+  assert.equal(scopes.monthly.resetAt, "2026-08-10T09:52:00.000Z");
+  assert.equal(scopes["5h"], undefined);
+  assert.equal(scopes.weekly, undefined);
 });
 
 test("quotaScopesFromSummary records premium credit exhaustion as unknown quota", () => {

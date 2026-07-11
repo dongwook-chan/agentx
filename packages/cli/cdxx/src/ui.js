@@ -168,13 +168,21 @@ export function printScanSummary(summary) {
   console.log(`files: ${summary.scannedFiles}`);
   console.log(`token_count records: ${summary.tokenCountRecords}`);
   if (summary.current) {
-    const primaryLeft = summary.statusRemaining?.primary;
-    const secondaryLeft = summary.statusRemaining?.secondary;
-    console.log(`current 5h: ${summary.current.primary}%${primaryLeft === undefined ? "" : ` used (${primaryLeft}% left)`}`);
-    console.log(`current weekly: ${summary.current.secondary}%${secondaryLeft === undefined ? "" : ` used (${secondaryLeft}% left)`}`);
+    const scopes = [
+      ["5h", "primary"],
+      ["weekly", "secondary"],
+      ["monthly", "monthly"],
+    ];
+    for (const [label, key] of scopes) {
+      const used = summary.current[key];
+      const left = summary.statusRemaining?.[key];
+      if (used === undefined && left === undefined) continue;
+      console.log(`current ${label}: ${used ?? "-"}%${left === undefined ? "" : ` used (${left}% left)`}`);
+    }
   }
-  console.log(`historical max 5h: ${summary.maxPrimary}%`);
-  console.log(`historical max weekly: ${summary.maxSecondary}%`);
+  if (summary.maxPrimary !== undefined) console.log(`historical max 5h: ${summary.maxPrimary}%`);
+  if (summary.maxSecondary !== undefined) console.log(`historical max weekly: ${summary.maxSecondary}%`);
+  if (summary.maxMonthly !== undefined) console.log(`historical max monthly: ${summary.maxMonthly}%`);
   if (summary.planType) console.log(`plan: ${summary.planType}`);
   if (summary.lastCredits) {
     console.log(`credits: has=${summary.lastCredits.has_credits ?? ""} balance=${summary.lastCredits.balance ?? ""}`);
@@ -189,7 +197,11 @@ export function printScanSummary(summary) {
     console.log("recent high-water marks:");
     for (const event of recent) {
       const location = event.file ? `${event.file}:${event.line}` : (summary.source ?? "quota");
-      console.log(`${event.timestamp} 5h=${event.primary}% weekly=${event.secondary}% ${location}`);
+      const parts = [];
+      if (event.primary !== undefined) parts.push(`5h=${event.primary}%`);
+      if (event.secondary !== undefined) parts.push(`weekly=${event.secondary}%`);
+      if (event.monthly !== undefined) parts.push(`monthly=${event.monthly}%`);
+      console.log(`${event.timestamp} ${parts.join(" ")} ${location}`);
     }
   }
 }

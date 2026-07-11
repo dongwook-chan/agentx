@@ -1,9 +1,15 @@
-import { readdir, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { readFirstLineBounded } from "@dong-/agentx-core";
 import { codexHome } from "./config.js";
 
 export const defaultSessionsDir = join(codexHome, "sessions");
+export const defaultSessionIndexPath = join(codexHome, "session_index.jsonl");
+export const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isCodexSessionId(value) {
+  return SESSION_ID_RE.test(String(value ?? ""));
+}
 
 async function walkJsonl(dir, out = []) {
   let entries = [];
@@ -165,6 +171,34 @@ export async function findSessionById(sessionId, {
     };
   }
   return undefined;
+}
+
+export async function findSessionIdByThreadName(threadName, {
+  indexPath = defaultSessionIndexPath,
+} = {}) {
+  const target = String(threadName ?? "").trim();
+  if (!target) return undefined;
+  if (isCodexSessionId(target)) return target;
+  const content = await readFile(indexPath, "utf8").catch(() => "");
+  let best;
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry?.thread_name !== target || !isCodexSessionId(entry?.id)) continue;
+    const updatedAt = Date.parse(entry.updated_at ?? "");
+    if (!best || (Number.isFinite(updatedAt) && updatedAt >= best.updatedAt)) {
+      best = {
+        id: entry.id,
+        updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
+      };
+    }
+  }
+  return best?.id;
 }
 
 export async function waitForSessionFileChange({

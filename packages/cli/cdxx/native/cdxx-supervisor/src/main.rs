@@ -59,6 +59,7 @@ struct Supervisor {
     before: HashMap<PathBuf, FileSnapshot>,
     start_ms: i64,
     matched_session: Option<MatchedSession>,
+    requested_session_id: Option<String>,
     tail: Option<QuotaTail>,
     failover_attempts: usize,
     current_args: Vec<String>,
@@ -73,7 +74,11 @@ impl Supervisor {
             "childPid": self.child.as_ref().map(|child| child.id()),
             "cwd": self.cwd,
             "args": self.current_args,
-            "codexSessionId": self.matched_session.as_ref().map(|session| session.session_id.clone()),
+            "codexSessionId": self
+                .matched_session
+                .as_ref()
+                .map(|session| session.session_id.clone())
+                .or(self.requested_session_id.clone()),
             "socketPath": self.socket_path.to_string_lossy(),
             "paused": self.paused,
             "restartable": true,
@@ -91,6 +96,7 @@ impl Supervisor {
         self.profile_at_start = active_profile()?;
         self.before = snapshot_session_files()?;
         self.start_ms = now_millis() as i64;
+        self.requested_session_id = resolve_requested_resume_session_id(&self.current_args)?;
         self.matched_session = None;
         self.tail = None;
         self.quota_handled = false;
@@ -127,6 +133,14 @@ impl Supervisor {
     }
 
     fn capture_matched_session(&mut self) -> Result<(), String> {
+        if let Some(session_id) = self.requested_session_id.clone() {
+            self.current_args = vec!["resume".to_string(), session_id.clone()];
+            if let Some(matched) = find_session_by_id(&session_id)? {
+                save_last_session(&matched)?;
+                self.matched_session = Some(matched);
+            }
+            return self.persist();
+        }
         if let Some(matched) = find_matching_session(&self.before, &self.cwd, self.start_ms)? {
             save_last_session(&matched)?;
             self.current_args = vec!["resume".to_string(), matched.session_id.clone()];
@@ -137,7 +151,12 @@ impl Supervisor {
 
     fn tick(&mut self) -> Result<(), String> {
         if self.matched_session.is_none() {
-            if let Some(matched) = find_matching_session(&self.before, &self.cwd, self.start_ms)? {
+            let matched = if let Some(session_id) = self.requested_session_id.clone() {
+                find_session_by_id(&session_id)?
+            } else {
+                find_matching_session(&self.before, &self.cwd, self.start_ms)?
+            };
+            if let Some(matched) = matched {
                 save_last_session(&matched)?;
                 self.tail = Some(QuotaTail {
                     file: matched.file.clone(),
@@ -281,6 +300,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         before: HashMap::new(),
         start_ms: now_millis() as i64,
         matched_session: None,
+        requested_session_id: None,
         tail: None,
         failover_attempts: 0,
         quota_handled: false,
@@ -307,14 +327,17 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             if guard.intentional_stop {
                 break code;
             }
-            let _ = find_matching_session(&guard.before, &guard.cwd, guard.start_ms).and_then(
-                |matched| {
-                    if let Some(session) = matched {
-                        save_last_session(&session)?;
-                    }
-                    Ok(())
-                },
-            );
+            let matched = if let Some(session_id) = guard.requested_session_id.clone() {
+                find_session_by_id(&session_id)
+            } else {
+                find_matching_session(&guard.before, &guard.cwd, guard.start_ms)
+            };
+            let _ = matched.and_then(|matched| {
+                if let Some(session) = matched {
+                    save_last_session(&session)?;
+                }
+                Ok(())
+            });
             break code;
         }
     };
@@ -471,6 +494,10 @@ fn sessions_dir() -> PathBuf {
     codex_home().join("sessions")
 }
 
+fn session_index_path() -> PathBuf {
+    codex_home().join("session_index.jsonl")
+}
+
 fn ensure_directories() -> Result<(), String> {
     for directory in [config_dir(), runtime_dir()] {
         fs::create_dir_all(&directory).map_err(to_string)?;
@@ -606,6 +633,69 @@ fn is_interactive_codex(args: &[String]) -> bool {
     )
 }
 
+fn is_codex_session_id(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    let lengths = [8, 4, 4, 4, 12];
+    parts.len() == lengths.len()
+        && parts
+            .iter()
+            .zip(lengths)
+            .all(|(part, length)| {
+                part.len() == length && part.chars().all(|ch| ch.is_ascii_hexdigit())
+            })
+}
+
+fn requested_resume_target(args: &[String]) -> Option<String> {
+    let resume_index = args.iter().position(|arg| arg == "resume")?;
+    for arg in args.iter().skip(resume_index + 1) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+fn resolve_requested_resume_session_id(args: &[String]) -> Result<Option<String>, String> {
+    let Some(target) = requested_resume_target(args) else {
+        return Ok(None);
+    };
+    if is_codex_session_id(&target) {
+        return Ok(Some(target));
+    }
+    let Ok(content) = fs::read_to_string(session_index_path()) else {
+        return Ok(None);
+    };
+    let mut best: Option<(String, i64)> = None;
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry.get("thread_name").and_then(Value::as_str) != Some(target.as_str()) {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !is_codex_session_id(id) {
+            continue;
+        }
+        let updated_at = entry
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .and_then(parse_iso_ms)
+            .unwrap_or(0);
+        if best
+            .as_ref()
+            .map(|(_, best_time)| updated_at >= *best_time)
+            .unwrap_or(true)
+        {
+            best = Some((id.to_string(), updated_at));
+        }
+    }
+    Ok(best.map(|(id, _)| id))
+}
+
 fn snapshot_session_files() -> Result<HashMap<PathBuf, FileSnapshot>, String> {
     let mut snapshot = HashMap::new();
     for file in walk_jsonl(&sessions_dir())? {
@@ -684,6 +774,37 @@ fn find_matching_session(
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(candidates.into_iter().map(|(_, meta)| meta).next())
+}
+
+fn find_session_by_id(session_id: &str) -> Result<Option<MatchedSession>, String> {
+    if !is_codex_session_id(session_id) {
+        return Ok(None);
+    }
+    let files = walk_jsonl(&sessions_dir())?;
+    for file in files.iter().filter(|file| file.to_string_lossy().contains(session_id)) {
+        let Some(mut meta) = read_session_meta(file)? else {
+            continue;
+        };
+        if meta.session_id != session_id {
+            continue;
+        }
+        meta.previous_size = fs::metadata(file).map(|metadata| metadata.len()).unwrap_or(0);
+        return Ok(Some(meta));
+    }
+    for file in files {
+        if file.to_string_lossy().contains(session_id) {
+            continue;
+        }
+        let Some(mut meta) = read_session_meta(&file)? else {
+            continue;
+        };
+        if meta.session_id != session_id {
+            continue;
+        }
+        meta.previous_size = fs::metadata(&file).map(|metadata| metadata.len()).unwrap_or(0);
+        return Ok(Some(meta));
+    }
+    Ok(None)
 }
 
 fn read_session_meta(file: &Path) -> Result<Option<MatchedSession>, String> {

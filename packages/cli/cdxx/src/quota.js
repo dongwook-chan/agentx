@@ -8,8 +8,15 @@ export const sessionsDir = join(codexHome, "sessions");
 export const codexQuotaScopes = {
   primary: "5h",
   secondary: "weekly",
+  monthly: "monthly",
   unknown: "unknown",
 };
+
+const statusLimitScopes = [
+  { key: "primary", scope: codexQuotaScopes.primary, label: "5h", reasonLabel: "primary" },
+  { key: "secondary", scope: codexQuotaScopes.secondary, label: "weekly", reasonLabel: "secondary" },
+  { key: "monthly", scope: codexQuotaScopes.monthly, label: "monthly", reasonLabel: "monthly" },
+];
 
 async function walkJsonl(dir, out = []) {
   let entries = [];
@@ -63,6 +70,7 @@ export function createQuotaSummary() {
     tokenCountRecords: 0,
     maxPrimary: 0,
     maxSecondary: 0,
+    maxMonthly: 0,
     firstAt: undefined,
     lastAt: undefined,
     planType: undefined,
@@ -84,20 +92,24 @@ function limitValue(status, name, key) {
 }
 
 function statusReason(status) {
-  const primaryRemaining = limitValue(status, "primary", "remainingPercent");
-  const secondaryRemaining = limitValue(status, "secondary", "remainingPercent");
-  if (primaryRemaining !== undefined && primaryRemaining <= 0) return "primary status limit reached";
-  if (secondaryRemaining !== undefined && secondaryRemaining <= 0) return "secondary status limit reached";
+  for (const { key, reasonLabel } of statusLimitScopes) {
+    const remaining = limitValue(status, key, "remainingPercent");
+    if (remaining !== undefined && remaining <= 0) return `${reasonLabel} status limit reached`;
+  }
   return undefined;
 }
 
 function statusResetAt(status, exhausted) {
   if (!exhausted) return undefined;
-  const primaryRemaining = limitValue(status, "primary", "remainingPercent");
-  const secondaryRemaining = limitValue(status, "secondary", "remainingPercent");
-  if (primaryRemaining !== undefined && primaryRemaining <= 0) return status.limits.primary?.resetAt;
-  if (secondaryRemaining !== undefined && secondaryRemaining <= 0) return status.limits.secondary?.resetAt;
-  return status.limits.primary?.resetAt ?? status.limits.secondary?.resetAt;
+  for (const { key } of statusLimitScopes) {
+    const remaining = limitValue(status, key, "remainingPercent");
+    if (remaining !== undefined && remaining <= 0) return status.limits?.[key]?.resetAt;
+  }
+  for (const { key } of statusLimitScopes) {
+    const resetAt = status.limits?.[key]?.resetAt;
+    if (resetAt) return resetAt;
+  }
+  return undefined;
 }
 
 function quotaScopeRecord({ status, usedPercent, remainingPercent, resetAt, resetText, reason, checkedAt }) {
@@ -114,23 +126,22 @@ function quotaScopeRecord({ status, usedPercent, remainingPercent, resetAt, rese
 
 export function createQuotaSummaryFromStatus(status, nowMs = Date.now()) {
   const now = new Date(nowMs).toISOString();
-  const primary = limitValue(status, "primary", "usedPercent") ?? 0;
-  const secondary = limitValue(status, "secondary", "usedPercent") ?? 0;
-  const primaryRemaining = limitValue(status, "primary", "remainingPercent");
-  const secondaryRemaining = limitValue(status, "secondary", "remainingPercent");
-  const exhausted = Boolean(
-    (primaryRemaining !== undefined && primaryRemaining <= 0)
-    || (secondaryRemaining !== undefined && secondaryRemaining <= 0),
-  );
+  const used = Object.fromEntries(statusLimitScopes.map(({ key }) => [key, limitValue(status, key, "usedPercent")]));
+  const remaining = Object.fromEntries(statusLimitScopes.map(({ key }) => [key, limitValue(status, key, "remainingPercent")]));
+  const resetText = Object.fromEntries(statusLimitScopes.map(({ key }) => [key, status.limits?.[key]?.resetText]));
+  const resetAtByScope = Object.fromEntries(statusLimitScopes.map(({ key }) => [key, status.limits?.[key]?.resetAt]));
+  const exhausted = statusLimitScopes.some(({ key }) => remaining[key] !== undefined && remaining[key] <= 0);
   const reason = statusReason(status);
   const resetAt = statusResetAt(status, exhausted);
-  const highWatermarks = primary >= 90 || secondary >= 90 || exhausted
+  const highWater = statusLimitScopes.some(({ key }) => used[key] >= 90);
+  const highWatermarks = highWater || exhausted
     ? [{
       file: undefined,
       line: undefined,
       timestamp: now,
-      primary,
-      secondary,
+      primary: used.primary,
+      secondary: used.secondary,
+      monthly: used.monthly,
       reachedType: undefined,
       resetAt,
       credits: undefined,
@@ -142,12 +153,14 @@ export function createQuotaSummaryFromStatus(status, nowMs = Date.now()) {
     scannedFiles: 0,
     tokenCountRecords: 0,
     statusRecords: 1,
-    maxPrimary: primary,
-    maxSecondary: secondary,
+    maxPrimary: used.primary ?? 0,
+    maxSecondary: used.secondary ?? 0,
+    maxMonthly: used.monthly ?? 0,
     firstAt: now,
     lastAt: now,
     planType: status.planType,
     account: status.account,
+    sessionId: status.sessionId,
     lastCredits: undefined,
     exhausted,
     historicalExhausted: exhausted,
@@ -155,26 +168,19 @@ export function createQuotaSummaryFromStatus(status, nowMs = Date.now()) {
     reason,
     resetAt,
     reachedTypes: [],
-    statusRemaining: {
-      primary: primaryRemaining,
-      secondary: secondaryRemaining,
-    },
-    statusResetText: {
-      primary: status.limits?.primary?.resetText,
-      secondary: status.limits?.secondary?.resetText,
-    },
-    statusResetAt: {
-      primary: status.limits?.primary?.resetAt,
-      secondary: status.limits?.secondary?.resetAt,
-    },
+    statusRemaining: remaining,
+    statusResetText: resetText,
+    statusResetAt: resetAtByScope,
     current: {
       file: undefined,
       line: undefined,
       timestamp: now,
-      primary,
-      secondary,
+      primary: used.primary,
+      secondary: used.secondary,
+      monthly: used.monthly,
       reachedType: undefined,
       resetAt,
+      resetAtByScope,
       credits: undefined,
       planType: status.planType,
     },
@@ -187,8 +193,7 @@ export function quotaScopesFromSummary(summary) {
   const checkedAt = summary.lastAt ?? summary.current.timestamp ?? new Date().toISOString();
   if (
     summary.exhausted
-    && summary.current.primary === undefined
-    && summary.current.secondary === undefined
+    && statusLimitScopes.every(({ key }) => summary.current[key] === undefined)
   ) {
     return {
       [codexQuotaScopes.unknown]: quotaScopeRecord({
@@ -202,42 +207,32 @@ export function quotaScopesFromSummary(summary) {
       }),
     };
   }
-  const primaryRemaining = summary.statusRemaining?.primary
-    ?? (typeof summary.current.primary === "number" ? Math.max(0, 100 - summary.current.primary) : undefined);
-  const secondaryRemaining = summary.statusRemaining?.secondary
-    ?? (typeof summary.current.secondary === "number" ? Math.max(0, 100 - summary.current.secondary) : undefined);
-  const primaryExhausted = primaryRemaining !== undefined
-    ? primaryRemaining <= 0
-    : summary.current.primary >= 100;
-  const secondaryExhausted = secondaryRemaining !== undefined
-    ? secondaryRemaining <= 0
-    : summary.current.secondary >= 100;
-  const primaryResetAt = summary.statusResetAt?.primary
-    ?? summary.current.resetAtByScope?.primary
-    ?? (primaryExhausted ? summary.current.resetAt : undefined);
-  const secondaryResetAt = summary.statusResetAt?.secondary
-    ?? summary.current.resetAtByScope?.secondary
-    ?? (secondaryExhausted ? summary.current.resetAt : undefined);
-  return {
-    [codexQuotaScopes.primary]: quotaScopeRecord({
-      status: primaryExhausted ? "exhausted" : "available",
-      usedPercent: summary.current.primary,
-      remainingPercent: primaryRemaining,
-      resetAt: primaryResetAt,
-      resetText: summary.statusResetText?.primary,
-      reason: primaryExhausted ? "5h quota exhausted" : undefined,
+  const scopes = {};
+  for (const { key, scope, label } of statusLimitScopes) {
+    const current = summary.current[key];
+    const remaining = summary.statusRemaining?.[key]
+      ?? (typeof current === "number" ? Math.max(0, 100 - current) : undefined);
+    const hasScope = current !== undefined
+      || remaining !== undefined
+      || summary.statusResetText?.[key] !== undefined
+      || summary.statusResetAt?.[key] !== undefined
+      || summary.current.resetAtByScope?.[key] !== undefined;
+    if (!hasScope) continue;
+    const exhausted = remaining !== undefined ? remaining <= 0 : current >= 100;
+    const resetAt = summary.statusResetAt?.[key]
+      ?? summary.current.resetAtByScope?.[key]
+      ?? (exhausted ? summary.current.resetAt : undefined);
+    scopes[scope] = quotaScopeRecord({
+      status: exhausted ? "exhausted" : "available",
+      usedPercent: current,
+      remainingPercent: remaining,
+      resetAt,
+      resetText: summary.statusResetText?.[key],
+      reason: exhausted ? `${label} quota exhausted` : undefined,
       checkedAt,
-    }),
-    [codexQuotaScopes.secondary]: quotaScopeRecord({
-      status: secondaryExhausted ? "exhausted" : "available",
-      usedPercent: summary.current.secondary,
-      remainingPercent: secondaryRemaining,
-      resetAt: secondaryResetAt,
-      resetText: summary.statusResetText?.secondary,
-      reason: secondaryExhausted ? "weekly quota exhausted" : undefined,
-      checkedAt,
-    }),
-  };
+    });
+  }
+  return Object.keys(scopes).length ? scopes : undefined;
 }
 
 function updateSummary(summary, file, lineNumber, event) {
@@ -261,12 +256,14 @@ function updateSummary(summary, file, lineNumber, event) {
       timestamp,
       primary,
       secondary,
+      monthly: undefined,
       reachedType,
       limitId: rateLimits.limit_id,
       resetAt: pickReset(rateLimits),
       resetAtByScope: {
         primary: epochSecondsToIso(rateLimits.primary?.resets_at),
         secondary: epochSecondsToIso(rateLimits.secondary?.resets_at),
+        monthly: undefined,
       },
       credits: rateLimits.credits,
       planType: rateLimits.plan_type,
@@ -284,6 +281,7 @@ function updateSummary(summary, file, lineNumber, event) {
       timestamp,
       primary,
       secondary,
+      monthly: undefined,
       reachedType,
       resetAt: pickReset(rateLimits),
       credits: rateLimits.credits,
@@ -429,6 +427,7 @@ export async function recordQuotaForProfile(summary, profileName) {
     source: summary.source,
     maxPrimary: summary.maxPrimary,
     maxSecondary: summary.maxSecondary,
+    maxMonthly: summary.maxMonthly,
     statusRemaining: summary.statusRemaining,
     statusResetAt: summary.statusResetAt,
     statusResetText: summary.statusResetText,

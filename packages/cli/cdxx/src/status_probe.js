@@ -122,17 +122,21 @@ export function parseCodexStatusOutput(output, nowMs = Date.now()) {
   const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
   const account = text.match(/Account:\s*([^\n(]+?)\s*\(([^)\n]+)\)/i)
     ?? text.match(/Account:\s*([^\n]+?)(?:\n|5h\s+limit|$)/i);
+  const session = text.match(/Session:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   const primary = parseLimit(lines, text, "5h", nowMs);
   const secondary = parseLimit(lines, text, "Weekly", nowMs);
+  const monthly = parseLimit(lines, text, "Monthly", nowMs);
 
-  if (!primary && !secondary) return undefined;
+  if (!primary && !secondary && !monthly && !session) return undefined;
   return {
     source: "status",
     account: account?.[1]?.trim(),
     planType: account?.[2]?.trim()?.toLowerCase(),
+    sessionId: session?.[1],
     limits: {
       primary,
       secondary,
+      monthly,
     },
     raw: text,
   };
@@ -187,7 +191,7 @@ function runScriptAttempt(args, env, options = {}) {
     const appendOutput = (chunk) => {
       output += chunk.toString("utf8");
       const clean = stripTerminalControl(output);
-      if (/5h\s+limit:/i.test(clean) && /weekly\s+limit:/i.test(clean)) {
+      if ((/5h\s+limit:/i.test(clean) && /weekly\s+limit:/i.test(clean)) || /monthly\s+limit:/i.test(clean)) {
         timers.push(setTimeout(() => {
           safeWrite("\x03", true);
         }, 500));

@@ -12,14 +12,14 @@ import { findRealCodex, isInteractiveCodex } from "./processes.js";
 import { QuotaTail, wait } from "./quota_tail.js";
 import { recordQuotaForProfile, scanCodexQuota } from "./quota.js";
 import {
+  findSessionIdByThreadName,
   findMatchingSession,
   findSessionById,
+  isCodexSessionId,
   snapshotSessionFiles,
   waitForSessionFileChange,
 } from "./session_match.js";
 export { pickNextProfile } from "./selection.js";
-
-const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function spawnCodex(command, args) {
   const child = spawn(command, args, { stdio: "inherit", cwd: process.cwd(), env: process.env });
@@ -104,15 +104,21 @@ function writeJSON(socket, value) {
   socket.end(`${JSON.stringify(value)}\n`);
 }
 
-function requestedResumeSessionId(args) {
+function requestedResumeTarget(args) {
   const resumeIndex = args.indexOf("resume");
   if (resumeIndex < 0) return undefined;
   for (const arg of args.slice(resumeIndex + 1)) {
     if (arg.startsWith("-")) continue;
-    if (SESSION_ID_RE.test(arg)) return arg;
-    return undefined;
+    return arg;
   }
   return undefined;
+}
+
+async function resolveRequestedResumeSessionId(args) {
+  const target = requestedResumeTarget(args);
+  if (!target) return undefined;
+  if (isCodexSessionId(target)) return target;
+  return await findSessionIdByThreadName(target);
 }
 
 async function monitorMatchedSession(matchedSession, child, profileName, signal) {
@@ -280,12 +286,14 @@ export async function runCodexSession(args) {
       const started = Date.now();
       const profileName = (await loadState()).activeProfile;
       const before = await snapshotSessionFiles();
+      const resumeSessionId = await resolveRequestedResumeSessionId(currentArgs);
       const launchArgs = await buildCodexLaunchArgsFromState(currentArgs);
       const spawned = spawnCodex(realCodex, launchArgs);
       child = spawned.child;
       pauseRequested = false;
       resumePending = false;
       activeMatchedSession = undefined;
+      if (resumeSessionId) lastSessionId = resumeSessionId;
       await persist();
 
       const matchAbort = new AbortController();
@@ -317,7 +325,6 @@ export async function runCodexSession(args) {
       };
 
       const matchPromise = (async () => {
-        const resumeSessionId = requestedResumeSessionId(currentArgs);
         let match = resumeSessionId
           ? await findSessionById(resumeSessionId, { before, onFormatError })
           : await findMatchingSession({
@@ -355,21 +362,29 @@ export async function runCodexSession(args) {
       await matchPromise.catch(() => undefined);
       if (monitorPromise) await monitorPromise.catch(() => undefined);
 
-      matchedSession = await findMatchingSession({
-        before,
-        cwd: process.cwd(),
-        startMs: started,
-      }).catch(() => matchedSession);
-      activeMatchedSession = matchedSession;
-      await saveMatchedSession(matchedSession);
-      if (matchedSession?.sessionId) lastSessionId = matchedSession.sessionId;
+      if (!matchedSession) {
+        matchedSession = resumeSessionId
+          ? await findSessionById(resumeSessionId, { before, onFormatError }).catch(() => undefined)
+          : await findMatchingSession({
+            before,
+            cwd: process.cwd(),
+            startMs: started,
+            onFormatError,
+          }).catch(() => undefined);
+      }
+      if (matchedSession) {
+        activeMatchedSession = matchedSession;
+        await saveMatchedSession(matchedSession);
+        if (matchedSession.sessionId) lastSessionId = matchedSession.sessionId;
+      }
 
       await refreshActiveProfileCredential();
 
       await persist();
 
       if (pauseRequested || paused) {
-        if (matchedSession?.sessionId) currentArgs = ["resume", matchedSession.sessionId];
+        const resumeId = matchedSession?.sessionId ?? resumeSessionId ?? lastSessionId;
+        if (resumeId) currentArgs = ["resume", resumeId];
         await persist();
         await waitForResume();
         pauseRequested = false;

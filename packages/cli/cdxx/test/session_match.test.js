@@ -7,8 +7,10 @@ import {
   pickNextProfile,
 } from "../src/session.js";
 import {
+  findSessionIdByThreadName,
   findSessionById,
   findMatchingSession,
+  isCodexSessionId,
   snapshotSessionFiles,
   waitForSessionFileChange,
   waitForMatchingSession,
@@ -151,6 +153,38 @@ test("findSessionById matches resumed sessions that existed before launch", asyn
     assert.equal(match.sessionId, id);
     assert.equal(match.file, file);
     assert.equal(match.previousSize, before.get(file).size);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("findSessionIdByThreadName resolves latest session index alias", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cdxx-session-index-"));
+  try {
+    const indexPath = join(root, "session_index.jsonl");
+    await writeFile(indexPath, [
+      JSON.stringify({
+        id: "00000000-0000-0000-0000-000000000008",
+        thread_name: "agentx",
+        updated_at: "2026-07-10T00:00:00.000Z",
+      }),
+      JSON.stringify({
+        id: "00000000-0000-0000-0000-000000000009",
+        thread_name: "agentx",
+        updated_at: "2026-07-11T00:00:00.000Z",
+      }),
+      JSON.stringify({
+        id: "00000000-0000-0000-0000-000000000010",
+        thread_name: "other",
+        updated_at: "2026-07-12T00:00:00.000Z",
+      }),
+      "",
+    ].join("\n"));
+
+    const id = await findSessionIdByThreadName("agentx", { indexPath });
+
+    assert.equal(id, "00000000-0000-0000-0000-000000000009");
+    assert.equal(isCodexSessionId(id), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
