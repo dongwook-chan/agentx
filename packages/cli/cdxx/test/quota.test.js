@@ -361,6 +361,29 @@ test("clearExpiredQuota recomputes aggregate status from active scoped quota", (
   assert.equal(profile.lastQuotaReason, "5h quota exhausted");
 });
 
+test("clearExpiredQuota releases stale resetless scoped quota", () => {
+  const profile = {
+    name: "user",
+    updatedAt: "2026-07-03T10:00:00.000Z",
+    quotaStatus: "exhausted",
+    lastQuotaReason: "credits exhausted",
+    quotaScopes: {
+      unknown: {
+        status: "exhausted",
+        reason: "credits exhausted",
+        checkedAt: "2026-07-03T10:00:00.000Z",
+      },
+    },
+  };
+
+  clearExpiredQuota(profile, new Date("2026-07-04T10:00:00.000Z"));
+
+  assert.equal(profile.quotaStatus, "available");
+  assert.equal(profile.quotaResetAt, undefined);
+  assert.equal(profile.lastQuotaReason, undefined);
+  assert.equal(profile.quotaScopes.unknown.status, "available");
+});
+
 test("parseQuotaTriggerLine treats usage-limit messages as status refresh triggers", () => {
   const line = JSON.stringify({
     timestamp: "2026-07-03T14:52:00.000Z",

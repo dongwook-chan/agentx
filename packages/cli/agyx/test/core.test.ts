@@ -4,6 +4,7 @@ import { detectEmail } from "../src/coordinator.js";
 import {
   effectiveAllowIneligibleActivation,
   effectiveAutoSwitchMode,
+  clearExpiredScopedQuotas,
   markProfileActivated,
   markProfileCredentialMismatch,
   markProfileIneligible,
@@ -14,7 +15,7 @@ import {
   uniqueProfileName,
   validateProfileName,
 } from "../src/config.js";
-import type { State } from "../src/config.js";
+import type { ProfileRecord, State } from "../src/config.js";
 import { parseEligibilityEventLine } from "../src/eligibility.js";
 import { shellInit } from "../src/install.js";
 import { buildAgyLaunchArgs } from "../src/launch_args.js";
@@ -629,6 +630,29 @@ test("tracks provider-scoped quota only from model log context", () => {
   );
   assert.equal(selectNextProfile(state, now, { quotaScopes: ["gemini"] }).name, "b");
   assert.equal(selectNextProfile(state, now, { quotaScopes: ["claude"] }).name, "a");
+});
+
+test("clears stale resetless scoped quota", () => {
+  const profile: ProfileRecord = {
+    name: "a",
+    createdAt: "2026-06-26T00:00:00.000Z",
+    updatedAt: "2026-06-26T00:00:00.000Z",
+    quotaStatus: "exhausted" as const,
+    lastQuotaReason: "RESOURCE_EXHAUSTED",
+    quotaScopes: {
+      unknown: {
+        status: "exhausted" as const,
+        reason: "RESOURCE_EXHAUSTED",
+        errorAt: "2026-06-26T00:00:00.000Z",
+      },
+    },
+  };
+
+  clearExpiredScopedQuotas(profile, new Date("2026-06-27T00:00:00.000Z"));
+
+  assert.equal(profile.quotaScopes, undefined);
+  assert.equal(profile.quotaStatus, "available");
+  assert.equal(profile.lastQuotaReason, undefined);
 });
 
 test("auto switch provider-first skips only current provider quota", () => {

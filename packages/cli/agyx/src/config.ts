@@ -33,6 +33,7 @@ export function effectiveYoloMode(state: Pick<State, "settings">): boolean {
 }
 
 export const defaultAllowIneligibleActivation = true;
+const resetlessQuotaTtlMs = 24 * 60 * 60 * 1000;
 
 export function effectiveAllowIneligibleActivation(state: Pick<State, "settings">): boolean {
   return state.settings?.allowIneligibleActivation ?? defaultAllowIneligibleActivation;
@@ -267,9 +268,23 @@ export function clearExpiredScopedQuotas(
   >) {
     if (quota.resetAt && Date.parse(quota.resetAt) <= now.getTime()) {
       delete profile.quotaScopes[scope];
+    } else if (!quota.resetAt) {
+      const checkedAt = quota.errorAt ?? profile.lastQuotaErrorAt ?? profile.updatedAt;
+      const checkedMs = checkedAt ? Date.parse(checkedAt) : undefined;
+      if (
+        typeof checkedMs === "number"
+        && Number.isFinite(checkedMs)
+        && now.getTime() - checkedMs >= resetlessQuotaTtlMs
+      ) {
+        delete profile.quotaScopes[scope];
+      }
     }
   }
   if (!Object.keys(profile.quotaScopes).length) delete profile.quotaScopes;
+  if (!profile.quotaScopes && profile.quotaStatus === "exhausted" && !profile.quotaResetAt) {
+    profile.quotaStatus = "available";
+    profile.lastQuotaReason = undefined;
+  }
 }
 
 export function markProfileCredentialVerified(

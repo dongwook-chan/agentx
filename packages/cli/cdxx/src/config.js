@@ -19,6 +19,7 @@ export const configDir = process.env.CDXX_CONFIG_DIR
 export const profilesDir = join(configDir, "profiles");
 export const runtimeDir = join(configDir, "run");
 export const statePath = join(configDir, "state.json");
+const resetlessQuotaTtlMs = 24 * 60 * 60 * 1000;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -141,6 +142,18 @@ export function clearExpiredQuota(profile, now = new Date()) {
       quota.usedPercent = undefined;
       quota.remainingPercent = undefined;
       quota.reason = undefined;
+    } else if (!quota.resetAt) {
+      const checkedAt = quota.checkedAt ?? quota.errorAt ?? profile.lastQuotaErrorAt ?? profile.updatedAt;
+      const checkedMs = checkedAt ? Date.parse(checkedAt) : undefined;
+      if (Number.isFinite(checkedMs) && now.getTime() - checkedMs >= resetlessQuotaTtlMs) {
+        quota.status = "available";
+        quota.reason = undefined;
+        quota.usedPercent = undefined;
+        quota.remainingPercent = undefined;
+        quota.resetText = undefined;
+      } else {
+        exhausted.push(quota);
+      }
     } else {
       exhausted.push(quota);
     }

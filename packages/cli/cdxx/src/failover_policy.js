@@ -1,5 +1,5 @@
 import { loadState } from "./config.js";
-import { recordQuotaForProfile } from "./quota.js";
+import { recordQuotaForProfile, scanCodexQuota } from "./quota.js";
 import { useProfile } from "./auth.js";
 import { pickNextProfile } from "./selection.js";
 import { withPausedAuthSwitch } from "./managed_sessions.js";
@@ -52,13 +52,37 @@ export function stopRetryingAction(reason, message, extra = {}) {
   };
 }
 
+async function quotaSummaryForFailover(payload) {
+  if (payload.summary) return payload.summary;
+  const fallback = quotaSummaryFromSupervisorPayload(payload);
+  if (fallback.resetAt) return fallback;
+  try {
+    const statusSummary = await scanCodexQuota({
+      reason: "live-quota-trigger",
+      allowLocalFallback: false,
+    });
+    if (statusSummary?.source === "status") return statusSummary;
+  } catch {
+    // The supervisor payload is still a reliable live trigger if /status probing fails.
+  }
+  return fallback;
+}
+
 export async function decideCodexFailover(payload) {
-  const summary = payload.summary ?? quotaSummaryFromSupervisorPayload(payload);
+  const summary = await quotaSummaryForFailover(payload);
   const profile = await recordQuotaForProfile(summary, payload.profileName);
   if (!profile) {
     return stopRetryingAction(
       "profile_not_found",
       `[cdxx] Active profile '${payload.profileName ?? "(none)"}' was not found; quota failover stopped.`,
+    );
+  }
+
+  if (!summary.exhausted) {
+    return stopRetryingAction(
+      "quota_available_by_status",
+      `[cdxx] /status no longer reports quota exhaustion for '${profile.name}'; failover stopped.`,
+      { profile: profile.name },
     );
   }
 
