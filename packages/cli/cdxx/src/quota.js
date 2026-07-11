@@ -402,6 +402,10 @@ export async function scanCodexSessions(options = {}) {
 
 export async function scanCodexQuota(options = {}) {
   if (options.preferStatus === false) return await scanCodexSessions(options);
+  // Codex /status can briefly lag just after a fresh TUI starts or after a
+  // quota event. Live exhaustion is still triggered from session logs; /status
+  // is the preferred refresh source for current windows and resetAt when it is
+  // available.
   const adapter = {
     refreshUsage: async () => {
       const status = options.status ?? await probeCodexStatusQuota(options.statusOptions ?? {});

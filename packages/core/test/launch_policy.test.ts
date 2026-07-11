@@ -67,35 +67,24 @@ test("applyLaunchPolicy honors yolo off and rejects foreign yolo flags", () => {
   );
 });
 
-test("decideUseProfile exits active-only profile sets without opening a picker", () => {
+test("decideUseProfile opens a picker for any saved profile set", () => {
   assert.deepEqual(decideUseProfile([]), {
     type: "empty",
     message: "No saved profiles.",
   });
 
-  assert.deepEqual(decideUseProfile([
+  assert.equal(decideUseProfile([
     { name: "dtjp_86", active: true, selectable: true },
-  ]), {
-    type: "none",
-    reason: "active_only",
-    message: "'dtjp_86' is already active.",
-  });
+  ]).type, "select");
 
   assert.equal(useProfileDisabledReason({
     name: "dtjp_86",
     active: true,
     selectable: true,
   }), "already active");
-});
-
-test("decideUseProfile selects only when a non-active selectable candidate exists", () => {
-  assert.deepEqual(decideUseProfile([
+  assert.equal(decideUseProfile([
     { name: "a", selectable: false, disabledReason: "quota exhausted" },
-  ]), {
-    type: "none",
-    reason: "no_selectable",
-    message: "No selectable profile found.",
-  });
+  ]).type, "select");
 
   assert.equal(decideUseProfile([
     { name: "active", active: true, selectable: true },

@@ -7,7 +7,7 @@
     "cdxx": "src/cli.js"
   },
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "npm run build:native && node --test test/*.test.js",
     "check": "node --check src/*.js",
     "build:native": "node scripts/build-native.cjs",
     "check:native-package": "node scripts/check-native-package.cjs",

@@ -109,18 +109,14 @@ export async function pickProfileForUse(state) {
   const candidates = useCandidates(state);
   const decision = decideUseProfile(candidates);
   if (decision.type === "empty") throw new Error(decision.message);
-  if (decision.type === "none") {
-    console.log(decision.message);
-    return undefined;
-  }
-  const candidatesByName = new Map(candidates.map((candidate) => [candidate.name, candidate]));
+  const candidatesByName = new Map(decision.candidates.map((candidate) => [candidate.name, candidate]));
   const choices = state.profiles.map((profile) => {
     const candidate = candidatesByName.get(profile.name);
     const reason = candidate ? useProfileDisabledReason(candidate) : "not selectable";
     return {
-      name: profileChoiceLabel(profile, state),
+      name: reason ? `${profileChoiceLabel(profile, state)}  (${reason})` : profileChoiceLabel(profile, state),
       value: profile.name,
-      disabled: reason,
+      description: reason,
     };
   });
   return await select({

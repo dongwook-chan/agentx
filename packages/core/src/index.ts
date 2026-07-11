@@ -151,26 +151,7 @@ export function decideUseProfile(
   candidates: readonly UseProfileCandidate[],
 ): UseProfileDecision {
   if (!candidates.length) return { type: "empty", message: "No saved profiles." };
-
-  const selectable = candidates.filter((candidate) => !useProfileDisabledReason(candidate));
-  if (selectable.length) {
-    return { type: "select", candidates: [...candidates] };
-  }
-
-  const active = candidates.find((candidate) => candidate.active);
-  if (active) {
-    return {
-      type: "none",
-      reason: "active_only",
-      message: `'${active.name}' is already active.`,
-    };
-  }
-
-  return {
-    type: "none",
-    reason: "no_selectable",
-    message: "No selectable profile found.",
-  };
+  return { type: "select", candidates: [...candidates] };
 }
 
 export interface LoginSemantics {

@@ -45,21 +45,21 @@ for (const product of products) {
   });
 }
 
-test("shared use contract exits instead of opening a picker when only active is present", () => {
-  assert.deepEqual(decideUseProfile([
+test("shared use contract opens picker when any saved profile is present", () => {
+  assert.equal(decideUseProfile([
     { name: "dtjp_86", active: true, selectable: true },
-  ]), {
-    type: "none",
-    reason: "active_only",
-    message: "'dtjp_86' is already active.",
-  });
+  ]).type, "select");
 });
 
-test("shared use contract opens selection only for non-active selectable candidates", () => {
+test("shared use contract reports empty only when no profiles are saved", () => {
   assert.deepEqual(decideUseProfile([]), {
     type: "empty",
     message: "No saved profiles.",
   });
+
+  assert.equal(decideUseProfile([
+    { name: "quota", selectable: false, disabledReason: "quota exhausted" },
+  ]).type, "select");
 
   assert.equal(decideUseProfile([
     { name: "active", active: true, selectable: true },

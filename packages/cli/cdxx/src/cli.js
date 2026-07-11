@@ -24,7 +24,7 @@ Preferred shell usage after 'cdxx install':
   codex x sessions               List supervised Codex sessions
   codex x pause | resume         Pause or resume supervised sessions
   codex x status                 Show wrapper status
-  codex x scan                   Check Codex quota (/status, jsonl fallback)
+  codex x scan                   Check quota via /status
   codex x config                 Configure wrapper settings interactively
   codex x config <key> [value]   Configure autoswitch/yolo
   codex x remove <name>          Delete a saved profile
@@ -43,8 +43,8 @@ Usage:
   cdxx sessions                   List supervised Codex sessions
   cdxx pause | resume             Pause or resume supervised sessions
   cdxx list                       List profiles
-  cdxx scan [--json] [--full] [--record] [--jsonl]
-                                  Check Codex quota (/status, jsonl fallback)
+  cdxx scan [--json] [--record] [--full] [--jsonl]
+                                  Check quota via /status
   cdxx config [key] [value]       Configure wrapper settings
   cdxx remove <name>              Delete a saved profile
   cdxx status                     Show wrapper status`;
@@ -57,7 +57,7 @@ const wrapperHelp = `cdxx wrapper commands:
   codex x sessions               List supervised Codex sessions
   codex x pause | resume         Pause or resume supervised sessions
   codex x status                 Show wrapper status
-  codex x scan                   Check Codex quota (/status, jsonl fallback)
+  codex x scan                   Check quota via /status
   codex x config                 Configure wrapper settings interactively
   codex x config list            Print wrapper settings
   codex x config get <key>       Print one setting
@@ -315,6 +315,29 @@ async function printSessions() {
   }
 }
 
+async function handleScanCommand(args) {
+  const asJson = takeFlag(args, "--json");
+  const full = takeFlag(args, "--full");
+  const record = takeFlag(args, "--record");
+  const jsonl = takeFlag(args, "--jsonl");
+  if (args.length) throw new Error("Usage: cdxx scan [--json] [--record] [--full] [--jsonl]");
+  const summary = jsonl
+    ? await scanCodexSessions()
+    : await scanCodexQuota({ reason: record ? "manual-record" : "explicit-scan" });
+  if (record) await recordQuotaForActiveProfile(summary);
+  if (asJson) {
+    const payload = full ? summary : {
+      ...summary,
+      highWatermarkCount: summary.highWatermarks.length,
+      highWatermarks: summary.highWatermarks.slice(-20),
+    };
+    console.log(JSON.stringify(payload, null, 2));
+  } else {
+    printScanSummary(summary);
+  }
+  return 0;
+}
+
 async function runNativeCodex(args) {
   return await spawnInherited(await findRealCodex(), args);
 }
@@ -369,23 +392,7 @@ async function runWrapperCommand(command, args) {
       return state.activeProfile ? 0 : 1;
     }
     case "scan": {
-      const asJson = takeFlag(args, "--json");
-      const full = takeFlag(args, "--full");
-      const record = takeFlag(args, "--record");
-      const jsonl = takeFlag(args, "--jsonl");
-      if (args.length) throw new Error("Usage: cdxx scan [--json] [--full] [--record] [--jsonl]");
-      const summary = jsonl ? await scanCodexSessions() : await scanCodexQuota({ reason: record ? "manual-record" : "explicit-scan" });
-      if (record) await recordQuotaForActiveProfile(summary);
-      if (asJson) {
-        const payload = full ? summary : {
-          ...summary,
-          highWatermarkCount: summary.highWatermarks.length,
-          highWatermarks: summary.highWatermarks.slice(-20),
-        };
-        console.log(JSON.stringify(payload, null, 2));
-      }
-      else printScanSummary(summary);
-      return 0;
+      return await handleScanCommand(args);
     }
     case "config":
       return await configure(args);
@@ -500,23 +507,7 @@ async function main() {
       return state.activeProfile ? 0 : 1;
     }
     case "scan": {
-      const asJson = takeFlag(args, "--json");
-      const full = takeFlag(args, "--full");
-      const record = takeFlag(args, "--record");
-      const jsonl = takeFlag(args, "--jsonl");
-      if (args.length) throw new Error("Usage: cdxx scan [--json] [--full] [--record] [--jsonl]");
-      const summary = jsonl ? await scanCodexSessions() : await scanCodexQuota({ reason: record ? "manual-record" : "explicit-scan" });
-      if (record) await recordQuotaForActiveProfile(summary);
-      if (asJson) {
-        const payload = full ? summary : {
-          ...summary,
-          highWatermarkCount: summary.highWatermarks.length,
-          highWatermarks: summary.highWatermarks.slice(-20),
-        };
-        console.log(JSON.stringify(payload, null, 2));
-      }
-      else printScanSummary(summary);
-      return 0;
+      return await handleScanCommand(args);
     }
     case "autoswitch":
       await setAutoswitch(args.shift());

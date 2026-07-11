@@ -11,9 +11,9 @@ logging in, or rebuilding prompt context by hand.
 It provides:
 
 - local Codex auth profile save/use/next
-- passive quota scanning from `$CODEX_HOME/sessions`
+- quota refresh from Codex `/status`, with JSONL quota events as the live trigger
 - shell integration so `codex` runs through the cdxx dispatcher
-- a Rust native supervisor for wrapped Codex TUI processes, with a Node supervisor fallback
+- a Rust native supervisor for wrapped Codex TUI processes
 - live autoswitch and `codex resume <session_id>` failover when a profile reaches quota
 
 ## Install locally
@@ -39,10 +39,9 @@ npm run build:native
 ## Native supervisor support
 
 `codex` first enters the cdxx dispatcher. Normal interactive Codex sessions then
-run through the Rust native supervisor for the current
-host. If the matching native binary is not present, it falls back to the Node
-supervisor with the same behavior. Set `CDXX_REQUIRE_NATIVE_SUPERVISOR=1` to
-fail instead of falling back.
+run through the Rust native supervisor for the current host. If the matching
+native binary is not present, `cdxx session` fails and reports the missing
+binary.
 
 Native supervisor target status:
 
@@ -52,12 +51,7 @@ Native supervisor target status:
 | `linux/arm64` | yes | yes |
 
 The package install policy is `darwin/arm64` and `linux/arm64`. Other hosts can
-run only from source with the Node supervisor fallback.
-
-Native and Node supervisors are expected to agree on observable behavior:
-non-interactive Codex commands are passed through directly, interactive TUI
-sessions are monitored for quota events, and autoswitch resumes the same Codex
-session with `codex resume <session_id>`.
+run only from source after adding a native supervisor target.
 
 The native supervisor intentionally does not decide account policy itself. When
 it sees a quota event, it calls the JS policy helper (`cdxx
@@ -65,7 +59,7 @@ _supervisor-failover`) and receives an action JSON payload such as
 `switch_and_resume` or `stop_retrying`. The helper owns profile selection,
 autoswitch-off handling, no-selectable-profile handling, and user-facing
 messages; the supervisor only prints the helper message and performs the
-requested process action. This keeps native and Node supervisor behavior aligned.
+requested process action.
 
 ## Command model
 
@@ -137,13 +131,22 @@ Codex records two quota windows in session JSONL as `primary` and `secondary`.
 `cdxx` displays them as `5h` and `weekly`: `primary` is the 5-hour window
 (`300` minutes), and `secondary` is the weekly window (`10080` minutes).
 
-Scan local Codex session transcripts:
+Manual scan uses Codex's interactive `/status` view:
 
 ```bash
 codex x scan
 codex x scan --json
+codex x scan --record
 codex x scan --json --full
 ```
+
+By default, `scan` prints the current `/status` result without mutating profile
+state. Use `--record` to persist the active profile's 5-hour and weekly quota
+windows and reset times. `--jsonl` remains available as a diagnostic fallback
+for local transcript scanning. Codex `/status` can briefly lag right after a
+fresh TUI starts or a quota event, so live quota exhaustion is still triggered
+from appended JSONL events; `/status` is the preferred refresh source for
+current windows and `resetAt` when it is available.
 
 `cdxx` defaults to yolo mode for supervised Codex sessions. It injects Codex's
 own dangerous flag, `--dangerously-bypass-approvals-and-sandbox`, unless you
@@ -171,9 +174,8 @@ by byte offset. If Codex reports an exhausted rate limit, `cdxx` switches to the
 next available saved profile and the supervisor starts
 `codex resume <session_id>` from the same working directory.
 
-The Node fallback follows the same pass-through and failover rules as the native
-supervisor. Non-interactive commands such as `codex exec`, `codex review`,
-`codex login`, and `codex doctor` are not supervised.
+Non-interactive commands such as `codex exec`, `codex review`, `codex login`,
+and `codex doctor` are not supervised.
 
 If every saved profile is disabled, exhausted, or otherwise not selectable,
 `cdxx` prints a stop message and suppresses further failover attempts for that

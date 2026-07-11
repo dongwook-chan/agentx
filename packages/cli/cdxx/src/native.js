@@ -48,28 +48,14 @@ async function executable(path) {
 }
 
 export async function runNativeSupervisor(args, realCodex) {
-  if (
-    process.env.CDXX_ENABLE_NATIVE_SUPERVISOR !== "1"
-    && process.env.CDXX_REQUIRE_NATIVE_SUPERVISOR !== "1"
-  ) {
-    return undefined;
-  }
-
   const host = nativeSupervisorHostStatus();
   if (!host.supported) {
-    if (process.env.CDXX_REQUIRE_NATIVE_SUPERVISOR === "1") {
-      throw new Error(host.message);
-    }
-    return undefined;
+    throw new Error(host.message);
   }
 
   const binary = nativeSupervisorPath();
   if (!await executable(binary)) {
-    if (process.env.CDXX_REQUIRE_NATIVE_SUPERVISOR === "1") {
-      throw new Error(`Native supervisor binary not found: ${binary}. Run 'npm run build:native'.`);
-    }
-    console.error(`cdxx: native supervisor binary not found; using Node supervisor fallback. (${binary})`);
-    return undefined;
+    throw new Error(`Native supervisor binary not found: ${binary}. Run 'npm run build:native'.`);
   }
 
   return await new Promise((resolve, reject) => {
@@ -83,7 +69,29 @@ export async function runNativeSupervisor(args, realCodex) {
         CDXX_NODE_PATH: process.execPath,
       },
     });
+    const previousListeners = new Map();
+    let interruptedSignal;
+    const signalNumbers = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+    const cleanup = () => {
+      for (const [signal, listeners] of previousListeners) {
+        process.removeAllListeners(signal);
+        for (const listener of listeners) process.on(signal, listener);
+      }
+    };
+    const installSignalHandler = (signal) => {
+      previousListeners.set(signal, process.listeners(signal));
+      process.removeAllListeners(signal);
+      process.on(signal, () => {
+        interruptedSignal = signal;
+        if (child.exitCode === null && !child.killed) child.kill(signal);
+      });
+    };
+    for (const signal of Object.keys(signalNumbers)) installSignalHandler(signal);
     child.on("error", reject);
-    child.on("exit", (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+    child.on("exit", (code, signal) => {
+      cleanup();
+      const exitSignal = signal ?? interruptedSignal;
+      resolve(code ?? (exitSignal ? 128 + (signalNumbers[exitSignal] ?? 0) : 1));
+    });
   });
 }

@@ -31,6 +31,7 @@ export interface UsageProbeOptions {
   realAgy?: string;
   cwd?: string;
   timeoutMs?: number;
+  record?: boolean;
 }
 
 export interface UsageProbeResult {
@@ -40,6 +41,7 @@ export interface UsageProbeResult {
   profileName?: string;
   aggregates: UsageScopeAggregate[];
   exhaustedScopes: QuotaScope[];
+  recorded?: boolean;
   error?: string;
 }
 
@@ -246,6 +248,12 @@ async function captureUsageTranscript(options: {
   return await readTranscript(options.transcriptPath);
 }
 
+function exhaustedScopesFromAggregates(aggregates: UsageScopeAggregate[]): QuotaScope[] {
+  return aggregates
+    .filter((aggregate) => aggregate.status === "exhausted")
+    .map((aggregate) => aggregate.scope);
+}
+
 async function recordUsageAggregates(
   profileName: string,
   aggregates: UsageScopeAggregate[],
@@ -296,12 +304,19 @@ export async function runUsageProbe(options: UsageProbeOptions = {}): Promise<Us
         timeoutMs: options.timeoutMs ?? 15000,
       });
       const aggregates = parseUsageTranscriptAggregates(transcript);
-      const exhaustedScopes = await recordUsageAggregates(profileName, aggregates);
+      // Usage views can lag immediately after a fresh session starts. Logs remain
+      // the trigger for quota exhaustion; this probe mainly seeds current scopes
+      // and resetAt when the CLI reports them.
+      const shouldRecord = options.record ?? true;
+      const exhaustedScopes = shouldRecord
+        ? await recordUsageAggregates(profileName, aggregates)
+        : exhaustedScopesFromAggregates(aggregates);
       return {
         ok: true,
         profileName,
         aggregates,
         exhaustedScopes,
+        recorded: shouldRecord,
       };
     } finally {
       if (process.env.AGYX_KEEP_USAGE_PROBE_LOGS !== "1") {

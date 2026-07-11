@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -46,6 +46,12 @@ async function send(socketPath, payload) {
     socket.on("error", reject);
     socket.on("close", () => resolve(JSON.parse(input)));
   });
+}
+
+async function readSingleSessionRecord(runDir) {
+  const entries = (await readdir(runDir)).filter((entry) => entry.endsWith(".json"));
+  assert.equal(entries.length, 1);
+  return JSON.parse(await readFile(join(runDir, entries[0]), "utf8"));
 }
 
 test("session resumes even when resume command arrives before pause loop waits", async () => {
@@ -150,7 +156,8 @@ done
         return false;
       }
     });
-    const socketPath = join(root, "config", "run", `${supervisor.pid}.sock`);
+    const record = await readSingleSessionRecord(join(root, "config", "run"));
+    const socketPath = record.socketPath;
     const paused = await send(socketPath, { command: "pause", reason: "profile-switch" });
     assert.equal(paused.ok, true);
     const resumed = await send(socketPath, { command: "resume", reason: "profile-switch" });

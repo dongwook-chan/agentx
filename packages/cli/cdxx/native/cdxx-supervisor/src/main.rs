@@ -390,12 +390,20 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
     let mut guard = supervisor.lock().map_err(to_string)?;
     let reply = match command {
         "pause" => {
+            if request.get("reason").and_then(Value::as_str) == Some("profile-switch") {
+                eprintln!(
+                    "[cdxx] Profile switch requested; this Codex session will restart with the active profile."
+                );
+            }
             guard.paused = true;
             guard.stop_child()?;
             guard.capture_matched_session()?;
             json!({ "ok": true, "record": guard.record() })
         }
         "resume" => {
+            if request.get("reason").and_then(Value::as_str) == Some("profile-switch") {
+                eprintln!("[cdxx] Resuming Codex session after profile switch.");
+            }
             guard.paused = false;
             if guard.child.is_none() {
                 guard.start_child()?;

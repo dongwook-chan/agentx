@@ -8,6 +8,10 @@ quota exhaustion, and move the active prompt session to an eligible profile so
 development can continue without manually logging out, logging in, copying
 context, or restarting the conversation.
 
+This is specifically for people who operate multiple accounts per provider, or
+multiple providers side by side, and want account switching to be a runtime
+policy instead of a manual recovery step.
+
 Published CLI packages:
 
 - `agyx`
@@ -22,6 +26,14 @@ failed login attempts.
 `agentx`, the future umbrella router across multiple agent CLIs, is intentionally
 not implemented yet. This repository first centralizes shared policy and
 contract tests so existing CLIs cannot drift.
+
+## Milestone
+
+The long-term milestone is one integrated `agentx` control plane across
+providers. The final target is provider-spanning automatic failover: when one
+provider/account exhausts quota, agentx should choose the next profile according
+to user-configured priority, provider preference, eligibility, and reset times,
+then resume the active work with minimal terminal disruption.
 
 Product-specific README files live with each published package:
 

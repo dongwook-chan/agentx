@@ -1,0 +1,55 @@
+name: Native supervisors
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.package }} ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: agyx
+            platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            workspace: packages/cli/agyx
+            expected_arch: arm64
+          - package: cdxx
+            platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            workspace: packages/cli/cdxx
+            expected_arch: arm64
+          - package: agyx
+            platform: darwin-arm64
+            runner: macos-14
+            workspace: packages/cli/agyx
+            expected_arch: arm64
+          - package: cdxx
+            platform: darwin-arm64
+            runner: macos-14
+            workspace: packages/cli/cdxx
+            expected_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Verify runner architecture
+        run: |
+          node -e "if (process.arch !== '${{ matrix.expected_arch }}') { console.error(`${process.platform}/${process.arch}`); process.exit(1); }"
+
+      - run: npm ci
+
+      - run: npm run build:native
+        working-directory: ${{ matrix.workspace }}
+
+      - run: npm run check:native-package
+        working-directory: ${{ matrix.workspace }}

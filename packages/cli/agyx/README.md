@@ -89,6 +89,7 @@ agy x list
 agy x use
 agy x use personal
 agy x next
+agy x scan
 agy x status
 agy x config
 agy x config autoswitch all-providers
@@ -210,6 +211,21 @@ Conversation names are supported by `agy` through `/rename` and `/resume`, but
 signals such as `RESOURCE_EXHAUSTED`, HTTP `429`, and `Individual quota
 reached`. When a reset hint such as `Resets in 73h16m27s` is present, agyx stores
 the inferred reset time in profile metadata.
+
+Manual scan uses Antigravity's interactive `/usage` view:
+
+```bash
+agy x scan
+agy x scan --json
+agy x scan --record
+```
+
+By default, `scan` prints the current `/usage` result without mutating profile
+state. Use `--record` to persist the active profile's quota windows and reset
+times. Supervised sessions also run a startup `/usage` probe to seed this
+metadata when possible. The `/usage` view can briefly lag right after a fresh
+session starts, so live quota exhaustion is still triggered from session logs;
+the scan path is mainly for current window and `resetAt` refresh.
 
 When the active model can be inferred from the same session log, quota is stored
 per provider scope: `claude`, `gemini`, or `gpt-oss`. If no reliable model

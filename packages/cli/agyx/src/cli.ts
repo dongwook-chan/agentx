@@ -61,6 +61,7 @@ Preferred shell usage after 'agyx install':
   agy x list                           List saved profiles
   agy x use [name]                     Activate a saved profile
   agy x next                           Switch to next selectable profile
+  agy x scan                           Check quota via /usage
   agy x status                         Show wrapper status
   agy x config                         Configure wrapper settings interactively
   agy x config <key> [value]           Configure autoswitch/ineligible/yolo
@@ -78,6 +79,7 @@ Usage:
                                        Pause all sessions and add an account
   agyx use [name]                      Switch account and resume every session
   agyx next                            Rotate to the next selectable account
+  agyx scan [--json] [--record]        Check quota via /usage
   agyx config [key] [value]            Configure wrapper settings
   agyx list [--verify]                 List profiles; optionally verify saved credentials
   agyx status                          Show wrapper status
@@ -96,6 +98,7 @@ const wrapperHelp = `agyx wrapper commands:
   agy x list                           List saved profiles
   agy x use [name]                     Activate a saved profile
   agy x next                           Switch to next selectable profile
+  agy x scan                           Check quota via /usage
   agy x status                         Show wrapper status
   agy x config                         Configure wrapper settings interactively
   agy x config list                    Print wrapper settings
@@ -120,6 +123,33 @@ function printSwitchResult(result: { name: string; email?: string; alreadyActive
     + (result.email ? ` (${result.email})` : "")
     + " and resumed all sessions.",
   );
+}
+
+function printUsageScanResult(result: Awaited<ReturnType<typeof runUsageProbe>>): void {
+  console.log("source: usage");
+  if (result.profileName) console.log(`profile: ${result.profileName}`);
+  console.log(`recorded: ${result.recorded ? "yes" : "no"}`);
+  if (result.skipped) {
+    console.log(`skipped: ${result.reason ?? "yes"}`);
+    return;
+  }
+  if (!result.ok) {
+    console.log(`error: ${result.error ?? "unknown"}`);
+    return;
+  }
+  if (!result.aggregates.length) {
+    console.log("scopes: none");
+    return;
+  }
+  for (const aggregate of result.aggregates) {
+    const parts = [
+      `${aggregate.scope}: ${aggregate.status}`,
+      aggregate.remainingPercent === undefined ? undefined : `${aggregate.remainingPercent}% left`,
+      aggregate.resetAt ? `reset ${aggregate.resetAt}` : undefined,
+      aggregate.modelLabel,
+    ].filter(Boolean);
+    console.log(parts.join("  "));
+  }
 }
 
 function takeOption(args: string[], name: string): string | undefined {
@@ -394,10 +424,6 @@ async function browseProfiles(mode: "list" | "use"): Promise<string | undefined>
     if (mode === "use") {
       const decision = decideProfileUse(state, quotaScopes);
       if (decision.type === "empty") throw new Error(decision.message);
-      if (decision.type === "none") {
-        console.log(decision.message);
-        return undefined;
-      }
     }
     const action = await pickProfileAction(state, mode, notice, quotaScopes);
     notice = undefined;
@@ -470,6 +496,16 @@ async function handleUseCommand(args: string[]): Promise<number> {
   return 0;
 }
 
+async function handleScanCommand(args: string[]): Promise<number> {
+  const asJson = takeFlag(args, "--json");
+  const record = takeFlag(args, "--record");
+  if (args.length) throw new Error("Usage: agyx scan [--json] [--record]");
+  const result = await runUsageProbe({ record });
+  if (asJson) console.log(JSON.stringify(result, null, 2));
+  else printUsageScanResult(result);
+  return result.ok ? 0 : 1;
+}
+
 async function handleListCommand(args: string[]): Promise<number> {
   const verify = takeFlag(args, "--verify");
   if (args.length) throw new Error("Usage: agyx list [--verify]");
@@ -512,6 +548,8 @@ async function runWrapperCommand(command: string, args: string[]): Promise<numbe
       printSwitchResult(result);
       return 0;
     }
+    case "scan":
+      return await handleScanCommand(args);
     case "config":
       return await configure(args);
     case "autoswitch": {
@@ -681,6 +719,8 @@ async function main(): Promise<number> {
       printSwitchResult(result);
       return 0;
     }
+    case "scan":
+      return await handleScanCommand(args);
     case "autoswitch": {
       const mode = args.shift();
       if (args.length) throw new Error("Usage: agyx autoswitch [off|provider-first|all-providers]");
