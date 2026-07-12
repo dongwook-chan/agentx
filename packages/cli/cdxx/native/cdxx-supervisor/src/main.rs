@@ -98,6 +98,7 @@ impl Supervisor {
         self.before = snapshot_session_files()?;
         self.start_ms = now_millis() as i64;
         self.requested_session_id = resolve_requested_resume_session_id(&self.current_args)?;
+        let resume_target = requested_resume_target(&self.current_args);
         self.matched_session = None;
         self.tail = None;
         self.quota_handled = false;
@@ -111,7 +112,42 @@ impl Supervisor {
             .env("CDXX_MANAGED", "1")
             .spawn()
             .map_err(to_string)?;
+        let child_pid = child.id();
         self.child = Some(child);
+        log_event(json!({
+            "event": "session.child_started",
+            "supervisorId": self.id,
+            "supervisorPid": std::process::id(),
+            "childPid": child_pid,
+            "cwd": self.cwd,
+            "args": self.current_args,
+            "profile": self.profile_at_start,
+            "resumeTarget": resume_target,
+            "requestedSessionId": self.requested_session_id,
+        }));
+        if let Some(session_id) = self.requested_session_id.clone() {
+            log_event(json!({
+                "event": "session.identity.resolved",
+                "source": "requested-resume",
+                "supervisorId": self.id,
+                "supervisorPid": std::process::id(),
+                "childPid": child_pid,
+                "sessionId": session_id,
+                "cwd": self.cwd,
+                "args": self.current_args,
+            }));
+        } else {
+            log_event(json!({
+                "event": "session.identity.pending",
+                "source": "file-match",
+                "supervisorId": self.id,
+                "supervisorPid": std::process::id(),
+                "childPid": child_pid,
+                "cwd": self.cwd,
+                "args": self.current_args,
+                "resumeTarget": resume_target,
+            }));
+        }
         self.persist()?;
         Ok(())
     }
@@ -134,18 +170,76 @@ impl Supervisor {
     }
 
     fn capture_matched_session(&mut self) -> Result<(), String> {
+        if let Some(matched) = self.matched_session.clone() {
+            self.current_args = vec!["resume".to_string(), matched.session_id.clone()];
+            log_event(json!({
+                "event": "session.identity.resolved",
+                "source": "cached-match",
+                "supervisorId": self.id,
+                "supervisorPid": std::process::id(),
+                "childPid": self.child.as_ref().map(|child| child.id()),
+                "sessionId": matched.session_id,
+                "sessionFile": matched.file.to_string_lossy(),
+                "cwd": self.cwd,
+                "args": self.current_args,
+            }));
+            return self.persist();
+        }
         if let Some(session_id) = self.requested_session_id.clone() {
             self.current_args = vec!["resume".to_string(), session_id.clone()];
             if let Some(matched) = find_session_by_id(&session_id)? {
                 save_last_session(&matched)?;
                 self.matched_session = Some(matched);
+                log_event(json!({
+                    "event": "session.identity.resolved",
+                    "source": "requested-lookup",
+                    "supervisorId": self.id,
+                    "supervisorPid": std::process::id(),
+                    "childPid": self.child.as_ref().map(|child| child.id()),
+                    "sessionId": session_id,
+                    "sessionFile": self.matched_session.as_ref().map(|session| session.file.to_string_lossy().to_string()),
+                    "cwd": self.cwd,
+                    "args": self.current_args,
+                }));
+            } else {
+                log_event(json!({
+                    "event": "session.identity.unresolved",
+                    "source": "requested-lookup",
+                    "supervisorId": self.id,
+                    "supervisorPid": std::process::id(),
+                    "childPid": self.child.as_ref().map(|child| child.id()),
+                    "sessionId": session_id,
+                    "cwd": self.cwd,
+                    "args": self.current_args,
+                }));
             }
             return self.persist();
         }
         if let Some(matched) = find_matching_session(&self.before, &self.cwd, self.start_ms)? {
             save_last_session(&matched)?;
             self.current_args = vec!["resume".to_string(), matched.session_id.clone()];
+            log_event(json!({
+                "event": "session.identity.resolved",
+                "source": "capture-file-match",
+                "supervisorId": self.id,
+                "supervisorPid": std::process::id(),
+                "childPid": self.child.as_ref().map(|child| child.id()),
+                "sessionId": matched.session_id,
+                "sessionFile": matched.file.to_string_lossy(),
+                "cwd": self.cwd,
+                "args": self.current_args,
+            }));
             self.matched_session = Some(matched);
+        } else {
+            log_event(json!({
+                "event": "session.identity.unresolved",
+                "source": "capture-file-match",
+                "supervisorId": self.id,
+                "supervisorPid": std::process::id(),
+                "childPid": self.child.as_ref().map(|child| child.id()),
+                "cwd": self.cwd,
+                "args": self.current_args,
+            }));
         }
         self.persist()
     }
@@ -159,12 +253,25 @@ impl Supervisor {
             };
             if let Some(matched) = matched {
                 save_last_session(&matched)?;
+                log_event(json!({
+                    "event": "session.identity.resolved",
+                    "source": if self.requested_session_id.is_some() { "requested-lookup" } else { "file-match" },
+                    "supervisorId": self.id,
+                    "supervisorPid": std::process::id(),
+                    "childPid": self.child.as_ref().map(|child| child.id()),
+                    "sessionId": matched.session_id,
+                    "sessionFile": matched.file.to_string_lossy(),
+                    "cwd": self.cwd,
+                    "args": self.current_args,
+                    "previousSize": matched.previous_size,
+                }));
                 self.tail = Some(QuotaTail {
                     file: matched.file.clone(),
                     offset: matched.previous_size,
                     carry: String::new(),
                 });
                 self.matched_session = Some(matched);
+                self.persist()?;
             }
         }
 
@@ -243,7 +350,7 @@ fn main() {
     match run(args) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("cdxx-supervisor: {error}");
+            terminal_line(&format!("cdxx-supervisor: {error}"));
             std::process::exit(1);
         }
     }
@@ -305,10 +412,10 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         };
 
         if let Some((profile_name, session_id, event)) = failover_trigger {
-            eprintln!("[cdxx] Profile '{}' reached quota.", profile_name);
+            terminal_line(&format!("[cdxx] Profile '{}' reached quota.", profile_name));
             let action = supervisor_failover(&profile_name, &session_id, &event)?;
             if let Some(message) = action.get("message").and_then(Value::as_str) {
-                eprintln!("{message}");
+                terminal_line(message);
             }
             let mut guard = supervisor.lock().map_err(to_string)?;
             match action.get("kind").and_then(Value::as_str) {
@@ -318,7 +425,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                 Some("switch_and_resume") => {
                     guard.failover_attempts += 1;
                     if guard.failover_attempts > 10 {
-                        eprintln!("[cdxx] Stopping after 10 quota failover attempts.");
+                        terminal_line("[cdxx] Stopping after 10 quota failover attempts.");
                     } else {
                         let _ = guard.stop_child();
                         guard.current_args = vec!["resume".to_string(), session_id];
@@ -327,10 +434,10 @@ fn run(args: Vec<String>) -> Result<i32, String> {
                 }
                 Some("stop_retrying") | Some("none") => {}
                 Some(other) => {
-                    eprintln!("[cdxx] Unknown quota failover action kind: {other}");
+                    terminal_line(&format!("[cdxx] Unknown quota failover action kind: {other}"));
                 }
                 None => {
-                    eprintln!("[cdxx] Quota failover action did not include a kind.");
+                    terminal_line("[cdxx] Quota failover action did not include a kind.");
                 }
             }
         }
@@ -413,10 +520,20 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
     let reply = match command {
         "pause" => {
             if request.get("reason").and_then(Value::as_str) == Some("profile-switch") {
-                eprintln!(
+                terminal_line(
                     "[cdxx] Profile switch requested; this Codex session will restart with the active profile."
                 );
             }
+            log_event(json!({
+                "event": "session.pause.requested",
+                "reason": request.get("reason").and_then(Value::as_str),
+                "supervisorId": guard.id,
+                "supervisorPid": std::process::id(),
+                "childPid": guard.child.as_ref().map(|child| child.id()),
+                "sessionId": guard.matched_session.as_ref().map(|session| session.session_id.clone()).or(guard.requested_session_id.clone()),
+                "cwd": guard.cwd,
+                "args": guard.current_args,
+            }));
             guard.paused = true;
             guard.stop_child()?;
             guard.capture_matched_session()?;
@@ -424,8 +541,18 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
         }
         "resume" => {
             if request.get("reason").and_then(Value::as_str) == Some("profile-switch") {
-                eprintln!("[cdxx] Resuming Codex session after profile switch.");
+                terminal_line("[cdxx] Resuming Codex session after profile switch.");
             }
+            log_event(json!({
+                "event": "session.resume.requested",
+                "reason": request.get("reason").and_then(Value::as_str),
+                "supervisorId": guard.id,
+                "supervisorPid": std::process::id(),
+                "childPid": guard.child.as_ref().map(|child| child.id()),
+                "sessionId": guard.matched_session.as_ref().map(|session| session.session_id.clone()).or(guard.requested_session_id.clone()),
+                "cwd": guard.cwd,
+                "args": guard.current_args,
+            }));
             guard.paused = false;
             if guard.child.is_none() {
                 guard.start_child()?;
@@ -512,6 +639,10 @@ fn state_path() -> PathBuf {
     config_dir().join("state.json")
 }
 
+fn event_log_path() -> PathBuf {
+    config_dir().join("events.jsonl")
+}
+
 fn codex_home() -> PathBuf {
     env::var("CODEX_HOME")
         .map(PathBuf::from)
@@ -576,6 +707,45 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(to_string)?;
     fs::rename(&temporary, path).map_err(to_string)?;
     Ok(())
+}
+
+fn append_jsonl(path: &Path, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(to_string)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(to_string)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(to_string)?;
+    file.write_all(serde_json::to_string(value).map_err(to_string)?.as_bytes())
+        .map_err(to_string)?;
+    file.write_all(b"\n").map_err(to_string)?;
+    Ok(())
+}
+
+fn log_event(mut value: Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("timestamp".to_string(), Value::String(now_iso()));
+        object.insert("product".to_string(), Value::String("cdxx".to_string()));
+        object.insert("emitter".to_string(), Value::String("native-supervisor".to_string()));
+    }
+    let _ = append_jsonl(&event_log_path(), &value);
+}
+
+fn terminal_line(message: &str) {
+    let mut output = String::new();
+    for (index, line) in message.split('\n').enumerate() {
+        if index > 0 {
+            output.push_str("\r\n");
+        }
+        output.push_str(line.trim_end_matches('\r'));
+    }
+    output.push_str("\r\n");
+    let _ = std::io::stderr().write_all(output.as_bytes());
+    let _ = std::io::stderr().flush();
 }
 
 fn active_profile() -> Result<Option<String>, String> {
@@ -986,7 +1156,7 @@ fn supervisor_failover(
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("[cdxx] failover command failed: {}", stderr.trim());
+        terminal_line(&format!("[cdxx] failover command failed: {}", stderr.trim()));
         return Ok(json!({
             "kind": "stop_retrying",
             "reason": "policy_helper_failed",
