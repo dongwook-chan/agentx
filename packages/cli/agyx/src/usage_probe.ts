@@ -32,6 +32,8 @@ export interface UsageProbeOptions {
   cwd?: string;
   timeoutMs?: number;
   record?: boolean;
+  env?: NodeJS.ProcessEnv;
+  extraArgs?: string[];
 }
 
 export interface UsageProbeResult {
@@ -197,9 +199,14 @@ async function captureUsageTranscript(options: {
   transcriptPath: string;
   logPath: string;
   timeoutMs: number;
+  env?: NodeJS.ProcessEnv;
+  extraArgs?: string[];
 }): Promise<string> {
   const state = await loadState();
-  const launchArgs = buildAgyLaunchArgs([], { logPath: options.logPath, state });
+  const launchArgs = [
+    ...buildAgyLaunchArgs([], { logPath: options.logPath, state }),
+    ...(options.extraArgs ?? []),
+  ];
   const expect = await findExpectExecutable();
   const script = expect ? undefined : await findScriptExecutable();
   if (!expect && !script) return "";
@@ -214,10 +221,11 @@ async function captureUsageTranscript(options: {
       stdio: command.input ? ["pipe", "ignore", "ignore"] : "ignore",
       env: {
         ...process.env,
+        ...(options.env ?? {}),
         AGYX_USAGE_PROBE: "1",
-        TERM: process.env.TERM || "xterm-256color",
-        COLUMNS: process.env.COLUMNS || "120",
-        LINES: process.env.LINES || "40",
+        TERM: options.env?.TERM || process.env.TERM || "xterm-256color",
+        COLUMNS: options.env?.COLUMNS || process.env.COLUMNS || "120",
+        LINES: options.env?.LINES || process.env.LINES || "40",
       },
     });
     if (command.input && child.stdin) child.stdin.end(command.input);
@@ -306,6 +314,8 @@ export async function runUsageProbe(options: UsageProbeOptions = {}): Promise<Us
         transcriptPath,
         logPath,
         timeoutMs: options.timeoutMs ?? 15000,
+        env: options.env,
+        extraArgs: options.extraArgs,
       });
       const aggregates = parseUsageTranscriptAggregates(transcript);
       // Usage views can lag immediately after a fresh session starts. Logs remain

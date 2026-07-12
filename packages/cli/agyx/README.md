@@ -217,15 +217,18 @@ Manual scan uses Antigravity's interactive `/usage` view:
 ```bash
 agy x scan
 agy x scan --json
+agy x scan --all
 agy x scan --no-record
 ```
 
 By default, `scan` records the active profile's quota windows and reset times
 from the current `/usage` result. Use `--no-record` only when you want a dry
-run. Supervised sessions also run a startup `/usage` probe to seed this metadata
-when possible. The `/usage` view can briefly lag right after a fresh session
-starts, so live quota exhaustion is still triggered from session logs; the scan
-path is mainly for current window and `resetAt` refresh.
+run. Use `--all` to run isolated `/usage` probes for every saved profile by
+placing each saved credential in a temporary HOME, without replacing the active
+credential. Supervised sessions also run a startup `/usage` probe to seed this
+metadata when possible. The `/usage` view can briefly lag right after a fresh
+session starts, so live quota exhaustion is still triggered from session logs;
+the scan path is mainly for current window and `resetAt` refresh.
 
 When the active model can be inferred from the same session log, quota is stored
 per provider scope: `claude`, `gemini`, or `gpt-oss`. If no reliable model

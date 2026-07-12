@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { select } from "@inquirer/prompts";
 import {
   activateProfile,
@@ -61,7 +64,7 @@ Preferred shell usage after 'agyx install':
   agy x list                           List saved profiles
   agy x use [name]                     Activate a saved profile
   agy x next                           Switch to next selectable profile
-  agy x scan                           Check quota via /usage
+  agy x scan [--all]                   Check quota via /usage
   agy x status                         Show wrapper status
   agy x config                         Configure wrapper settings interactively
   agy x config <key> [value]           Configure autoswitch/ineligible/yolo
@@ -79,7 +82,8 @@ Usage:
                                        Pause all sessions and add an account
   agyx use [name]                      Switch account and resume every session
   agyx next                            Rotate to the next selectable account
-  agyx scan [--json] [--no-record]     Check quota via /usage
+  agyx scan [--json] [--no-record] [--all]
+                                       Check quota via /usage
   agyx config [key] [value]            Configure wrapper settings
   agyx list [--verify]                 List profiles; optionally verify saved credentials
   agyx status                          Show wrapper status
@@ -98,7 +102,7 @@ const wrapperHelp = `agyx wrapper commands:
   agy x list                           List saved profiles
   agy x use [name]                     Activate a saved profile
   agy x next                           Switch to next selectable profile
-  agy x scan                           Check quota via /usage
+  agy x scan [--all]                   Check quota via /usage
   agy x status                         Show wrapper status
   agy x config                         Configure wrapper settings interactively
   agy x config list                    Print wrapper settings
@@ -149,6 +153,87 @@ function printUsageScanResult(result: Awaited<ReturnType<typeof runUsageProbe>>)
       aggregate.modelLabel,
     ].filter(Boolean);
     console.log(parts.join("  "));
+  }
+}
+
+type UsageScanResult = Awaited<ReturnType<typeof runUsageProbe>>;
+
+interface UsageScanAllResult {
+  name: string;
+  ok: boolean;
+  result?: UsageScanResult;
+  error?: string;
+}
+
+function formatRelativeReset(iso?: string): string {
+  if (!iso) return "-";
+  const ms = Date.parse(iso) - Date.now();
+  if (!Number.isFinite(ms)) return iso;
+  if (ms <= 0) return "now";
+  const minutes = Math.ceil(ms / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.ceil(hours / 24)}d`;
+}
+
+async function runUsageProbeForProfile(
+  profileName: string,
+  record: boolean,
+): Promise<UsageScanAllResult> {
+  const probeHome = await mkdtemp(join(tmpdir(), "agyx-usage-profile-"));
+  try {
+    const credential = await keychain.readProfile(profileName);
+    const geminiDir = join(probeHome, ".gemini");
+    const credentialDir = join(geminiDir, "antigravity-cli");
+    await mkdir(credentialDir, { recursive: true, mode: 0o700 });
+    await writeFile(join(credentialDir, "antigravity-oauth-token"), credential, { mode: 0o600 });
+    await chmod(credentialDir, 0o700).catch(() => undefined);
+    const result = await runUsageProbe({
+      profileName,
+      record,
+      env: {
+        HOME: probeHome,
+        XDG_CONFIG_HOME: join(probeHome, ".config"),
+      },
+      extraArgs: [
+        `--gemini_dir=${geminiDir}`,
+        "--app_data_dir=antigravity-cli",
+      ],
+    });
+    return { name: profileName, ok: result.ok, result, error: result.error };
+  } catch (error) {
+    return { name: profileName, ok: false, error: (error as Error).message };
+  } finally {
+    await rm(probeHome, { recursive: true, force: true });
+  }
+}
+
+async function runUsageProbeForAllProfiles(record: boolean): Promise<UsageScanAllResult[]> {
+  const state = await loadState();
+  const results: UsageScanAllResult[] = [];
+  for (const profile of state.profiles) {
+    results.push(await runUsageProbeForProfile(profile.name, record));
+  }
+  return results;
+}
+
+function printUsageScanAllResults(results: UsageScanAllResult[]): void {
+  for (const entry of results) {
+    if (!entry.ok || !entry.result) {
+      console.log(`${entry.name}: failed - ${entry.error ?? "usage probe failed"}`);
+      continue;
+    }
+    if (entry.result.skipped) {
+      console.log(`${entry.name}: skipped - ${entry.result.reason ?? "no usage result"}`);
+      continue;
+    }
+    const scopes = entry.result.aggregates.map((aggregate) => {
+      const remaining = aggregate.remainingPercent === undefined ? "" : ` ${aggregate.remainingPercent}% left`;
+      const reset = aggregate.resetAt ? ` reset=${formatRelativeReset(aggregate.resetAt)}` : "";
+      return `${aggregate.scope}:${aggregate.status}${remaining}${reset}`;
+    });
+    console.log(`${entry.name}: ${scopes.length ? scopes.join(", ") : "no usage rows"}`);
   }
 }
 
@@ -498,9 +583,16 @@ async function handleUseCommand(args: string[]): Promise<number> {
 
 async function handleScanCommand(args: string[]): Promise<number> {
   const asJson = takeFlag(args, "--json");
+  const all = takeFlag(args, "--all");
   takeFlag(args, "--record");
   const record = !takeFlag(args, "--no-record");
-  if (args.length) throw new Error("Usage: agyx scan [--json] [--no-record]");
+  if (args.length) throw new Error("Usage: agyx scan [--json] [--no-record] [--all]");
+  if (all) {
+    const results = await runUsageProbeForAllProfiles(record);
+    if (asJson) console.log(JSON.stringify(results, null, 2));
+    else printUsageScanAllResults(results);
+    return results.every((result) => result.ok) ? 0 : 1;
+  }
   const result = await runUsageProbe({ record });
   if (asJson) console.log(JSON.stringify(result, null, 2));
   else printUsageScanResult(result);
@@ -855,6 +947,7 @@ async function main(): Promise<number> {
         profileName?: string;
         realAgy?: string;
         cwd?: string;
+        timeoutMs?: number;
       };
       console.log(JSON.stringify(await runUsageProbe(payload)));
       return 0;
