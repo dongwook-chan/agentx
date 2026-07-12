@@ -231,9 +231,10 @@ session starts, so live quota exhaustion is still triggered from session logs;
 the scan path is mainly for current window and `resetAt` refresh.
 
 When the active model can be inferred from the same session log, quota is stored
-per provider scope: `claude`, `gemini`, or `gpt-oss`. If no reliable model
-context exists, the quota event is stored as `unknown` and treated as
-profile-wide.
+per free-tier quota group: `gemini-flash`, `gemini-pro`, or `claude-gpt`.
+Legacy state keys `claude`, `gemini`, and `gpt-oss` are still read for backward
+compatibility. If no reliable model context exists, the quota event is stored as
+`unknown` and treated as profile-wide.
 
 Automatic quota failover is configured with:
 
@@ -244,8 +245,8 @@ agy x config autoswitch provider-first
 agy x config autoswitch off
 ```
 
-The default is `all-providers`: agyx waits until both Claude and Gemini quota are
-exhausted for the active profile before switching accounts. `provider-first`
+The default is `all-providers`: agyx waits until all known free-tier quota groups
+are exhausted for the active profile before switching accounts. `provider-first`
 switches as soon as the current provider scope is exhausted. Automatic switching
 uses the same global pause/switch/resume transaction as `agyx next`.
 

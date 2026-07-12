@@ -8,7 +8,7 @@ import {
   uniqueProfileName as coreUniqueProfileName,
   validateProfileName as coreValidateProfileName,
 } from "@dong-/agentx-core";
-import { QuotaScope } from "./quota.js";
+import { QuotaScope, quotaScopeAliases } from "./quota.js";
 
 export interface ScopedQuotaRecord {
   status: "available" | "exhausted";
@@ -216,6 +216,9 @@ export function markProfileQuotaExhausted(
   profile.lastQuotaReason = event.reason;
   const scope = event.scope ?? "unknown";
   profile.quotaScopes = profile.quotaScopes ?? {};
+  for (const alias of quotaScopeAliases(scope)) {
+    if (alias !== scope) delete profile.quotaScopes[alias];
+  }
   profile.quotaScopes[scope] = {
     status: "exhausted",
     resetAt: event.resetAt,
@@ -247,6 +250,9 @@ export function markProfileQuotaAvailable(
     profile.lastQuotaReason = undefined;
     delete profile.quotaScopes?.unknown;
   } else {
+    for (const alias of quotaScopeAliases(scope)) {
+      delete profile.quotaScopes?.[alias];
+    }
     if (event.resetAt || event.remainingPercent !== undefined || event.modelLabel) {
       profile.quotaScopes = profile.quotaScopes ?? {};
       profile.quotaScopes[scope] = {

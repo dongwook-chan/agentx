@@ -5,7 +5,31 @@ export interface QuotaEvent {
   modelLabel?: string;
 }
 
-export type QuotaScope = "claude" | "gemini" | "gpt-oss" | "unknown";
+export type QuotaScope =
+  | "gemini-flash"
+  | "gemini-pro"
+  | "claude-gpt"
+  | "claude"
+  | "gemini"
+  | "gpt-oss"
+  | "unknown";
+
+export function quotaScopeAliases(scope: QuotaScope): QuotaScope[] {
+  switch (scope) {
+    case "gemini-flash":
+    case "gemini-pro":
+      return [scope, "gemini"];
+    case "claude-gpt":
+      return [scope, "claude", "gpt-oss"];
+    case "claude":
+    case "gpt-oss":
+      return ["claude-gpt", scope];
+    case "gemini":
+      return ["gemini-flash", "gemini-pro", "gemini"];
+    default:
+      return [scope];
+  }
+}
 
 export interface ModelEvent {
   label: string;
@@ -48,9 +72,13 @@ export function isRequestEventLine(line: string): boolean {
 export function classifyModelScope(label: string | undefined): QuotaScope {
   if (!label) return "unknown";
   const lower = label.toLowerCase();
-  if (lower.includes("claude")) return "claude";
-  if (lower.includes("gemini")) return "gemini";
-  if (lower.includes("gpt-oss") || lower.includes("gpt oss")) return "gpt-oss";
+  if (lower.includes("claude")) return "claude-gpt";
+  if (lower.includes("gpt-oss") || lower.includes("gpt oss")) return "claude-gpt";
+  if (lower.includes("gemini")) {
+    if (lower.includes("flash")) return "gemini-flash";
+    if (lower.includes("pro")) return "gemini-pro";
+    return "gemini";
+  }
   return "unknown";
 }
 
@@ -190,7 +218,11 @@ export function parseUsageTranscriptLine(
   if (!state.scope) return undefined;
 
   const quotaEvent = parseQuotaEventLine(cleaned, now);
-  const status = quotaEvent ? "exhausted" : parseUsageStatus(cleaned);
+  const parsedResetAt = parseResetAt(cleaned, now);
+  let status = quotaEvent ? "exhausted" : parseUsageStatus(cleaned);
+  if (!status && parsedResetAt && state.remainingPercent !== undefined) {
+    status = state.remainingPercent <= 0.5 ? "exhausted" : "available";
+  }
   if (!status) return undefined;
   const lineRemainingPercent = parseRemainingPercent(cleaned);
   if (lineRemainingPercent !== undefined) state.remainingPercent = lineRemainingPercent;
@@ -201,7 +233,7 @@ export function parseUsageTranscriptLine(
     scope: state.scope,
     modelLabel: state.modelLabel,
     reason: quotaEvent?.reason ?? (status === "exhausted" ? "usage quota exhausted" : undefined),
-    resetAt: quotaEvent?.resetAt ?? parseResetAt(cleaned, now),
+    resetAt: quotaEvent?.resetAt ?? parsedResetAt,
     remainingPercent,
   };
 }
@@ -232,17 +264,27 @@ export function parseUsageTranscriptAggregates(
         !current
         || (
           current.status === "available"
-          && event.remainingPercent !== undefined
           && (
-            current.remainingPercent === undefined
-            || event.remainingPercent < current.remainingPercent
+            (
+              event.remainingPercent !== undefined
+              && (
+                current.remainingPercent === undefined
+                || event.remainingPercent < current.remainingPercent
+              )
+            )
+            || (
+              event.resetAt
+              && !current.resetAt
+            )
           )
         )
       ) {
+        const resetAt = event.resetAt ?? current?.resetAt;
         aggregates.set(event.scope, {
           status: "available",
           scope: event.scope,
           modelLabel: event.modelLabel,
+          ...(resetAt ? { resetAt } : {}),
           remainingPercent: event.remainingPercent,
         });
       }

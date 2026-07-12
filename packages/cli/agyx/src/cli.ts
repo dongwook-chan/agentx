@@ -282,7 +282,15 @@ function spawnInherited(command: string, args: string[]): Promise<number> {
 }
 
 function parseQuotaScope(value: string | undefined): QuotaScope {
-  if (value === "claude" || value === "gemini" || value === "gpt-oss" || value === "unknown") {
+  if (
+    value === "gemini-flash"
+    || value === "gemini-pro"
+    || value === "claude-gpt"
+    || value === "claude"
+    || value === "gemini"
+    || value === "gpt-oss"
+    || value === "unknown"
+  ) {
     return value;
   }
   return "unknown";

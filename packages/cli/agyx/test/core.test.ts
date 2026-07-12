@@ -482,7 +482,7 @@ test("profile view shows reset time for available scoped usage windows", () => {
         updatedAt: now.toISOString(),
         quotaStatus: "available",
         quotaScopes: {
-          claude: {
+          "claude-gpt": {
             status: "available",
             resetAt: "2026-06-27T00:00:00.000Z",
             remainingPercent: 42,
@@ -490,9 +490,9 @@ test("profile view shows reset time for available scoped usage windows", () => {
         },
       },
     ],
-  }, now, { quotaScopes: ["claude"] });
+  }, now, { quotaScopes: ["claude-gpt"] });
 
-  assert.equal(views[0]!.status, "ready/claude");
+  assert.equal(views[0]!.status, "ready/claude-gpt");
   assert.equal(views[0]!.quotaReset, "in 1d");
   assert.equal(views[0]!.selectable, true);
 });
@@ -515,7 +515,7 @@ test("parses interactive usage transcript quota rows", () => {
   assert.equal(parseUsageTranscriptLine("  Gemini 3.5 Flash (High)", state), undefined);
   assert.deepEqual(parseUsageTranscriptLine("[████] 100.00%", state), {
     status: "available",
-    scope: "gemini",
+    scope: "gemini-flash",
     modelLabel: "Gemini 3.5 Flash (High)",
     reason: undefined,
     resetAt: undefined,
@@ -523,7 +523,7 @@ test("parses interactive usage transcript quota rows", () => {
   });
   assert.deepEqual(parseUsageTranscriptLine("Quota available", state), {
     status: "available",
-    scope: "gemini",
+    scope: "gemini-flash",
     modelLabel: "Gemini 3.5 Flash (High)",
     reason: undefined,
     resetAt: undefined,
@@ -535,7 +535,7 @@ test("parses interactive usage transcript quota rows", () => {
     parseUsageTranscriptLine("Quota exhausted. Will reset after 49h37m0s.", state, new Date("2026-06-26T00:00:00.000Z")),
     {
       status: "exhausted",
-      scope: "claude",
+      scope: "claude-gpt",
       modelLabel: "Claude Sonnet 4.6 (Thinking)",
       reason: "quota exhausted",
       resetAt: "2026-06-28T01:37:00.000Z",
@@ -550,7 +550,7 @@ test("aggregates usage transcript quota rows by provider scope", () => {
   Gemini 3.5 Flash (Medium)
 [████] 42.00%
 Quota exhausted. Will reset after 5h0m0s.
-  Gemini 3.5 Pro (High)
+  Gemini 3.1 Pro (High)
 [████] 12.00%
 Quota exhausted. Will reset after 2h0m0s.
   Claude Sonnet 4.6 (Thinking)
@@ -564,19 +564,81 @@ Quota available
   assert.deepEqual(aggregates, [
     {
       status: "exhausted",
-      scope: "gemini",
+      scope: "gemini-flash",
+      resetAt: "2026-06-26T05:00:00.000Z",
+      reason: "quota exhausted",
+      modelLabel: "Gemini 3.5 Flash (Medium)",
+      remainingPercent: 42,
+    },
+    {
+      status: "exhausted",
+      scope: "gemini-pro",
       resetAt: "2026-06-26T02:00:00.000Z",
       reason: "quota exhausted",
-      modelLabel: "Gemini 3.5 Pro (High)",
+      modelLabel: "Gemini 3.1 Pro (High)",
       remainingPercent: 12,
     },
     {
       status: "exhausted",
-      scope: "claude",
+      scope: "claude-gpt",
       resetAt: "2026-06-26T03:00:00.000Z",
       reason: "quota exhausted",
       modelLabel: "Claude Sonnet 4.6 (Thinking)",
       remainingPercent: 8,
+    },
+  ]);
+});
+
+test("aggregates current free tier usage groups", () => {
+  const aggregates = parseUsageTranscriptAggregates(`
+└ Models & Quota
+  Gemini 3.5 Flash (Medium)
+    [░░░░] 0.00%
+    Refreshes in 79h 59m
+  Gemini 3.5 Flash (High)
+    [░░░░] 0.00%
+    Refreshes in 79h 59m
+  Gemini 3.5 Flash (Low)
+    [░░░░] 0.00%
+    Refreshes in 79h 59m
+  Gemini 3.1 Pro (Low)
+    [████] 100.00%
+    Quota available
+  Gemini 3.1 Pro (High)
+    [████] 100.00%
+    Quota available
+  Claude Sonnet 4.6 (Thinking)
+    [████░░] 48.00%
+    48% remaining · Refreshes in 80h 2m
+  Claude Opus 4.6 (Thinking)
+    [████░░] 48.00%
+    48% remaining · Refreshes in 80h 2m
+  GPT-OSS 120B (Medium)
+    [████░░] 48.00%
+    48% remaining · Refreshes in 80h 2m
+`, new Date("2026-06-26T00:00:00.000Z"));
+
+  assert.deepEqual(aggregates, [
+    {
+      status: "exhausted",
+      scope: "gemini-flash",
+      resetAt: "2026-06-29T07:59:00.000Z",
+      reason: "usage quota exhausted",
+      modelLabel: "Gemini 3.5 Flash (Medium)",
+      remainingPercent: 0,
+    },
+    {
+      status: "available",
+      scope: "gemini-pro",
+      modelLabel: "Gemini 3.1 Pro (Low)",
+      remainingPercent: 100,
+    },
+    {
+      status: "available",
+      scope: "claude-gpt",
+      resetAt: "2026-06-29T08:02:00.000Z",
+      modelLabel: "Claude Sonnet 4.6 (Thinking)",
+      remainingPercent: 48,
     },
   ]);
 });
@@ -603,11 +665,11 @@ test("usage availability overrides stale unknown quota from logs", () => {
     ],
   };
 
-  markProfileQuotaAvailable(state, "a", "gemini", {}, now);
+  markProfileQuotaAvailable(state, "a", "gemini-flash", {}, now);
 
   assert.equal(state.profiles[0]!.quotaScopes, undefined);
   assert.equal(state.profiles[0]!.quotaStatus, "available");
-  assert.equal(effectiveProfileStatus(state.profiles[0]!, now, { quotaScopes: ["gemini"] }), "ready");
+  assert.equal(effectiveProfileStatus(state.profiles[0]!, now, { quotaScopes: ["gemini-flash"] }), "ready");
 });
 
 test("usage availability records scoped reset windows", () => {
@@ -624,20 +686,20 @@ test("usage availability records scoped reset windows", () => {
     ],
   };
 
-  markProfileQuotaAvailable(state, "a", "claude", {
+  markProfileQuotaAvailable(state, "a", "claude-gpt", {
     resetAt: "2026-06-27T00:00:00.000Z",
     remainingPercent: 58,
     modelLabel: "Claude Sonnet 4.6",
   }, now);
 
-  assert.deepEqual(state.profiles[0]!.quotaScopes?.claude, {
+  assert.deepEqual(state.profiles[0]!.quotaScopes?.["claude-gpt"], {
     status: "available",
     resetAt: "2026-06-27T00:00:00.000Z",
     modelLabel: "Claude Sonnet 4.6",
     remainingPercent: 58,
     checkedAt: "2026-06-26T00:00:00.000Z",
   });
-  assert.equal(effectiveProfileStatus(state.profiles[0]!, now, { quotaScopes: ["claude"] }), "ready");
+  assert.equal(effectiveProfileStatus(state.profiles[0]!, now, { quotaScopes: ["claude-gpt"] }), "ready");
 });
 
 test("tracks provider-scoped quota only from model log context", () => {
@@ -646,7 +708,7 @@ test("tracks provider-scoped quota only from model log context", () => {
   );
   assert.deepEqual(modelEvent, {
     label: "Claude Sonnet 4.6 (Thinking)",
-    scope: "claude",
+    scope: "claude-gpt",
   });
 
   const now = new Date("2026-06-26T00:00:00.000Z");
@@ -670,22 +732,22 @@ test("tracks provider-scoped quota only from model log context", () => {
   markProfileQuotaExhausted(state, "b", {
     reason: "individual quota reached",
     resetAt: "2026-06-27T00:00:00.000Z",
-    scope: "claude",
+    scope: modelEvent?.scope,
     modelLabel: "Claude Sonnet 4.6 (Thinking)",
   }, now);
 
   assert.equal(state.profiles[1]!.quotaStatus, undefined);
-  assert.equal(state.profiles[1]!.quotaScopes?.claude?.modelLabel, "Claude Sonnet 4.6 (Thinking)");
+  assert.equal(state.profiles[1]!.quotaScopes?.["claude-gpt"]?.modelLabel, "Claude Sonnet 4.6 (Thinking)");
   assert.equal(
-    effectiveProfileStatus(state.profiles[1]!, now, { quotaScopes: ["gemini"] }),
+    effectiveProfileStatus(state.profiles[1]!, now, { quotaScopes: ["gemini-flash"] }),
     "ready",
   );
   assert.equal(
-    effectiveProfileStatus(state.profiles[1]!, now, { quotaScopes: ["claude"] }),
+    effectiveProfileStatus(state.profiles[1]!, now, { quotaScopes: ["claude-gpt"] }),
     "exhausted",
   );
-  assert.equal(selectNextProfile(state, now, { quotaScopes: ["gemini"] }).name, "b");
-  assert.equal(selectNextProfile(state, now, { quotaScopes: ["claude"] }).name, "a");
+  assert.equal(selectNextProfile(state, now, { quotaScopes: ["gemini-flash"] }).name, "b");
+  assert.equal(selectNextProfile(state, now, { quotaScopes: ["claude-gpt"] }).name, "a");
 });
 
 test("clears stale resetless scoped quota", () => {
@@ -722,7 +784,7 @@ test("auto switch provider-first skips only current provider quota", () => {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          claude: {
+          "claude-gpt": {
             status: "exhausted",
             resetAt: "2026-06-27T00:00:00.000Z",
           },
@@ -733,7 +795,7 @@ test("auto switch provider-first skips only current provider quota", () => {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          gemini: {
+          "gemini-flash": {
             status: "exhausted",
             resetAt: "2026-06-27T00:00:00.000Z",
           },
@@ -744,7 +806,7 @@ test("auto switch provider-first skips only current provider quota", () => {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          claude: {
+          "claude-gpt": {
             status: "exhausted",
             resetAt: "2026-06-27T00:00:00.000Z",
           },
@@ -754,13 +816,13 @@ test("auto switch provider-first skips only current provider quota", () => {
   };
 
   assert.equal(
-    shouldAutoSwitchAfterQuota(state.profiles[0], "provider-first", "claude", now),
+    shouldAutoSwitchAfterQuota(state.profiles[0], "provider-first", "claude-gpt", now),
     true,
   );
-  assert.equal(selectAutoSwitchProfile(state, "provider-first", "claude", now).name, "b");
+  assert.equal(selectAutoSwitchProfile(state, "provider-first", "claude-gpt", now).name, "b");
 });
 
-test("auto switch all-providers waits until both Claude and Gemini are exhausted", () => {
+test("auto switch all-providers waits until all free tier quota groups are exhausted", () => {
   const now = new Date("2026-06-26T00:00:00.000Z");
   const state: State = {
     version: 1,
@@ -771,7 +833,7 @@ test("auto switch all-providers waits until both Claude and Gemini are exhausted
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          claude: {
+          "claude-gpt": {
             status: "exhausted",
             resetAt: "2026-06-27T00:00:00.000Z",
           },
@@ -787,7 +849,7 @@ test("auto switch all-providers waits until both Claude and Gemini are exhausted
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          gemini: {
+          "gemini-flash": {
             status: "exhausted",
             resetAt: "2026-06-27T00:00:00.000Z",
           },
@@ -797,20 +859,30 @@ test("auto switch all-providers waits until both Claude and Gemini are exhausted
   };
 
   assert.equal(
-    shouldAutoSwitchAfterQuota(state.profiles[0], "all-providers", "claude", now),
+    shouldAutoSwitchAfterQuota(state.profiles[0], "all-providers", "claude-gpt", now),
     false,
   );
 
-  state.profiles[0]!.quotaScopes!.gemini = {
+  state.profiles[0]!.quotaScopes!["gemini-flash"] = {
     status: "exhausted",
     resetAt: "2026-06-27T00:00:00.000Z",
   };
 
   assert.equal(
-    shouldAutoSwitchAfterQuota(state.profiles[0], "all-providers", "gemini", now),
+    shouldAutoSwitchAfterQuota(state.profiles[0], "all-providers", "gemini-flash", now),
+    false,
+  );
+
+  state.profiles[0]!.quotaScopes!["gemini-pro"] = {
+    status: "exhausted",
+    resetAt: "2026-06-27T00:00:00.000Z",
+  };
+
+  assert.equal(
+    shouldAutoSwitchAfterQuota(state.profiles[0], "all-providers", "gemini-pro", now),
     true,
   );
-  assert.equal(selectAutoSwitchProfile(state, "all-providers", "gemini", now).name, "b");
+  assert.equal(selectAutoSwitchProfile(state, "all-providers", "gemini-pro", now).name, "b");
 });
 
 test("auto switch treats unknown profile-wide quota as both provider quotas", () => {
@@ -859,8 +931,9 @@ test("auto switch orders fallback candidates by earliest quota reset", () => {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          claude: { status: "exhausted", resetAt: "2026-06-27T00:00:00.000Z" },
-          gemini: { status: "exhausted", resetAt: "2026-06-27T00:00:00.000Z" },
+          "claude-gpt": { status: "exhausted", resetAt: "2026-06-27T00:00:00.000Z" },
+          "gemini-flash": { status: "exhausted", resetAt: "2026-06-27T00:00:00.000Z" },
+          "gemini-pro": { status: "exhausted", resetAt: "2026-06-27T00:00:00.000Z" },
         },
       },
       {
@@ -868,7 +941,7 @@ test("auto switch orders fallback candidates by earliest quota reset", () => {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          gemini: { status: "exhausted", resetAt: "2026-06-29T00:00:00.000Z" },
+          "gemini-pro": { status: "exhausted", resetAt: "2026-06-29T00:00:00.000Z" },
         },
       },
       {
@@ -876,13 +949,13 @@ test("auto switch orders fallback candidates by earliest quota reset", () => {
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         quotaScopes: {
-          gemini: { status: "exhausted", resetAt: "2026-06-28T00:00:00.000Z" },
+          "gemini-pro": { status: "exhausted", resetAt: "2026-06-28T00:00:00.000Z" },
         },
       },
     ],
   };
 
-  assert.equal(selectAutoSwitchProfile(state, "all-providers", "claude", now).name, "c");
+  assert.equal(selectAutoSwitchProfile(state, "all-providers", "claude-gpt", now).name, "c");
 });
 
 test("detects request event lines from agy logs", () => {

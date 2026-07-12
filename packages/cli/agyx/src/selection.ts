@@ -4,7 +4,7 @@ import {
   ProfileRecord,
   State,
 } from "./config.js";
-import { QuotaScope } from "./quota.js";
+import { QuotaScope, quotaScopeAliases } from "./quota.js";
 
 export type ProfileRuntimeStatus =
   | "ready"
@@ -29,7 +29,7 @@ function effectiveScopes(options: EffectiveStatusOptions): QuotaScope[] {
   );
 }
 
-const providerQuotaScopes: QuotaScope[] = ["claude", "gemini"];
+const providerQuotaScopes: QuotaScope[] = ["gemini-flash", "gemini-pro", "claude-gpt"];
 
 function quotaActive(resetAt: string | undefined, now: Date): boolean {
   return !resetAt || Date.parse(resetAt) > now.getTime();
@@ -53,8 +53,10 @@ export function isScopeQuotaExhausted(
 ): boolean {
   if (scope === "unknown") return hasProfileWideQuota(profile, now);
   if (hasProfileWideQuota(profile, now)) return true;
-  const quota = profile.quotaScopes?.[scope];
-  return Boolean(quota?.status === "exhausted" && quotaActive(quota.resetAt, now));
+  return quotaScopeAliases(scope).some((candidate) => {
+    const quota = profile.quotaScopes?.[candidate];
+    return Boolean(quota?.status === "exhausted" && quotaActive(quota.resetAt, now));
+  });
 }
 
 function allowIneligibleActivation(options: EffectiveStatusOptions): boolean {
@@ -84,10 +86,13 @@ export function scopedQuotaResetAt(
   now = new Date(),
 ): string | undefined {
   if (!scope || scope === "unknown") return undefined;
-  const quota = profile.quotaScopes?.[scope];
-  if (!quota) return undefined;
-  if (!quota.resetAt) return undefined;
-  return Date.parse(quota.resetAt) > now.getTime() ? quota.resetAt : undefined;
+  const resets = quotaScopeAliases(scope)
+    .map((candidate) => profile.quotaScopes?.[candidate]?.resetAt)
+    .filter((resetAt): resetAt is string =>
+      typeof resetAt === "string" && Date.parse(resetAt) > now.getTime()
+    )
+    .sort((left, right) => Date.parse(left) - Date.parse(right));
+  return resets[0];
 }
 
 export function exhaustedQuotaScope(
