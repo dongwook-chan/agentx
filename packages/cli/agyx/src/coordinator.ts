@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import {
+  appendAgentEvent,
   pauseAllSessions,
   resumeAllSessions,
   runAuthSwitchTransaction,
@@ -19,6 +20,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import {
   ensureDirectories,
+  eventLogPath,
   loadState,
   logDir,
   markProfileActivated,
@@ -42,7 +44,7 @@ import {
   runningAgy,
   stopProcesses,
 } from "./processes.js";
-import { QuotaScope } from "./quota.js";
+import { canonicalQuotaScope, QuotaScope } from "./quota.js";
 import {
   effectiveProfileStatus,
   isProfileSelectable,
@@ -61,6 +63,10 @@ interface SessionReply {
 const autoSwitchLockPath = join(runtimeDir, "auto-switch.lock");
 const authSwitchLockPath = join(runtimeDir, "auth-switch.lock");
 let authSwitchLockDepth = 0;
+
+async function logSwitchEvent(event: { event: string } & Record<string, unknown>): Promise<void> {
+  await appendAgentEvent(eventLogPath, { product: "agyx", ...event }).catch(() => undefined);
+}
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
@@ -156,7 +162,7 @@ export async function activeQuotaScopes(): Promise<QuotaScope[]> {
   const scopes = new Set<QuotaScope>();
   for (const record of await sessionRecords()) {
     const scope = record.currentQuotaScope;
-    if (scope && scope !== "unknown") scopes.add(scope);
+    if (scope && scope !== "unknown") scopes.add(canonicalQuotaScope(scope));
   }
   return [...scopes];
 }
@@ -406,6 +412,13 @@ export async function switchProfile(name: string): Promise<ProfileSwitchResult> 
     const profile = initialState.profiles.find((entry) => entry.name === name);
     if (!profile) throw new Error(`Profile not found: ${name}`);
     if (initialState.activeProfile === name) {
+      await logSwitchEvent({
+        event: "switch.skipped",
+        trigger: "manual-use",
+        fromProfile: initialState.activeProfile,
+        toProfile: name,
+        reason: "already_active",
+      });
       return {
         name,
         email: profile.email ?? profile.verifiedEmail,
@@ -422,9 +435,29 @@ export async function switchProfile(name: string): Promise<ProfileSwitchResult> 
     }
     const previousCredential = await keychain.readActive().catch(() => undefined);
     try {
-      return await activateProfile(name, { verify: true });
+      await logSwitchEvent({
+        event: "profile.selected",
+        trigger: "manual-use",
+        fromProfile: initialState.activeProfile,
+        toProfile: name,
+      });
+      const result = await activateProfile(name, { verify: true });
+      await logSwitchEvent({
+        event: "switch.completed",
+        trigger: "manual-use",
+        fromProfile: initialState.activeProfile,
+        toProfile: result.name,
+      });
+      return result;
     } catch (error) {
       if (previousCredential) await keychain.writeActive(previousCredential);
+      await logSwitchEvent({
+        event: "switch.failed",
+        trigger: "manual-use",
+        fromProfile: initialState.activeProfile,
+        toProfile: name,
+        error: (error as Error).message,
+      });
       throw error;
     }
   });
@@ -436,6 +469,13 @@ export async function switchToNextProfile(): Promise<ProfileSwitchResult> {
     const quotaScopes = await activeQuotaScopes();
     const initialCandidate = selectNextProfile(initialState, new Date(), { quotaScopes });
     if (initialCandidate.name === initialState.activeProfile) {
+      await logSwitchEvent({
+        event: "switch.skipped",
+        trigger: "manual-next",
+        fromProfile: initialState.activeProfile,
+        toProfile: initialCandidate.name,
+        reason: "already_active",
+      });
       return {
         name: initialCandidate.name,
         email: initialCandidate.email ?? initialCandidate.verifiedEmail,
@@ -449,6 +489,13 @@ export async function switchToNextProfile(): Promise<ProfileSwitchResult> {
         const state = await loadState();
         const candidate = selectNextProfile(state, new Date(), { quotaScopes });
         if (candidate.name === state.activeProfile) {
+          await logSwitchEvent({
+            event: "switch.skipped",
+            trigger: "manual-next",
+            fromProfile: state.activeProfile,
+            toProfile: candidate.name,
+            reason: "already_active",
+          });
           return {
             name: candidate.name,
             email: candidate.email ?? candidate.verifiedEmail,
@@ -456,7 +503,20 @@ export async function switchToNextProfile(): Promise<ProfileSwitchResult> {
           };
         }
         try {
-          return await activateProfile(candidate.name, { verify: true });
+          await logSwitchEvent({
+            event: "profile.selected",
+            trigger: "manual-next",
+            fromProfile: state.activeProfile,
+            toProfile: candidate.name,
+          });
+          const result = await activateProfile(candidate.name, { verify: true });
+          await logSwitchEvent({
+            event: "switch.completed",
+            trigger: "manual-next",
+            fromProfile: state.activeProfile,
+            toProfile: result.name,
+          });
+          return result;
         } catch (error) {
           lastError = error as Error;
           const profile = (await loadState()).profiles.find((entry) => entry.name === candidate.name);
@@ -468,6 +528,12 @@ export async function switchToNextProfile(): Promise<ProfileSwitchResult> {
       throw lastError ?? new Error("No selectable profiles.");
     } catch (error) {
       if (previousCredential) await keychain.writeActive(previousCredential);
+      await logSwitchEvent({
+        event: "switch.failed",
+        trigger: "manual-next",
+        fromProfile: initialState.activeProfile,
+        error: (error as Error).message,
+      });
       throw error;
     }
   });
@@ -493,20 +559,58 @@ export async function autoSwitchAfterQuota(
   return await withAutoSwitchLock(async () => {
     const initialState = await loadState();
     const mode = effectiveAutoSwitchMode(initialState);
-    if (mode === "off") return undefined;
+    if (mode === "off") {
+      await logSwitchEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: "autoswitch_off",
+        fromProfile: initialState.activeProfile,
+        quotaScope,
+      });
+      return undefined;
+    }
     const activeProfile = initialState.profiles.find((profile) =>
       profile.name === initialState.activeProfile
     );
-    if (!shouldAutoSwitchAfterQuota(activeProfile, mode, quotaScope)) return undefined;
+    if (!shouldAutoSwitchAfterQuota(activeProfile, mode, quotaScope)) {
+      await logSwitchEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: "quota_scope_not_switchable",
+        fromProfile: initialState.activeProfile,
+        quotaScope,
+        mode,
+      });
+      return undefined;
+    }
 
     return await withPausedAuthSwitch(async () => {
       const initialState = await loadState();
       const mode = effectiveAutoSwitchMode(initialState);
-      if (mode === "off") return undefined;
+      if (mode === "off") {
+        await logSwitchEvent({
+          event: "switch.stopped",
+          trigger: "autoswitch",
+          reason: "autoswitch_off",
+          fromProfile: initialState.activeProfile,
+          quotaScope,
+        });
+        return undefined;
+      }
       const activeProfile = initialState.profiles.find((profile) =>
         profile.name === initialState.activeProfile
       );
-      if (!shouldAutoSwitchAfterQuota(activeProfile, mode, quotaScope)) return undefined;
+      if (!shouldAutoSwitchAfterQuota(activeProfile, mode, quotaScope)) {
+        await logSwitchEvent({
+          event: "switch.stopped",
+          trigger: "autoswitch",
+          reason: "quota_scope_not_switchable",
+          fromProfile: initialState.activeProfile,
+          quotaScope,
+          mode,
+        });
+        return undefined;
+      }
 
       const initialCandidate = selectAutoSwitchProfile(initialState, mode, quotaScope);
       const previousCredential = await keychain.readActive().catch(() => undefined);
@@ -520,7 +624,24 @@ export async function autoSwitchAfterQuota(
             ? initialCandidate
             : selectAutoSwitchProfile(state, currentMode, quotaScope);
           try {
-            return await activateProfile(candidate.name, { verify: true });
+            await logSwitchEvent({
+              event: "profile.selected",
+              trigger: "autoswitch",
+              fromProfile: state.activeProfile,
+              toProfile: candidate.name,
+              quotaScope,
+              mode: currentMode,
+            });
+            const result = await activateProfile(candidate.name, { verify: true });
+            await logSwitchEvent({
+              event: "switch.completed",
+              trigger: "autoswitch",
+              fromProfile: state.activeProfile,
+              toProfile: result.name,
+              quotaScope,
+              mode: currentMode,
+            });
+            return result;
           } catch (error) {
             lastError = error as Error;
             const profile = (await loadState()).profiles.find((entry) => entry.name === candidate.name);
@@ -532,6 +653,14 @@ export async function autoSwitchAfterQuota(
         throw lastError ?? new Error("No selectable profile for automatic quota failover.");
       } catch (error) {
         if (previousCredential) await keychain.writeActive(previousCredential);
+        await logSwitchEvent({
+          event: "switch.failed",
+          trigger: "autoswitch",
+          fromProfile: initialState.activeProfile,
+          quotaScope,
+          mode,
+          error: (error as Error).message,
+        });
         throw error;
       }
     });

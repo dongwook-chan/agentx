@@ -101,3 +101,62 @@ test("profile-switch session adapter sends restart reason", async () => {
     await sessions.cleanupRuntimeFile(socketPath);
   }
 });
+
+test("session socket calls time out instead of hanging indefinitely", async () => {
+  const socketPath = join(process.env.CDXX_CONFIG_DIR, "run", "timeout.sock");
+  const record = {
+    id: "timeout",
+    pid: process.pid,
+    childPid: 12347,
+    cwd: root,
+    args: [],
+    socketPath,
+    paused: false,
+    restartable: true,
+    startedAt: new Date().toISOString(),
+  };
+  const server = createServer({ allowHalfOpen: true }, (socket) => {
+    socket.on("data", () => {});
+    socket.on("end", () => {});
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  try {
+    const adapter = sessions.sessionControlAdapter({ timeoutMs: 20 });
+    await assert.rejects(
+      async () => await adapter.pause(record),
+      /Timed out waiting for session .*timeout\.sock.*pause/,
+    );
+  } finally {
+    server.close();
+    await sessions.cleanupRuntimeFile(socketPath);
+  }
+});
+
+test("profile switches are refused from inside the current managed Codex session", async () => {
+  const ancestors = await sessions.currentProcessAncestorPids();
+  const childPid = [...ancestors][0];
+  assert.ok(childPid, "test process should have a parent pid");
+  const recordPath = sessions.runtimeRecordPath("self");
+  await sessions.writeRuntimeRecord(recordPath, {
+    id: "self",
+    pid: process.pid,
+    childPid,
+    cwd: root,
+    args: [],
+    socketPath: join(process.env.CDXX_CONFIG_DIR, "run", "self.sock"),
+    paused: false,
+    restartable: true,
+    startedAt: new Date().toISOString(),
+  });
+  try {
+    await assert.rejects(
+      async () => await sessions.withPausedAuthSwitch(async () => "should-not-run"),
+      /Refusing to switch Codex profiles from inside a supervised Codex session/,
+    );
+  } finally {
+    await sessions.cleanupRuntimeFile(recordPath);
+  }
+});

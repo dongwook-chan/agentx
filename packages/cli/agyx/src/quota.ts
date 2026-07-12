@@ -31,6 +31,13 @@ export function quotaScopeAliases(scope: QuotaScope): QuotaScope[] {
   }
 }
 
+export function canonicalQuotaScope(scope: QuotaScope, modelLabel?: string): QuotaScope {
+  const modelScope = classifyModelScope(modelLabel);
+  if (modelScope !== "unknown") return modelScope;
+  if (scope === "claude" || scope === "gpt-oss") return "claude-gpt";
+  return scope;
+}
+
 export interface ModelEvent {
   label: string;
   scope: QuotaScope;

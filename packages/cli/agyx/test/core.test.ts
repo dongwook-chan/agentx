@@ -497,6 +497,42 @@ test("profile view shows reset time for available scoped usage windows", () => {
   assert.equal(views[0]!.selectable, true);
 });
 
+test("profile view hides expired legacy scoped usage windows", () => {
+  const views = buildProfileViews({
+    profiles: [
+      {
+        name: "a",
+        createdAt: "2026-06-26T00:00:00.000Z",
+        updatedAt: "2026-06-26T00:00:00.000Z",
+        quotaStatus: "available",
+        quotaScopes: {
+          gemini: {
+            status: "exhausted",
+            resetAt: "2026-06-27T00:00:00.000Z",
+            modelLabel: "Gemini 3.5 Flash (High)",
+          },
+        },
+      },
+      {
+        name: "b",
+        createdAt: "2026-06-26T00:00:00.000Z",
+        updatedAt: "2026-06-26T00:00:00.000Z",
+        quotaStatus: "available",
+        quotaScopes: {
+          claude: {
+            status: "available",
+            resetAt: "2026-06-29T00:00:00.000Z",
+            modelLabel: "Claude Sonnet 4.6 (Thinking)",
+          },
+        },
+      },
+    ],
+  }, new Date("2026-06-28T00:00:00.000Z"));
+
+  assert.equal(views[0]!.status, "ready");
+  assert.equal(views[1]!.status, "ready/claude-gpt");
+});
+
 test("parses quota reset hints from agy logs", () => {
   const event = parseQuotaEventLine(
     "RESOURCE_EXHAUSTED: Individual quota reached. Resets in 1h30m10s",

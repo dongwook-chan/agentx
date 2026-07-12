@@ -92,6 +92,7 @@ export const configDir = process.env.AGYX_CONFIG_DIR
 export const runtimeDir = join(configDir, "run");
 export const logDir = join(configDir, "logs");
 export const statePath = join(configDir, "state.json");
+export const eventLogPath = join(configDir, "events.jsonl");
 
 export async function ensureDirectories(): Promise<void> {
   for (const directory of [configDir, runtimeDir, logDir]) {

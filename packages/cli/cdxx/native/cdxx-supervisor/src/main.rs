@@ -36,6 +36,7 @@ struct QuotaTail {
     carry: String,
 }
 
+#[derive(Clone)]
 struct QuotaEvent {
     timestamp: Option<String>,
     primary: f64,
@@ -149,7 +150,7 @@ impl Supervisor {
         self.persist()
     }
 
-    fn tick(&mut self) -> Result<(), String> {
+    fn tick(&mut self) -> Result<Option<(String, String, QuotaEvent)>, String> {
         if self.matched_session.is_none() {
             let matched = if let Some(session_id) = self.requested_session_id.clone() {
                 find_session_by_id(&session_id)?
@@ -168,10 +169,10 @@ impl Supervisor {
         }
 
         if self.quota_handled {
-            return Ok(());
+            return Ok(None);
         }
         let Some(tail) = self.tail.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         let events = tail.read_added()?;
         for event in events {
@@ -189,23 +190,9 @@ impl Supervisor {
                 continue;
             };
             self.quota_handled = true;
-            eprintln!("[cdxx] Profile '{}' reached quota.", profile_name);
-            let action = supervisor_failover(&profile_name, &session_id, &event)?;
-            if let Some(message) = action.get("message").and_then(Value::as_str) {
-                eprintln!("{message}");
-            }
-            if action.get("kind").and_then(Value::as_str) == Some("switch_and_resume") {
-                self.failover_attempts += 1;
-                if self.failover_attempts > 10 {
-                    eprintln!("[cdxx] Stopping after 10 quota failover attempts.");
-                    continue;
-                }
-                let _ = self.stop_child();
-                self.current_args = vec!["resume".to_string(), session_id];
-                self.start_child()?;
-            }
+            return Ok(Some((profile_name, session_id, event)));
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -312,8 +299,43 @@ fn run(args: Vec<String>) -> Result<i32, String> {
 
     let code = loop {
         thread::sleep(Duration::from_millis(500));
+        let failover_trigger = {
+            let mut guard = supervisor.lock().map_err(to_string)?;
+            guard.tick()?
+        };
+
+        if let Some((profile_name, session_id, event)) = failover_trigger {
+            eprintln!("[cdxx] Profile '{}' reached quota.", profile_name);
+            let action = supervisor_failover(&profile_name, &session_id, &event)?;
+            if let Some(message) = action.get("message").and_then(Value::as_str) {
+                eprintln!("{message}");
+            }
+            let mut guard = supervisor.lock().map_err(to_string)?;
+            match action.get("kind").and_then(Value::as_str) {
+                Some("sessions_restarted") => {
+                    // The shared JS transaction has already paused and resumed supervised sessions.
+                }
+                Some("switch_and_resume") => {
+                    guard.failover_attempts += 1;
+                    if guard.failover_attempts > 10 {
+                        eprintln!("[cdxx] Stopping after 10 quota failover attempts.");
+                    } else {
+                        let _ = guard.stop_child();
+                        guard.current_args = vec!["resume".to_string(), session_id];
+                        guard.start_child()?;
+                    }
+                }
+                Some("stop_retrying") | Some("none") => {}
+                Some(other) => {
+                    eprintln!("[cdxx] Unknown quota failover action kind: {other}");
+                }
+                None => {
+                    eprintln!("[cdxx] Quota failover action did not include a kind.");
+                }
+            }
+        }
+
         let mut guard = supervisor.lock().map_err(to_string)?;
-        guard.tick()?;
         let exited = match guard.child.as_mut() {
             Some(child) => child
                 .try_wait()

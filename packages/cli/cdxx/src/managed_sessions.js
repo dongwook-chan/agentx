@@ -1,9 +1,14 @@
 import { pauseAllSessions, resumeAllSessions, runAuthSwitchTransaction } from "@dong-/agentx-core";
+import { execFile } from "node:child_process";
 import { chmod, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import { connect } from "node:net";
 import { join } from "node:path";
 import { ensureConfig, runtimeDir } from "./config.js";
 import { withAuthSwitchLock } from "./lock.js";
+
+const defaultSessionSocketTimeoutMs = 5000;
+const execFileAsync = promisify(execFile);
 
 export function runtimeRecordPath(id) {
   return join(runtimeDir, `${id}.json`);
@@ -68,22 +73,77 @@ export async function writeRuntimeRecord(path, record) {
   }
 }
 
-async function send(socketPath, command, payload = {}) {
+async function send(socketPath, command, payload = {}, options = {}) {
   return await new Promise((resolve, reject) => {
     const socket = connect(socketPath);
+    const timeoutMs = options.timeoutMs ?? defaultSessionSocketTimeoutMs;
     let input = "";
+    let settled = false;
+    let timedOut = false;
+    let timer;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(value);
+    };
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        socket.destroy();
+        settle(reject, new Error(`Timed out waiting for session ${socketPath} to handle '${command}'.`));
+      }, timeoutMs);
+      timer.unref?.();
+    }
     socket.setEncoding("utf8");
     socket.on("connect", () => socket.end(`${JSON.stringify({ command, ...payload })}\n`));
     socket.on("data", (chunk) => { input += chunk; });
-    socket.on("error", reject);
+    socket.on("error", (error) => settle(reject, error));
     socket.on("close", () => {
+      if (timedOut) return;
       try {
-        resolve(JSON.parse(input));
+        settle(resolve, JSON.parse(input));
       } catch {
-        reject(new Error(`Invalid response from session ${socketPath}`));
+        settle(reject, new Error(`Invalid response from session ${socketPath}`));
       }
     });
   });
+}
+
+function parentPidFromStat(content) {
+  const endOfCommand = content.lastIndexOf(")");
+  if (endOfCommand < 0) return undefined;
+  const fields = content.slice(endOfCommand + 2).trim().split(/\s+/);
+  const ppid = Number(fields[1]);
+  return Number.isInteger(ppid) && ppid > 0 ? ppid : undefined;
+}
+
+async function parentPid(pid) {
+  const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined);
+  if (stat) return parentPidFromStat(stat);
+  const output = await execFileAsync("ps", ["-o", "ppid=", "-p", String(pid)], { timeout: 1000 })
+    .then((result) => result.stdout)
+    .catch(() => undefined);
+  const ppid = Number(output?.trim());
+  return Number.isInteger(ppid) && ppid > 0 ? ppid : undefined;
+}
+
+export async function currentProcessAncestorPids(pid = process.pid) {
+  const ancestors = new Set();
+  let current = pid;
+  for (let depth = 0; depth < 128 && current > 1; depth += 1) {
+    const parent = await parentPid(current);
+    if (!parent || ancestors.has(parent)) break;
+    ancestors.add(parent);
+    current = parent;
+  }
+  return ancestors;
+}
+
+export async function currentManagedSessionRecord(records = undefined) {
+  const managed = records ?? await sessionRecords();
+  const ancestors = await currentProcessAncestorPids();
+  return managed.find((record) => record.childPid && ancestors.has(record.childPid));
 }
 
 export async function sessionRecords() {
@@ -109,14 +169,14 @@ export async function sessionRecords() {
 
 export function sessionControlAdapter(options = {}) {
   return {
-    sessionRecords,
+    sessionRecords: options.sessionRecords ?? sessionRecords,
     pause: async (record) => {
-      const reply = await send(record.socketPath, "pause", { reason: options.reason });
+      const reply = await send(record.socketPath, "pause", { reason: options.reason }, options);
       if (!reply.ok) throw new Error(reply.error ?? `Failed to pause ${record.id}`);
       return reply.record ?? { ...record, childPid: undefined, paused: true };
     },
     resume: async (record) => {
-      const reply = await send(record.socketPath, "resume", { reason: options.reason });
+      const reply = await send(record.socketPath, "resume", { reason: options.reason }, options);
       if (!reply.ok) throw new Error(reply.error ?? `Failed to resume ${record.id}`);
     },
     onResumeError: (record, error) => {
@@ -134,9 +194,21 @@ export async function resumeAll(records) {
 }
 
 export async function withPausedAuthSwitch(operation, options = {}) {
+  const records = await sessionRecords();
+  const currentRecord = await currentManagedSessionRecord(records);
+  if (currentRecord) {
+    throw new Error(
+      "Refusing to switch Codex profiles from inside a supervised Codex session. "
+      + "Run 'codex x use' or 'codex x next' from a separate shell so the current session is not paused by itself.",
+    );
+  }
   return await runAuthSwitchTransaction(
     {
-      sessionControl: sessionControlAdapter({ reason: "profile-switch" }),
+      sessionControl: sessionControlAdapter({
+        reason: "profile-switch",
+        timeoutMs: options.sessionSocketTimeoutMs,
+        sessionRecords: async () => records,
+      }),
       withLock: withAuthSwitchLock,
     },
     operation,

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
+import { appendAgentEvent } from "@dong-/agentx-core";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
-import { clearExpiredQuota, effectiveYoloMode, loadState, profilesDir, saveState } from "./config.js";
+import { clearExpiredQuota, effectiveYoloMode, eventLogPath, loadState, profilesDir, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
 import { installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
@@ -14,6 +15,10 @@ import { profileSelectableReason } from "./selection.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
 import { formatReset, recordQuotaForActiveProfile, recordQuotaForProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
 import { confirmProfileUse, pickConfigKey, pickConfigValue, pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
+
+async function logSwitchEvent(event) {
+  await appendAgentEvent(eventLogPath, { product: "cdxx", ...event }).catch(() => undefined);
+}
 
 const help = `cdxx - Codex CLI profile and quota helper
 
@@ -157,7 +162,20 @@ async function switchNext() {
   for (const profile of state.profiles) clearExpiredQuota(profile);
   const next = pickNextProfile(state);
   if (!next) throw new Error("No selectable profile found.");
+  await logSwitchEvent({
+    event: "profile.selected",
+    trigger: "manual-next",
+    fromProfile: state.activeProfile,
+    toProfile: next.name,
+  });
   const result = await withPausedSessions(async () => await useProfile(next.name));
+  await logSwitchEvent({
+    event: "switch.completed",
+    trigger: "manual-next",
+    fromProfile: state.activeProfile,
+    toProfile: result.name,
+    actionKind: "sessions_restarted",
+  });
   console.log(`Activated '${result.name}'${result.email ? ` (${result.email})` : ""}.`);
 }
 
@@ -176,7 +194,35 @@ async function useProfileCommand(name, { force = false } = {}) {
     allowBlockedQuota = await confirmProfileUse(profile ?? { name }, blocked);
     if (!allowBlockedQuota) return undefined;
   }
-  return await withPausedSessions(async () => await useProfile(name, { force: allowBlockedQuota }));
+  await logSwitchEvent({
+    event: "profile.selected",
+    trigger: "manual-use",
+    fromProfile: state.activeProfile,
+    toProfile: name,
+    force: allowBlockedQuota,
+  });
+  try {
+    const result = await withPausedSessions(async () => await useProfile(name, { force: allowBlockedQuota }));
+    await logSwitchEvent({
+      event: "switch.completed",
+      trigger: "manual-use",
+      fromProfile: state.activeProfile,
+      toProfile: result.name,
+      force: allowBlockedQuota,
+      actionKind: "sessions_restarted",
+    });
+    return result;
+  } catch (error) {
+    await logSwitchEvent({
+      event: "switch.failed",
+      trigger: "manual-use",
+      fromProfile: state.activeProfile,
+      toProfile: name,
+      force: allowBlockedQuota,
+      error: error?.message ?? String(error),
+    });
+    throw error;
+  }
 }
 
 async function setAutoswitch(value) {

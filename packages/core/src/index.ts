@@ -1,4 +1,5 @@
-import { open, stat } from "node:fs/promises";
+import { appendFile, mkdir, open, stat } from "node:fs/promises";
+import { dirname } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 export interface FirstLineReadResult {
@@ -229,6 +230,23 @@ export interface ManagedSessionRecord {
   paused?: boolean;
   restartable?: boolean;
   startedAt?: string;
+}
+
+export interface AgentEvent {
+  timestamp?: string;
+  product: string;
+  event: string;
+  [key: string]: unknown;
+}
+
+export async function appendAgentEvent(path: string, event: AgentEvent): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const { timestamp, ...rest } = event;
+  const record = {
+    timestamp: timestamp ?? new Date().toISOString(),
+    ...rest,
+  };
+  await appendFile(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
 }
 
 export interface SessionControlAdapter<TRecord extends ManagedSessionRecord> {

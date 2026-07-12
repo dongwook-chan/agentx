@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   applyLaunchPolicy,
+  appendAgentEvent,
   clearExpiredProfileQuota,
   decideUseProfile,
   IncrementalFileTail,
@@ -15,7 +16,7 @@ import {
   usageCheckMode,
 } from "../src/index.js";
 import type { GenericProfileRecord } from "../src/index.js";
-import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -44,6 +45,28 @@ test("applyLaunchPolicy injects yolo flag exactly once", () => {
     foreignYoloFlags: ["--dangerously-skip-permissions"],
     foreignFlagLabel: "agy",
   }), args);
+});
+
+test("appendAgentEvent writes JSONL records with timestamps", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentx-events-"));
+  const path = join(root, "nested", "events.jsonl");
+  try {
+    await appendAgentEvent(path, {
+      product: "testx",
+      event: "switch.completed",
+      fromProfile: "a",
+      toProfile: "b",
+    });
+    const [line] = (await readFile(path, "utf8")).trim().split("\n");
+    const record = JSON.parse(line!);
+    assert.equal(record.product, "testx");
+    assert.equal(record.event, "switch.completed");
+    assert.equal(record.fromProfile, "a");
+    assert.equal(record.toProfile, "b");
+    assert.match(record.timestamp, /^\d{4}-\d{2}-\d{2}T/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("applyLaunchPolicy honors yolo off and rejects foreign yolo flags", () => {

@@ -64,7 +64,7 @@ Preferred shell usage after 'agyx install':
   agy x list                           List saved profiles
   agy x use [name]                     Activate a saved profile
   agy x next                           Switch to next selectable profile
-  agy x scan [--all]                   Check quota via /usage
+  agy x scan [--all|--full]            Check quota via /usage
   agy x status                         Show wrapper status
   agy x config                         Configure wrapper settings interactively
   agy x config <key> [value]           Configure autoswitch/ineligible/yolo
@@ -82,7 +82,7 @@ Usage:
                                        Pause all sessions and add an account
   agyx use [name]                      Switch account and resume every session
   agyx next                            Rotate to the next selectable account
-  agyx scan [--json] [--no-record] [--all]
+  agyx scan [--json] [--no-record] [--all|--full]
                                        Check quota via /usage
   agyx config [key] [value]            Configure wrapper settings
   agyx list [--verify]                 List profiles; optionally verify saved credentials
@@ -102,7 +102,7 @@ const wrapperHelp = `agyx wrapper commands:
   agy x list                           List saved profiles
   agy x use [name]                     Activate a saved profile
   agy x next                           Switch to next selectable profile
-  agy x scan [--all]                   Check quota via /usage
+  agy x scan [--all|--full]            Check quota via /usage
   agy x status                         Show wrapper status
   agy x config                         Configure wrapper settings interactively
   agy x config list                    Print wrapper settings
@@ -591,10 +591,10 @@ async function handleUseCommand(args: string[]): Promise<number> {
 
 async function handleScanCommand(args: string[]): Promise<number> {
   const asJson = takeFlag(args, "--json");
-  const all = takeFlag(args, "--all");
+  const all = takeFlag(args, "--all") || takeFlag(args, "--full");
   takeFlag(args, "--record");
   const record = !takeFlag(args, "--no-record");
-  if (args.length) throw new Error("Usage: agyx scan [--json] [--no-record] [--all]");
+  if (args.length) throw new Error("Usage: agyx scan [--json] [--no-record] [--all|--full]");
   if (all) {
     const results = await runUsageProbeForAllProfiles(record);
     if (asJson) console.log(JSON.stringify(results, null, 2));

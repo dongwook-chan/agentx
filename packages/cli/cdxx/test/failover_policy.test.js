@@ -117,6 +117,19 @@ test("quota failover switches under the shared paused-session transaction", asyn
     const state = await config.loadState();
     assert.equal(state.activeProfile, "b");
     assert.equal(state.profiles.find((profile) => profile.name === "a")?.quotaStatus, "exhausted");
+    const events = (await readFile(config.eventLogPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(
+      events.map((event) => event.event),
+      ["quota.detected", "profile.selected", "switch.completed"],
+    );
+    assert.equal(events[0].product, "cdxx");
+    assert.equal(events[0].profile, "a");
+    assert.equal(events[1].fromProfile, "a");
+    assert.equal(events[1].toProfile, "b");
+    assert.equal(events[2].actionKind, "sessions_restarted");
   } finally {
     server.close();
   }

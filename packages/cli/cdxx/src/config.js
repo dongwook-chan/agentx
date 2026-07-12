@@ -19,6 +19,7 @@ export const configDir = process.env.CDXX_CONFIG_DIR
 export const profilesDir = join(configDir, "profiles");
 export const runtimeDir = join(configDir, "run");
 export const statePath = join(configDir, "state.json");
+export const eventLogPath = join(configDir, "events.jsonl");
 const resetlessQuotaTtlMs = 24 * 60 * 60 * 1000;
 
 export function nowIso() {

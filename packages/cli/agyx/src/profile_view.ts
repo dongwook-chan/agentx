@@ -12,6 +12,7 @@ import {
   ProfileRuntimeStatus,
   scopedQuotaResetAt,
 } from "./selection.js";
+import { canonicalQuotaScope, QuotaScope } from "./quota.js";
 
 export interface ProfileView {
   marker: string;
@@ -43,10 +44,22 @@ export function profileStatusText(
   if (status === "ineligible") return "ineligible";
   if (status === "exhausted") {
     const exhaustedScope = exhaustedQuotaScopeForOptions(profile, options, now);
-    return exhaustedScope && exhaustedScope !== "unknown" ? `quota:${exhaustedScope}` : "quota";
+    return exhaustedScope && exhaustedScope !== "unknown"
+      ? `quota:${canonicalQuotaScope(exhaustedScope)}`
+      : "quota";
   }
-  const scopedQuotaText = Object.keys(profile.quotaScopes ?? {})
-    .filter((scope) => scope !== "unknown")
+  const scopedQuotaText = (Object.entries(profile.quotaScopes ?? {}) as Array<
+    [QuotaScope, NonNullable<ProfileRecord["quotaScopes"]>[QuotaScope]]
+  >)
+    .filter(([scope, quota]) => {
+      if (scope === "unknown" || !quota) return false;
+      if (quota.resetAt && Date.parse(quota.resetAt) <= now.getTime()) return false;
+      if (quota.status === "exhausted" && !quota.resetAt) return false;
+      if (quota.status === "available" && !quota.resetAt) return false;
+      return true;
+    })
+    .map(([scope, quota]) => canonicalQuotaScope(scope, quota?.modelLabel))
+    .filter((scope, index, scopes) => scopes.indexOf(scope) === index)
     .join(",");
   if (scopedQuotaText) return `ready/${scopedQuotaText}`;
   return profile.quotaStatus === "available" ? "ready" : "unknown";
