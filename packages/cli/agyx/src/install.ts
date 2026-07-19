@@ -36,12 +36,7 @@ export function shellInit(): string {
     "    command agyx dispatch -- \"$@\"",
     "    return $?",
     "  fi",
-    "  if command -v agyx-supervisor > /dev/null 2>&1; then",
-    "    command agyx-supervisor \"$@\"",
-    "  else",
-    "    echo \"agyx: native supervisor command not found: agyx-supervisor\" >&2",
-    "    return 1",
-    "  fi",
+    "  command agyx session -- \"$@\"",
     "}",
   ].join("\n");
 }

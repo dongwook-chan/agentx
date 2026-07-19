@@ -1,12 +1,15 @@
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { runLauncher } from "@dong-/agentx-supervisor";
 import {
   nativeSupervisorBinaryName as coreNativeSupervisorBinaryName,
   nativeSupervisorHostStatus as coreNativeSupervisorHostStatus,
   NativeSupervisorHostStatus,
 } from "@dong-/agentx-core";
+import { findRealAgy, isRestartable } from "./processes.js";
+import { buildAgyLaunchArgs } from "./launch_args.js";
+import { loadState } from "./config.js";
 
 export const nativeSupervisorBinaryByHost = {
   "darwin:arm64": "agyx-supervisor-darwin-arm64",
@@ -53,46 +56,21 @@ async function executable(path: string): Promise<boolean> {
 }
 
 export async function runNativeSupervisor(args: string[]): Promise<number> {
-  const host = nativeSupervisorHostStatus();
-  if (!host.supported) {
-    throw new Error(host.message);
-  }
-
-  const binary = nativeSupervisorPath();
-  if (!await executable(binary)) {
-    throw new Error(
-      `Native supervisor binary not found: ${binary}. Run 'npm run build:native'.`,
-    );
-  }
-
-  return await new Promise((resolvePromise, reject) => {
-    const child = spawn(binary, args, {
-      cwd: process.cwd(),
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        AGYX_CLI_PATH: fileURLToPath(new URL("./cli.js", import.meta.url)),
-        AGYX_NODE_PATH: process.execPath,
-      },
-    });
-    const forward = (signal: NodeJS.Signals): void => {
-      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
-    };
-    const onSigint = (): void => forward("SIGINT");
-    const onSigterm = (): void => forward("SIGTERM");
-    process.once("SIGINT", onSigint);
-    process.once("SIGTERM", onSigterm);
-    const cleanup = (): void => {
-      process.off("SIGINT", onSigint);
-      process.off("SIGTERM", onSigterm);
-    };
-    child.on("error", (error) => {
-      cleanup();
-      reject(error);
-    });
-    child.on("exit", (code, signal) => {
-      cleanup();
-      resolvePromise(code ?? (signal ? 128 : 1));
-    });
+  const realAgy = await findRealAgy();
+  const policyCommand = fileURLToPath(new URL("./cli.js", import.meta.url));
+  return await runLauncher({
+    product: "agyx",
+    executable: realAgy,
+    args,
+    policyCommand,
+    restartable: isRestartable(args),
+    buildArgs: async ({ record, logPath }: {
+      record: { conversationId?: string };
+      logPath?: string;
+    }) => buildAgyLaunchArgs(args, {
+      conversationId: record.conversationId,
+      logPath: logPath ?? "",
+      state: await loadState(),
+    }),
   });
 }

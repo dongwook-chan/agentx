@@ -1,0 +1,42 @@
+{
+  "name": "@dong-/agentx-supervisor",
+  "version": "0.1.0",
+  "description": "Singleton session supervisor for agentx CLI wrappers",
+  "type": "module",
+  "bin": {
+    "agentx-supervisor": "src/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./src/client.js": {
+      "types": "./src/client.d.ts",
+      "default": "./src/client.js"
+    },
+    "./src/launcher.js": {
+      "types": "./src/launcher.d.ts",
+      "default": "./src/launcher.js"
+    },
+    "./src/hook.js": "./src/hook.js",
+    "./cli": "./src/cli.js"
+  },
+  "scripts": {
+    "build": "npm run check",
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/*.js"
+  },
+  "files": [
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@dong-/agentx-core": "0.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { connect } from "node:net";
+import { sendSupervisor } from "@dong-/agentx-supervisor";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,14 +45,18 @@ async function send(socketPath, payload) {
     socket.on("connect", () => socket.end(`${JSON.stringify(payload)}\n`));
     socket.on("data", (chunk) => { input += chunk; });
     socket.on("error", reject);
-    socket.on("close", () => resolve(JSON.parse(input)));
+    socket.on("close", () => {
+      if (!input) return reject(new Error(`Empty response from ${socketPath}`));
+      resolve(JSON.parse(input));
+    });
   });
 }
 
-async function readSingleSessionRecord(runDir) {
-  const entries = (await readdir(runDir)).filter((entry) => entry.endsWith(".json"));
-  assert.equal(entries.length, 1);
-  return JSON.parse(await readFile(join(runDir, entries[0]), "utf8"));
+async function readSingleSessionRecord(socketPath) {
+  const reply = await send(socketPath, { command: "sessions" });
+  const records = reply.records.filter((record) => record.product === "cdxx");
+  assert.equal(records.length, 1);
+  return records[0];
 }
 
 test("session resumes even when resume command arrives before pause loop waits", async () => {
@@ -78,6 +83,7 @@ done
     CDXX_REAL_CODEX: fakeCodex,
     CDXX_TEST_LAUNCHES: launches,
     CDXX_DISABLE_STARTUP_STATUS_PROBE: "1",
+    AGENTX_SUPERVISOR_SOCKET: join(root, "agentx", "supervisor.sock"),
   };
   const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {
     cwd: root,
@@ -99,13 +105,22 @@ done
 
     const paused = await runCli(["pause"], env);
     assert.equal(paused.code, 0, paused.stderr);
+    assert.match(paused.stdout, /Paused 1/);
+    const pausedState = await send(env.AGENTX_SUPERVISOR_SOCKET, { command: "sessions" });
+    assert.equal(pausedState.records.length, 1, JSON.stringify(pausedState));
     const resumed = await runCli(["resume"], env);
     assert.equal(resumed.code, 0, resumed.stderr);
+    assert.match(resumed.stdout, /Resumed 1/);
 
-    await waitFor(async () => {
-      const lines = (await readFile(launches, "utf8")).trim().split("\n");
-      return lines.length >= 2;
-    });
+    try {
+      await waitFor(async () => {
+        const lines = (await readFile(launches, "utf8")).trim().split("\n");
+        return lines.length >= 2;
+      });
+    } catch (error) {
+      const state = await send(env.AGENTX_SUPERVISOR_SOCKET, { command: "sessions" }).catch((sendError) => ({ sendError: String(sendError) }));
+      assert.fail(`${error.message}; stderr=${supervisorStderr}; state=${JSON.stringify(state)}`);
+    }
     assert.doesNotMatch(supervisorStderr, /Profile switch requested/);
   } finally {
     if (supervisor.exitCode === null && supervisor.signalCode === null) {
@@ -140,6 +155,7 @@ done
     CDXX_REAL_CODEX: fakeCodex,
     CDXX_TEST_LAUNCHES: launches,
     CDXX_DISABLE_STARTUP_STATUS_PROBE: "1",
+    AGENTX_SUPERVISOR_SOCKET: join(root, "agentx", "supervisor.sock"),
   };
   const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {
     cwd: root,
@@ -158,11 +174,15 @@ done
         return false;
       }
     });
-    const record = await readSingleSessionRecord(join(root, "config", "run"));
+    const record = await readSingleSessionRecord(env.AGENTX_SUPERVISOR_SOCKET);
     const socketPath = record.socketPath;
-    const paused = await send(socketPath, { command: "pause", reason: "profile-switch" });
+    const paused = await sendSupervisor({ command: "pause", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath });
     assert.equal(paused.ok, true);
-    const resumed = await send(socketPath, { command: "resume", reason: "profile-switch" });
+    await waitFor(async () => {
+      const status = await sendSupervisor({ command: "status", launcherId: record.launcherId }, { socketPath }).catch(() => undefined);
+      return status?.record && !status.record.childPid;
+    });
+    const resumed = await sendSupervisor({ command: "resume", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath });
     assert.equal(resumed.ok, true);
 
     await waitFor(async () =>

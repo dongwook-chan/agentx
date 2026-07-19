@@ -7,9 +7,9 @@ import { join } from "node:path";
 import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
 import { clearExpiredQuota, effectiveYoloMode, eventLogPath, loadState, profilesDir, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
-import { installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
+import { codexHooksPath, installCodexHooks, installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
-import { pauseAll, resumeAll, sessionRecords, withPausedAuthSwitch } from "./managed_sessions.js";
+import { pauseAll, resumeAll, resumeManaged, sessionRecords, withPausedAuthSwitch } from "./managed_sessions.js";
 import { findRealCodex } from "./processes.js";
 import { profileSelectableReason } from "./selection.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
@@ -353,6 +353,7 @@ async function printStatus() {
   console.log(`yolo: ${effectiveYoloMode(state) ? "on" : "off"}`);
   console.log(`real codex: ${await findRealCodex().catch(() => "(not found)")}`);
   console.log(`shell integration file: ${shellIntegrationPath()}`);
+  console.log(`codex hooks file: ${codexHooksPath()}`);
   console.log(`supervised sessions: ${(await sessionRecords()).length}`);
 }
 
@@ -530,8 +531,7 @@ async function runWrapperCommand(command, args) {
       return 0;
     }
     case "resume": {
-      const records = await sessionRecords();
-      await resumeAll(records);
+      const records = await resumeManaged();
       console.log(`Resumed ${records.length} supervised session(s).`);
       return 0;
     }
@@ -601,6 +601,7 @@ async function main() {
     case "install": {
       const path = await installShellIntegration();
       console.log(`Installed codex shell function in ${path}`);
+      console.log(`Installed Codex session hooks in ${await installCodexHooks()}`);
       console.log(`Run: source ${path}`);
       return 0;
     }
@@ -647,8 +648,7 @@ async function main() {
       return 0;
     }
     case "resume": {
-      const records = await sessionRecords();
-      await resumeAll(records);
+      const records = await resumeManaged();
       console.log(`Resumed ${records.length} supervised session(s).`);
       return 0;
     }

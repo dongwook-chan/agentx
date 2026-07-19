@@ -2,6 +2,7 @@ import { QuotaScope } from "./quota.js";
 
 export interface SessionRecord {
   id: string;
+  launcherId?: string;
   pid: number;
   childPid?: number;
   cwd: string;

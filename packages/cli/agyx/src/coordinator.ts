@@ -53,6 +53,7 @@ import {
   shouldAutoSwitchAfterQuota,
 } from "./selection.js";
 import { SessionRecord } from "./session_record.js";
+import { supervisorRequest } from "@dong-/agentx-supervisor";
 
 interface SessionReply {
   ok: boolean;
@@ -141,6 +142,13 @@ async function send(socketPath: string, command: string, payload: Record<string,
 }
 
 export async function sessionRecords(): Promise<SessionRecord[]> {
+  try {
+    const reply = await supervisorRequest({ command: "sessions" });
+    const records = (reply.records ?? []).filter((record: SessionRecord & { product?: string }) => record.product === "agyx");
+    if (records.length) return records;
+  } catch {
+    // Fall back to legacy per-session records during upgrades.
+  }
   await ensureDirectories();
   const entries = await readdir(runtimeDir);
   const records: SessionRecord[] = [];
@@ -240,6 +248,14 @@ function sessionControlAdapter(options: { reason?: string } = {}): SessionContro
   return {
     sessionRecords,
     pause: async (record) => {
+      if ((record as SessionRecord & { launcherId?: string }).launcherId) {
+        const reply = await supervisorRequest({
+          command: "pause",
+          launcherId: (record as SessionRecord & { launcherId?: string }).launcherId,
+          reason: options.reason,
+        });
+        return reply.record as SessionRecord;
+      }
       const reply = await send(record.socketPath, "pause", { reason: options.reason });
       if (!reply.ok) {
         if (!reply.error?.includes("Unexpected non-whitespace character after JSON")) {
@@ -260,6 +276,14 @@ function sessionControlAdapter(options: { reason?: string } = {}): SessionContro
       if (unmanaged.length) await stopProcesses(unmanaged);
     },
     resume: async (record) => {
+      if ((record as SessionRecord & { launcherId?: string }).launcherId) {
+        await supervisorRequest({
+          command: "resume",
+          launcherId: (record as SessionRecord & { launcherId?: string }).launcherId,
+          reason: options.reason,
+        });
+        return;
+      }
       const reply = await send(record.socketPath, "resume", { reason: options.reason });
       if (!reply.ok) throw new Error(reply.error);
     },
@@ -288,7 +312,10 @@ export async function pauseAll(): Promise<SessionRecord[]> {
 }
 
 export async function resumeAll(records: SessionRecord[]): Promise<void> {
-  await resumeAllSessions(sessionControlAdapter(), records);
+  const managed = records.filter((record) => (record as SessionRecord & { launcherId?: string }).launcherId);
+  const legacy = records.filter((record) => !(record as SessionRecord & { launcherId?: string }).launcherId);
+  if (managed.length) await supervisorRequest({ command: "resume-all", product: "agyx" });
+  if (legacy.length) await resumeAllSessions(sessionControlAdapter(), legacy);
 }
 
 export interface ProfileCaptureResult {

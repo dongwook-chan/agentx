@@ -6,13 +6,13 @@ import {
   mkdir,
   mkdtemp,
   readFile,
-  readdir,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { sendSupervisor } from "@dong-/agentx-supervisor";
 
 async function waitFor(
   predicate: () => Promise<boolean>,
@@ -94,6 +94,7 @@ while :; do sleep 1; done
     AGYX_REAL_AGY: fakeAgy,
     AGYX_TEST_LAUNCHES: launches,
     AGYX_SKIP_UNMANAGED_AGY_STOP: "1",
+    AGENTX_SUPERVISOR_SOCKET: join(root, "agentx", "supervisor.sock"),
   };
   const supervisor = spawn(
     process.execPath,
@@ -113,10 +114,9 @@ while :; do sleep 1; done
     assert.equal(paused.code, 0, paused.stderr);
     assert.match(paused.stdout, /Paused 1 supervised session/);
 
-    const runtime = join(root, "config", "run");
-    const recordName = (await readdir(runtime)).find((name) => name.endsWith(".json"));
-    assert.ok(recordName);
-    const record = JSON.parse(await readFile(join(runtime, recordName), "utf8"));
+    const sessions = await sendSession(environment.AGENTX_SUPERVISOR_SOCKET, { command: "sessions" }) as { ok: boolean; records: Array<Record<string, unknown>> };
+    const record = sessions.records.find((entry) => entry.product === "agyx");
+    assert.ok(record);
     assert.equal(record.paused, true);
     assert.equal(record.conversationId, conversation);
 
@@ -158,6 +158,7 @@ while :; do sleep 1; done
     AGYX_REAL_AGY: fakeAgy,
     AGYX_TEST_LAUNCHES: launches,
     AGYX_SKIP_UNMANAGED_AGY_STOP: "1",
+    AGENTX_SUPERVISOR_SOCKET: join(root, "agentx", "supervisor.sock"),
   };
   const supervisor = spawn(
     process.execPath,
@@ -173,14 +174,16 @@ while :; do sleep 1; done
       try { return (await readFile(launches, "utf8")).trim().split("\n").length === 1; }
       catch { return false; }
     });
-    const runtime = join(root, "config", "run");
-    const recordName = (await readdir(runtime)).find((name) => name.endsWith(".json"));
-    assert.ok(recordName);
-    const record = JSON.parse(await readFile(join(runtime, recordName), "utf8"));
-    const socketPath = record.socketPath as string;
-    const paused = await sendSession(socketPath, { command: "pause", reason: "profile-switch" });
+    const sessions = await sendSession(environment.AGENTX_SUPERVISOR_SOCKET, { command: "sessions" }) as { ok: boolean; records: Array<Record<string, unknown>> };
+    const record = sessions.records.find((entry) => entry.product === "agyx");
+    assert.ok(record);
+    const paused = await sendSupervisor({ command: "pause", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath: environment.AGENTX_SUPERVISOR_SOCKET });
     assert.equal(paused.ok, true);
-    const resumed = await sendSession(socketPath, { command: "resume", reason: "profile-switch" });
+    await waitFor(async () => {
+      const status = await sendSupervisor({ command: "status", launcherId: record.launcherId }, { socketPath: environment.AGENTX_SUPERVISOR_SOCKET });
+      return Boolean(status.record && !(status.record as { childPid?: number }).childPid);
+    });
+    const resumed = await sendSupervisor({ command: "resume", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath: environment.AGENTX_SUPERVISOR_SOCKET });
     assert.equal(resumed.ok, true);
 
     await waitFor(async () =>

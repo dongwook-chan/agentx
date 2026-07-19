@@ -6,6 +6,7 @@ import { connect } from "node:net";
 import { join } from "node:path";
 import { ensureConfig, runtimeDir } from "./config.js";
 import { withAuthSwitchLock } from "./lock.js";
+import { supervisorRequest } from "@dong-/agentx-supervisor";
 
 const defaultSessionSocketTimeoutMs = 5000;
 const execFileAsync = promisify(execFile);
@@ -147,6 +148,13 @@ export async function currentManagedSessionRecord(records = undefined) {
 }
 
 export async function sessionRecords() {
+  try {
+    const records = (await supervisorRequest({ command: "sessions" })).records
+      .filter((record) => record.product === "cdxx");
+    if (records.length) return records;
+  } catch {
+    // Fall back to legacy per-session records during upgrades.
+  }
   await ensureConfig();
   const entries = await readdir(runtimeDir).catch((error) => {
     if (error?.code === "ENOENT") return [];
@@ -171,11 +179,19 @@ export function sessionControlAdapter(options = {}) {
   return {
     sessionRecords: options.sessionRecords ?? sessionRecords,
     pause: async (record) => {
+      if (record.launcherId) {
+        const reply = await supervisorRequest({ command: "pause", launcherId: record.launcherId, reason: options.reason });
+        return reply.record ?? { ...record, childPid: undefined, paused: true };
+      }
       const reply = await send(record.socketPath, "pause", { reason: options.reason }, options);
       if (!reply.ok) throw new Error(reply.error ?? `Failed to pause ${record.id}`);
       return reply.record ?? { ...record, childPid: undefined, paused: true };
     },
     resume: async (record) => {
+      if (record.launcherId) {
+        await supervisorRequest({ command: "resume", launcherId: record.launcherId, reason: options.reason });
+        return;
+      }
       const reply = await send(record.socketPath, "resume", { reason: options.reason }, options);
       if (!reply.ok) throw new Error(reply.error ?? `Failed to resume ${record.id}`);
     },
@@ -190,7 +206,22 @@ export async function pauseAll() {
 }
 
 export async function resumeAll(records) {
-  await resumeAllSessions(sessionControlAdapter(), records);
+  const managed = records.filter((record) => record.launcherId);
+  const legacy = records.filter((record) => !record.launcherId);
+  if (managed.length) {
+    await supervisorRequest({ command: "resume-all", product: "cdxx" });
+  }
+  if (legacy.length) await resumeAllSessions(sessionControlAdapter(), legacy);
+}
+
+export async function resumeManaged() {
+  try {
+    return (await supervisorRequest({ command: "resume-all", product: "cdxx" })).records ?? [];
+  } catch {
+    const records = await sessionRecords();
+    await resumeAll(records);
+    return records;
+  }
 }
 
 export async function withPausedAuthSwitch(operation, options = {}) {

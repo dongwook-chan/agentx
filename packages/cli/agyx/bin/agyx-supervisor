@@ -1,35 +1,3 @@
 #!/bin/sh
 set -eu
-
-case "$(uname -s):$(uname -m)" in
-  Darwin:arm64|Darwin:aarch64)
-    target="agyx-supervisor-darwin-arm64"
-    ;;
-  Linux:arm64|Linux:aarch64)
-    target="agyx-supervisor-linux-arm64"
-    ;;
-  *)
-    echo "agyx: unsupported supervisor host: $(uname -s)/$(uname -m)" >&2
-    exit 1
-    ;;
-esac
-
-script=$0
-while [ -L "$script" ]; do
-  link=$(readlink "$script")
-  case "$link" in
-    /*) script=$link ;;
-    *) script=$(dirname -- "$script")/$link ;;
-  esac
-done
-
-directory=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd)
-binary="$directory/$target"
-
-if [ -x "$binary" ]; then
-  exec "$binary" "$@"
-fi
-
-echo "agyx: native supervisor binary not found: $binary" >&2
-echo "agyx: run 'npm run build:native --workspace agyx' from the agentx checkout." >&2
-exit 1
+exec agyx session -- "$@"

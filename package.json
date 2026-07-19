@@ -6,12 +6,13 @@
   "workspaces": [
     "packages/core",
     "packages/contracts",
+    "packages/supervisor",
     "packages/cli/agyx",
     "packages/cli/cdxx"
   ],
   "scripts": {
-    "build": "npm run build --workspace @dong-/agentx-core && npm run build --workspace agyx",
-    "test": "npm run test --workspace @dong-/agentx-contracts && npm run test --workspace @dong-/cdxx && npm run test --workspace agyx",
+    "build": "npm run build --workspace @dong-/agentx-core && npm run build --workspace @dong-/agentx-supervisor && npm run build --workspace agyx",
+    "test": "npm run test --workspace @dong-/agentx-contracts && npm run test --workspace @dong-/agentx-supervisor && npm run test --workspace @dong-/cdxx && npm run test --workspace agyx",
     "check": "npm run check --workspace @dong-/cdxx",
     "check:native-package": "npm run check:native-package --workspace @dong-/cdxx && npm run check:native-package --workspace agyx",
     "prepack": "npm run build && npm run check && npm test && npm run check:native-package"
