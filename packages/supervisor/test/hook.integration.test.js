@@ -43,3 +43,31 @@ test("SessionStart hook binds exact Codex session id and transcript to launcher"
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("stale launchers are pruned without failing pause", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentx-supervisor-stale-"));
+  const socketPath = join(root, "supervisor.sock");
+  const daemon = new SupervisorDaemon({ socketPath, statePath: join(root, "state.json") });
+  await daemon.start();
+  try {
+    daemon.sessions.set("stale", {
+      launcherId: "stale",
+      product: "agyx",
+      launcherPid: 2_147_483_647,
+      childPid: 2_147_483_646,
+      cwd: "/tmp",
+      args: [],
+      startedAt: new Date().toISOString(),
+      paused: false,
+      scope: "unknown",
+    });
+    const paused = await sendSupervisor({ command: "pause", launcherId: "stale" }, { socketPath });
+    assert.equal(paused.ok, true);
+    assert.equal(paused.stale, true);
+    const sessions = await sendSupervisor({ command: "sessions" }, { socketPath });
+    assert.deepEqual(sessions.records, []);
+  } finally {
+    await daemon.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

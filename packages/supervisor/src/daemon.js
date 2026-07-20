@@ -7,6 +7,16 @@ import { productConfigDir, supervisorSocketPath, supervisorStatePath } from "./p
 
 function nowIso() { return new Date().toISOString(); }
 
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) {
+    if (error?.code === "EPERM") return true;
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
 export class SupervisorDaemon {
   constructor(options = {}) {
     this.socketPath = options.socketPath ?? supervisorSocketPath();
@@ -166,9 +176,17 @@ export class SupervisorDaemon {
         await this.persist();
         return { ok: true };
       }
-      case "sessions": return { ok: true, records: [...this.sessions.values()].map((entry) => this.publicRecord(entry)) };
+      case "sessions": {
+        await this.pruneStaleSessions();
+        return { ok: true, records: [...this.sessions.values()].map((entry) => this.publicRecord(entry)) };
+      }
       case "status": {
         const session = this.sessions.get(request.launcherId);
+        if (session && !processAlive(session.launcherPid)) {
+          this.sessions.delete(request.launcherId);
+          await this.persist();
+          return { ok: false, error: "session not found" };
+        }
         return session ? { ok: true, record: this.publicRecord(session) } : { ok: false, error: "session not found" };
       }
       case "pause": return await this.commandLauncher(request.launcherId, "pause", request.reason);
@@ -189,13 +207,22 @@ export class SupervisorDaemon {
   async commandLauncher(launcherId, command, reason) {
     const session = this.sessions.get(launcherId);
     if (!session) throw new Error(`Unknown launcher: ${launcherId}`);
+    if (!processAlive(session.launcherPid)) {
+      this.sessions.delete(launcherId);
+      await this.persist();
+      return { ok: true, stale: true, record: { ...this.publicRecord(session), childPid: undefined, paused: true } };
+    }
     if (command === "resume" && session.paused && !session.childPid) {
       session.reason = reason;
       session.paused = false;
       await this.persist();
       try { process.kill(session.launcherPid, "SIGCONT"); }
       catch (error) {
-        if (error?.code === "ESRCH") this.sessions.delete(launcherId);
+        if (error?.code === "ESRCH") {
+          this.sessions.delete(launcherId);
+          await this.persist();
+          return { ok: true, stale: true, record: { ...this.publicRecord(session), childPid: undefined, paused: true } };
+        }
         throw error;
       }
       session.quotaHandled = false;
@@ -207,7 +234,11 @@ export class SupervisorDaemon {
     session.reason = reason;
     try { process.kill(session.launcherPid, signal); }
     catch (error) {
-      if (error?.code === "ESRCH") this.sessions.delete(launcherId);
+      if (error?.code === "ESRCH") {
+        this.sessions.delete(launcherId);
+        await this.persist();
+        return { ok: true, stale: true, record: { ...this.publicRecord(session), childPid: undefined, paused: true } };
+      }
       throw error;
     }
     session.paused = command === "pause";
@@ -230,7 +261,18 @@ export class SupervisorDaemon {
     await rename(temporary, this.statePath);
   }
 
+  async pruneStaleSessions() {
+    let changed = false;
+    for (const [launcherId, session] of this.sessions) {
+      if (processAlive(session.launcherPid)) continue;
+      this.sessions.delete(launcherId);
+      changed = true;
+    }
+    if (changed) await this.persist();
+  }
+
   async tick() {
+    await this.pruneStaleSessions();
     for (const session of this.sessions.values()) {
       try { await this.scan(session); }
       catch (error) { await this.logEvent(session.product, { event: "supervisor.scan.failed", launcherId: session.launcherId, error: error?.message ?? String(error) }); }
