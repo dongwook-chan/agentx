@@ -83,6 +83,7 @@ done
     CDXX_REAL_CODEX: fakeCodex,
     CDXX_TEST_LAUNCHES: launches,
     CDXX_DISABLE_STARTUP_STATUS_PROBE: "1",
+    CDXX_INTEGRATION_MODE: "hooks",
     AGENTX_SUPERVISOR_SOCKET: join(root, "agentx", "supervisor.sock"),
   };
   const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {
@@ -155,6 +156,7 @@ done
     CDXX_REAL_CODEX: fakeCodex,
     CDXX_TEST_LAUNCHES: launches,
     CDXX_DISABLE_STARTUP_STATUS_PROBE: "1",
+    CDXX_INTEGRATION_MODE: "hooks",
     AGENTX_SUPERVISOR_SOCKET: join(root, "agentx", "supervisor.sock"),
   };
   const supervisor = spawn(process.execPath, [cliPath, "session", "--"], {

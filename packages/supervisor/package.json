@@ -20,6 +20,7 @@
       "default": "./src/launcher.js"
     },
     "./src/hook.js": "./src/hook.js",
+    "./src/json_rpc_proxy.js": "./src/json_rpc_proxy.js",
     "./cli": "./src/cli.js"
   },
   "scripts": {
@@ -34,7 +35,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@dong-/agentx-core": "0.1.0"
+    "@dong-/agentx-core": "0.1.0",
+    "ws": "^8.21.2"
   },
   "engines": {
     "node": ">=20"

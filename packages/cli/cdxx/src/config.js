@@ -50,9 +50,17 @@ export function emptyState() {
       autoswitch: false,
       yolo: true,
     },
+    codexIntegration: undefined,
     profiles: [],
     sessions: {},
   };
+}
+
+export async function saveCodexIntegration(integration) {
+  const state = await loadState();
+  state.codexIntegration = integration;
+  await saveState(state);
+  return integration;
 }
 
 export function effectiveYoloMode(state) {

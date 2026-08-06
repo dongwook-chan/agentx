@@ -255,3 +255,15 @@ test("pickNextProfile starts at first profile when active profile is missing", (
 
   assert.equal(pickNextProfile(state).name, "a");
 });
+
+test("pickNextProfile never returns the current profile", () => {
+  const state = {
+    activeProfile: "a",
+    profiles: [
+      { name: "a", quotaStatus: "available" },
+      { name: "b", quotaStatus: "exhausted", quotaResetAt: "2099-01-01T00:00:00.000Z" },
+    ],
+  };
+
+  assert.equal(pickNextProfile(state), undefined);
+});

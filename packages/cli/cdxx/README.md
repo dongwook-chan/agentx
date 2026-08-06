@@ -11,7 +11,7 @@ logging in, or rebuilding prompt context by hand.
 It provides:
 
 - local Codex auth profile save/use/next
-- quota refresh from Codex `/status`, with JSONL quota events as the live trigger
+- quota refresh from Codex `/status`, with app-server events as the live trigger
 - shell integration so `codex` runs through the cdxx dispatcher
 - a Rust native supervisor for wrapped Codex TUI processes
 - live autoswitch and `codex resume <session_id>` failover when a profile reaches quota
@@ -23,6 +23,13 @@ npm install -g @dong-/cdxx
 cdxx install
 source ~/.zshrc
 ```
+
+Installation capability-detects the installed Codex CLI. When `--remote` and a
+listen-capable `codex app-server` are available, `cdxx` uses a persistent local
+app-server and a thin per-session proxy. If that transport is unavailable,
+installation asks before adding lifecycle hooks to `~/.codex/hooks.json`. If
+hook installation is declined, only the agentx Codex integration is disabled;
+the regular Codex CLI remains usable.
 
 For the current terminal only:
 
@@ -145,11 +152,11 @@ By default, `scan` records the active profile's 5-hour and weekly quota windows
 and reset times from the current `/status` result. Use `--no-record` only when
 you want a dry run. Use `--all` to run isolated `/status` probes for every saved
 profile and record their reset windows without replacing the active auth file.
-`--jsonl` remains available as a diagnostic fallback for local transcript
-scanning. Codex `/status` can briefly lag right after a fresh TUI starts or a
-quota event, so live quota exhaustion is still triggered from appended JSONL
-events; `/status` is the preferred refresh source for current windows and
-`resetAt` when it is available.
+`--jsonl` remains available as an explicit diagnostic command for local
+transcript scanning. Codex `/status` can briefly lag right after a fresh TUI
+starts or a quota event, so remote sessions use app-server rate-limit and turn
+failure notifications as the live trigger; `/status` remains the preferred
+refresh source for current windows and `resetAt` when it is available.
 
 `cdxx` defaults to yolo mode for supervised Codex sessions. It injects Codex's
 own dangerous flag, `--dangerously-bypass-approvals-and-sandbox`, unless you
@@ -164,17 +171,15 @@ codex x config yolo off
 The `agy` flag `--dangerously-skip-permissions` is rejected when passed through
 `cdxx`; it is not a Codex option.
 
-After a wrapped session exits, `cdxx` scans new or modified Codex transcripts
-and records rate-limit status on the active profile. Enable live profile
-failover:
+Enable live profile failover:
 
 ```bash
 codex x config autoswitch on
 ```
 
-With autoswitch enabled, the Rust supervisor tails the matched Codex transcript
-by byte offset. If Codex reports an exhausted rate limit, `cdxx` switches to the
-next available saved profile and the supervisor starts
+With autoswitch enabled, the supervisor observes app-server events (or the
+approved hook transcript in compatibility mode). If Codex reports an exhausted
+rate limit, `cdxx` switches to the next available saved profile and starts
 `codex resume <session_id>` from the same working directory.
 
 Non-interactive commands such as `codex exec`, `codex review`, `codex login`,
@@ -184,24 +189,23 @@ If every saved profile is disabled, exhausted, or otherwise not selectable,
 `cdxx` prints a stop message and suppresses further failover attempts for that
 quota event.
 
-## Session matching
+## Session identity
 
-Codex does not expose an `agy --log-file` style TUI transcript path option.
-`cdxx` matches the child session from Codex's real transcript files instead:
+For supported Codex versions, the TUI connects through a Unix-socket proxy to a
+persistent Codex app-server. The proxy forwards traffic unchanged and records
+`result.thread.sessionId` from the TUI's own `thread/start`, `thread/resume`, or
+`thread/fork` response. It does not create an extra thread, issue an extra
+resume, or scan `$CODEX_HOME/sessions`.
 
-1. Snapshot `$CODEX_HOME/sessions/**/*.jsonl` immediately before launching Codex.
-2. Poll new or modified JSONL files while Codex runs.
-3. Read only the first `session_meta` record and match:
-   `payload.cwd == process.cwd()`, `payload.originator == "codex-tui"`, and
-   `payload.timestamp >= launchTime - 5s`.
-4. Tail the matched JSONL file from the pre-launch file size, so runtime quota
-   checks depend only on newly appended log bytes.
-
-The matched `payload.session_id`/`payload.id` is suitable for `codex resume`.
+The shared agentx launcher only exposes an optional transport-adapter lifecycle.
+The Codex JSON-RPC adapter owns the proxy behavior, while `agyx` keeps its
+existing single-log-path adapter and conversation-ID parser.
 
 ## Notes
 
-- `cdxx` reads Codex JSONL transcripts but does not print prompts or responses.
+- Remote-mode supervision does not read Codex JSONL transcripts. Explicit
+  `codex x scan --jsonl` and approved hook compatibility mode can still read
+  transcript metadata and quota events.
 - A profile is treated as exhausted when Codex reports 5-hour
   `primary.used_percent >= 100`, weekly `secondary.used_percent >= 100`, or a
   non-null `rate_limit_reached_type`.

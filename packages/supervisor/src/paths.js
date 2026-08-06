@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export function productConfigDir(product) {
   if (product === "agyx") {
@@ -26,5 +26,9 @@ export function supervisorSocketPath() {
 }
 
 export function supervisorStatePath() {
+  if (process.env.AGENTX_SUPERVISOR_STATE) return process.env.AGENTX_SUPERVISOR_STATE;
+  if (process.env.AGENTX_SUPERVISOR_SOCKET) {
+    return join(dirname(process.env.AGENTX_SUPERVISOR_SOCKET), "supervisor.json");
+  }
   return join(supervisorRuntimeDir(), "supervisor.json");
 }

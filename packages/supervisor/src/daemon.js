@@ -1,8 +1,9 @@
 import { appendFile, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { spawn } from "node:child_process";
-import { detectAgyConversation, parseAgyModelLine, parseAgyQuotaLine, parseCodexQuotaLine, recordAgyQuota } from "./quota.js";
+import { activeProfile, detectAgyConversation, parseAgyModelLine, parseAgyQuotaLine, parseCodexProtocolMessage, parseCodexQuotaLine, recordAgyQuota } from "./quota.js";
 import { productConfigDir, supervisorSocketPath, supervisorStatePath } from "./paths.js";
 
 function nowIso() { return new Date().toISOString(); }
@@ -25,12 +26,16 @@ export class SupervisorDaemon {
     this.failover = options.failover ?? this.runFailover.bind(this);
     this.timer = undefined;
     this.server = undefined;
+    this.tickRunning = false;
+    this.persistQueue = Promise.resolve();
+    this.persistSequence = 0;
   }
 
   async start() {
     const runtime = dirname(this.socketPath);
     await mkdir(runtime, { recursive: true, mode: 0o700 });
     await chmod(runtime, 0o700).catch(() => undefined);
+    await this.restore();
     await rm(this.socketPath, { force: true });
     this.server = createServer((socket) => this.handleSocket(socket));
     await new Promise((resolve, reject) => {
@@ -46,11 +51,11 @@ export class SupervisorDaemon {
     this.timer.unref?.();
   }
 
-  async close() {
+  async close(options = {}) {
     if (this.timer) clearInterval(this.timer);
     if (this.server) await new Promise((resolve) => this.server.close(resolve));
     await rm(this.socketPath, { force: true });
-    await rm(this.statePath, { force: true });
+    if (!options.preserveState) await rm(this.statePath, { force: true });
   }
 
   handleSocket(socket) {
@@ -90,13 +95,36 @@ export class SupervisorDaemon {
       restartable: true,
       startedAt: session.startedAt,
       codexSessionId: session.sessionId,
+      codexThreadId: session.threadId,
       conversationId: session.conversationId,
       transcriptPath: session.transcriptPath,
       logPath: session.logPath,
       currentModelLabel: session.modelLabel,
       currentQuotaScope: session.scope,
+      profileName: session.profileName,
+      codexHome: session.codexHome,
+      offset: session.offset,
+      identityMode: session.identityMode,
       reason: session.reason,
     };
+  }
+
+  async restore() {
+    const state = JSON.parse(await readFile(this.statePath, "utf8").catch(() => "{}"));
+    for (const record of state.sessions ?? []) {
+      if (!record.launcherId || !processAlive(record.launcherPid)) continue;
+      const session = {
+        ...record,
+        launcherId: record.launcherId,
+        profileName: record.profileName ?? await activeProfile(record.product),
+        codexHome: record.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+        offset: record.offset ?? 0,
+        carry: "",
+        quotaHandled: false,
+        scope: record.currentQuotaScope ?? "unknown",
+      };
+      this.sessions.set(session.launcherId, session);
+    }
   }
 
   async handle(request) {
@@ -118,6 +146,7 @@ export class SupervisorDaemon {
           sessionId: request.sessionId ?? existing.sessionId,
           conversationId: request.conversationId ?? existing.conversationId,
           profileName: request.profileName ?? existing.profileName,
+          codexHome: request.codexHome ?? existing.codexHome,
           policyCommand: request.policyCommand ?? existing.policyCommand,
           startedAt: existing.startedAt ?? nowIso(),
           paused: false,
@@ -126,6 +155,7 @@ export class SupervisorDaemon {
           quotaHandled: false,
           modelLabel: existing.modelLabel,
           scope: existing.scope ?? "unknown",
+          identityMode: request.identityMode ?? existing.identityMode,
         };
         this.sessions.set(session.launcherId, session);
         await this.persist();
@@ -135,6 +165,7 @@ export class SupervisorDaemon {
         const session = request.launcherId ? this.sessions.get(request.launcherId) : undefined;
         if (!session) return { ok: true, registered: false };
         if (request.sessionId) session.sessionId = request.sessionId;
+        if (request.threadId) session.threadId = request.threadId;
         if (request.transcriptPath) {
           const changed = session.transcriptPath !== request.transcriptPath;
           session.transcriptPath = request.transcriptPath;
@@ -146,6 +177,29 @@ export class SupervisorDaemon {
         if (request.cwd) session.cwd = request.cwd;
         await this.persist();
         return { ok: true, registered: true, record: this.publicRecord(session) };
+      }
+      case "identity": {
+        const session = request.launcherId ? this.sessions.get(request.launcherId) : undefined;
+        if (!session) return { ok: true, registered: false };
+        if (request.sessionId) session.sessionId = request.sessionId;
+        if (request.threadId) session.threadId = request.threadId;
+        if (request.conversationId) session.conversationId = request.conversationId;
+        if (request.transcriptPath) session.transcriptPath = request.transcriptPath;
+        if (request.cwd) session.cwd = request.cwd;
+        await this.persist();
+        return { ok: true, registered: true, record: this.publicRecord(session) };
+      }
+      case "observe": {
+        const session = request.launcherId ? this.sessions.get(request.launcherId) : undefined;
+        if (!session) return { ok: true, registered: false };
+        void this.observe(session, request.message).catch(async (error) => {
+          await this.logEvent(session.product, {
+            event: "supervisor.observe.failed",
+            launcherId: session.launcherId,
+            error: error?.message ?? String(error),
+          });
+        });
+        return { ok: true, registered: true };
       }
       case "child": {
         const session = this.sessions.get(request.launcherId);
@@ -255,10 +309,24 @@ export class SupervisorDaemon {
   }
 
   async persist() {
-    const temporary = `${this.statePath}.${process.pid}.tmp`;
+    // Socket requests and the polling loop can persist concurrently. Reusing one
+    // PID-based temporary path lets one writer rename another writer's file,
+    // producing ENOENT and aborting quota failover after auth is switched.
+    const sequence = ++this.persistSequence;
     const value = { pid: process.pid, socketPath: this.socketPath, startedAt: nowIso(), sessions: [...this.sessions.values()].map((entry) => this.publicRecord(entry)) };
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-    await rename(temporary, this.statePath);
+    const write = async () => {
+      const temporary = `${this.statePath}.${process.pid}.${sequence}.tmp`;
+      try {
+        await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+        await rename(temporary, this.statePath);
+      } catch (error) {
+        await rm(temporary, { force: true }).catch(() => undefined);
+        throw error;
+      }
+    };
+    const pending = this.persistQueue.then(write, write);
+    this.persistQueue = pending.catch(() => undefined);
+    await pending;
   }
 
   async pruneStaleSessions() {
@@ -272,10 +340,16 @@ export class SupervisorDaemon {
   }
 
   async tick() {
-    await this.pruneStaleSessions();
-    for (const session of this.sessions.values()) {
-      try { await this.scan(session); }
-      catch (error) { await this.logEvent(session.product, { event: "supervisor.scan.failed", launcherId: session.launcherId, error: error?.message ?? String(error) }); }
+    if (this.tickRunning) return;
+    this.tickRunning = true;
+    try {
+      await this.pruneStaleSessions();
+      for (const session of this.sessions.values()) {
+        try { await this.scan(session); }
+        catch (error) { await this.logEvent(session.product, { event: "supervisor.scan.failed", launcherId: session.launcherId, error: error?.message ?? String(error) }); }
+      }
+    } finally {
+      this.tickRunning = false;
     }
   }
 
@@ -315,20 +389,40 @@ export class SupervisorDaemon {
         if (quota && !session.quotaHandled) {
           session.quotaHandled = true;
           await this.failover(session, quota);
+          // One Codex failure commonly emits both token_count and task_complete
+          // records. The failover restarts the child and resets quotaHandled
+          // while this batch is still being scanned, so do not process the
+          // second record as a new failure.
+          break;
         }
       }
     }
     await this.persist();
   }
 
+  async observe(session, message) {
+    if (session.product !== "cdxx") return;
+    const quota = parseCodexProtocolMessage(message);
+    if (!quota || session.quotaHandled) return;
+    session.quotaHandled = true;
+    await this.persist();
+    await this.failover(session, quota);
+  }
+
   async runFailover(session, event) {
     const command = session.policyCommand ? process.execPath : (session.product === "agyx" ? "agyx" : "cdxx");
     const args = session.product === "agyx"
       ? ["_auto-next", event.scope ?? "unknown"]
-      : ["_supervisor-failover", Buffer.from(JSON.stringify({ profileName: session.profileName, sessionId: session.sessionId, ...event })).toString("base64")];
+      : ["_supervisor-failover", Buffer.from(JSON.stringify({ profileName: session.profileName, sessionId: session.threadId ?? session.sessionId, ...event })).toString("base64")];
     const launchArgs = session.policyCommand ? [session.policyCommand, ...args] : args;
     const output = await new Promise((resolve, reject) => {
-      const child = spawn(command, launchArgs, { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+      const child = spawn(command, launchArgs, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          ...(session.product === "cdxx" && session.codexHome ? { CODEX_HOME: session.codexHome } : {}),
+        },
+      });
       const stdout = [];
       const stderr = [];
       child.stdout.on("data", (chunk) => stdout.push(chunk));
@@ -350,7 +444,8 @@ export async function runDaemon() {
   const daemon = new SupervisorDaemon();
   await daemon.start();
   const stop = async () => {
-    await daemon.close();
+    // Keep launcher registrations so a restarted daemon can resume supervision.
+    await daemon.close({ preserveState: true });
     process.exit(0);
   };
   process.on("SIGINT", stop);

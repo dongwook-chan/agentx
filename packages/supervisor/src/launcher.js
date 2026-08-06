@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { supervisorRequest } from "./client.js";
@@ -8,7 +9,7 @@ import { productConfigDir } from "./paths.js";
 
 function launcherId(product) { return `${product}-${process.pid}-${randomBytes(6).toString("hex")}`; }
 
-export async function runLauncher({ product, executable, args, buildArgs, restartable = true, socketPath, policyCommand }) {
+export async function runLauncher({ product, executable, args, buildArgs, restartable = true, socketPath, policyCommand, identityMode, createTransport }) {
   const id = launcherId(product);
   const cwd = process.cwd();
   let child;
@@ -30,15 +31,43 @@ export async function runLauncher({ product, executable, args, buildArgs, restar
     logPath = join(logs, `session-${id}.log`);
   }
   const request = (payload) => supervisorRequest(payload, socketPath ? { socketPath } : {});
-  await request({ command: "register", product, launcherId: id, launcherPid: process.pid, cwd, args, logPath, policyCommand, profileName: await activeProfile(product) });
+  const initialProfileName = await activeProfile(product);
+  await request({
+    command: "register",
+    product,
+    launcherId: id,
+    launcherPid: process.pid,
+    cwd,
+    args,
+    logPath,
+    policyCommand,
+    profileName: initialProfileName,
+    codexHome: product === "cdxx" ? (process.env.CODEX_HOME ?? join(homedir(), ".codex")) : undefined,
+    identityMode,
+  });
+  let transport;
+  try {
+    transport = createTransport ? await createTransport({
+      product,
+      launcherId: id,
+      cwd,
+      args,
+      request,
+      profileName: initialProfileName,
+    }) : undefined;
+  } catch (error) {
+    await request({ command: "unregister", launcherId: id }).catch(() => undefined);
+    throw error;
+  }
 
   const launch = async () => {
     launchGeneration += 1;
     const generation = launchGeneration;
     const status = await request({ command: "status", launcherId: id });
     const record = status.record;
-    currentArgs = await buildArgs({ originalArgs: args, currentArgs, record, logPath });
     const profileName = await activeProfile(product);
+    await transport?.beforeLaunch?.({ record, generation, profileName });
+    currentArgs = await buildArgs({ originalArgs: args, currentArgs, record, logPath, transport });
     child = spawn(executable, currentArgs, {
       cwd,
       stdio: "inherit",
@@ -151,6 +180,7 @@ export async function runLauncher({ product, executable, args, buildArgs, restar
       break;
     }
   } finally {
+    await transport?.close?.().catch(() => undefined);
     await request({ command: "unregister", launcherId: id }).catch(() => undefined);
   }
   return finalCode;

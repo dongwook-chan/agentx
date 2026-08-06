@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { detectAgyConversation, parseAgyModelLine, parseAgyQuotaLine, parseCodexQuotaLine } from "../src/quota.js";
+import { detectAgyConversation, parseAgyModelLine, parseAgyQuotaLine, parseCodexProtocolMessage, parseCodexQuotaLine } from "../src/quota.js";
 
 test("parses Codex quota token_count events", () => {
   const event = parseCodexQuotaLine(JSON.stringify({
@@ -17,6 +17,73 @@ test("parses Codex quota token_count events", () => {
   }));
   assert.equal(event.primary, 100);
   assert.equal(event.resetAt, new Date(1900000000 * 1000).toISOString());
+});
+
+test("does not treat absent purchased credits as exhausted included usage", () => {
+  const event = parseCodexQuotaLine(JSON.stringify({
+    timestamp: "2026-08-04T07:18:49.875Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      rate_limits: {
+        limit_id: "codex",
+        primary: { used_percent: 43, window_minutes: 10080 },
+        secondary: null,
+        credits: { has_credits: false, unlimited: false, balance: "0" },
+        rate_limit_reached_type: null,
+      },
+    },
+  }));
+  assert.equal(event, undefined);
+});
+
+test("parses Codex usage_limit_exceeded task completion events", () => {
+  const event = parseCodexQuotaLine(JSON.stringify({
+    timestamp: "2026-08-04T07:27:30.211Z",
+    type: "event_msg",
+    payload: {
+      type: "task_complete",
+      error: {
+        message: "You've hit your usage limit or try again at Aug 8th, 2026 8:16 AM.",
+        codex_error_info: "usage_limit_exceeded",
+      },
+    },
+  }));
+  assert.equal(event.reachedType, "usage_limit_exceeded");
+  assert.equal(event.reason, "usage limit reached");
+  assert.equal(event.resetAt, "2026-08-08T08:16:00.000Z");
+});
+
+test("parses Codex app-server rate limit notifications", () => {
+  const event = parseCodexProtocolMessage({
+    method: "account/rateLimits/updated",
+    params: {
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: 100, resetsAt: 1900000000 },
+        secondary: null,
+        rateLimitReachedType: null,
+      },
+    },
+  });
+  assert.equal(event.primary, 100);
+  assert.equal(event.resetAt, new Date(1900000000 * 1000).toISOString());
+});
+
+test("parses Codex app-server usage-limit failures", () => {
+  const event = parseCodexProtocolMessage({
+    method: "turn/completed",
+    params: {
+      turn: {
+        status: "failed",
+        error: {
+          message: "You've hit your usage limit.",
+          codexErrorInfo: "UsageLimitExceeded",
+        },
+      },
+    },
+  });
+  assert.equal(event.reachedType, "usage_limit_exceeded");
 });
 
 test("parses agy identity, model scope and quota lines", () => {

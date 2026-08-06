@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
 import { clearExpiredQuota, effectiveYoloMode, eventLogPath, loadState, profilesDir, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
-import { codexHooksPath, installCodexHooks, installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
+import { codexHooksPath, installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
 import { pauseAll, resumeAll, resumeManaged, sessionRecords, withPausedAuthSwitch } from "./managed_sessions.js";
 import { findRealCodex } from "./processes.js";
@@ -351,6 +351,7 @@ async function printStatus() {
   }
   console.log(`autoswitch: ${state.settings?.autoswitch ? "on" : "off"}`);
   console.log(`yolo: ${effectiveYoloMode(state) ? "on" : "off"}`);
+  console.log(`Codex integration: ${state.codexIntegration?.mode ?? "auto-detect"}`);
   console.log(`real codex: ${await findRealCodex().catch(() => "(not found)")}`);
   console.log(`shell integration file: ${shellIntegrationPath()}`);
   console.log(`codex hooks file: ${codexHooksPath()}`);
@@ -599,10 +600,19 @@ async function main() {
 
   switch (command) {
     case "install": {
-      const path = await installShellIntegration();
-      console.log(`Installed codex shell function in ${path}`);
-      console.log(`Installed Codex session hooks in ${await installCodexHooks()}`);
-      console.log(`Run: source ${path}`);
+      const installation = await installShellIntegration();
+      if (installation.integration.mode === "remote") {
+        console.log("Enabled Codex integration through the persistent app-server transport.");
+        console.log(`Installed codex shell function in ${installation.path}`);
+        console.log(`Run: source ${installation.path}`);
+      } else if (installation.integration.mode === "hooks") {
+        console.log(`Installed Codex lifecycle hooks in ${codexHooksPath()}`);
+        console.log(`Installed codex shell function in ${installation.path}`);
+        console.log(`Run: source ${installation.path}`);
+      } else {
+        console.log("Codex integration is disabled because neither remote app-server transport nor approved lifecycle hooks are available.");
+        console.log("Agentx Codex session supervision and automatic profile failover are unavailable. The regular Codex CLI remains usable.");
+      }
       return 0;
     }
     case "shell-init":

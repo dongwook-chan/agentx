@@ -3,17 +3,41 @@ import { join } from "node:path";
 import { productConfigDir } from "./paths.js";
 
 export function parseCodexQuotaLine(line) {
-  if (!line.includes("\"token_count\"") || !line.includes("\"rate_limits\"")) return undefined;
+  if (!line.includes("\"token_count\"") && !line.includes("usage_limit_exceeded")) return undefined;
   let value;
   try { value = JSON.parse(line); }
   catch { return undefined; }
-  if (value.type !== "event_msg" || value.payload?.type !== "token_count") return undefined;
+  if (value.type !== "event_msg") return undefined;
+  if (
+    value.payload?.type === "task_complete"
+    && value.payload?.error?.codex_error_info === "usage_limit_exceeded"
+  ) {
+    const message = String(value.payload.error.message ?? "");
+    const retryMatch = message.match(/try again at\s+(.+?)(?:\.(?:\s|$)|$)/i);
+    const retryText = retryMatch?.[1]?.replace(/(\d+)(?:st|nd|rd|th)\b/gi, "$1");
+    const retryMs = Date.parse(retryText ?? "");
+    return {
+      timestamp: value.timestamp,
+      primary: 0,
+      secondary: 0,
+      reachedType: "usage_limit_exceeded",
+      reason: "usage limit reached",
+      resetAt: Number.isFinite(retryMs) ? new Date(retryMs).toISOString() : undefined,
+    };
+  }
+  if (value.payload?.type !== "token_count" || !value.payload?.rate_limits) return undefined;
   const limits = value.payload.rate_limits;
   const primary = Number(limits?.primary?.used_percent ?? 0);
   const secondary = Number(limits?.secondary?.used_percent ?? 0);
   const reachedType = limits?.rate_limit_reached_type ?? null;
   const credits = limits?.credits;
-  const creditsExhausted = credits?.has_credits === false && credits?.unlimited !== true;
+  // A Plus account commonly has no purchased credits while its included usage
+  // window is still available. Only treat credits as the exhausted resource
+  // when Codex identifies the active limit as premium/credits (or supplies no
+  // usage windows at all).
+  const creditsExhausted = credits?.has_credits === false
+    && credits?.unlimited !== true
+    && (limits?.limit_id === "premium" || (!limits?.primary && !limits?.secondary));
   if (primary < 100 && secondary < 100 && reachedType === null && !creditsExhausted) return undefined;
   const resetsAt = primary >= 100
     ? limits?.primary?.resets_at
@@ -25,6 +49,54 @@ export function parseCodexQuotaLine(line) {
     reachedType,
     resetAt: Number.isFinite(Number(resetsAt)) ? new Date(Number(resetsAt) * 1000).toISOString() : undefined,
     planType: limits?.plan_type,
+  };
+}
+
+export function parseCodexProtocolMessage(message) {
+  if (!message || typeof message !== "object") return undefined;
+  if (message.method === "account/rateLimits/updated") {
+    const limits = message.params?.rateLimits;
+    if (!limits) return undefined;
+    const primary = Number(limits.primary?.usedPercent ?? 0);
+    const secondary = Number(limits.secondary?.usedPercent ?? 0);
+    const reachedType = limits.rateLimitReachedType ?? null;
+    const credits = limits.credits;
+    const creditsExhausted = credits?.hasCredits === false
+      && credits?.unlimited !== true
+      && (limits.limitId === "premium" || (!limits.primary && !limits.secondary));
+    if (primary < 100 && secondary < 100 && reachedType === null && !creditsExhausted) return undefined;
+    const resetsAt = primary >= 100
+      ? limits.primary?.resetsAt
+      : limits.secondary?.resetsAt;
+    return {
+      timestamp: new Date().toISOString(),
+      primary,
+      secondary,
+      reachedType,
+      reason: reachedType
+        ? `rate_limit_reached_type=${reachedType}`
+        : (primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached"),
+      resetAt: Number.isFinite(Number(resetsAt))
+        ? new Date(Number(resetsAt) * 1000).toISOString()
+        : undefined,
+    };
+  }
+
+  const error = message.method === "error"
+    ? message.params?.error
+    : (message.method === "turn/completed" && message.params?.turn?.status === "failed"
+      ? message.params.turn.error
+      : undefined);
+  if (!error) return undefined;
+  const errorInfo = JSON.stringify(error.codexErrorInfo ?? error.codex_error_info ?? "");
+  const messageText = String(error.message ?? "");
+  if (!/usage.?limit.?exceeded/i.test(errorInfo) && !/usage limit/i.test(messageText)) return undefined;
+  return {
+    timestamp: new Date().toISOString(),
+    primary: 0,
+    secondary: 0,
+    reachedType: "usage_limit_exceeded",
+    reason: messageText || "usage limit reached",
   };
 }
 

@@ -27,9 +27,9 @@ export function quotaSummaryFromSupervisorPayload(payload) {
     exhausted: true,
     historicalExhausted: true,
     exhaustedEvents: 1,
-    reason: reachedType
+    reason: payload.reason ?? (reachedType
       ? `rate_limit_reached_type=${reachedType}`
-      : (primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached"),
+      : (primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached")),
     resetAt: payload.resetAt,
     reachedTypes: reachedType ? [String(reachedType)] : [],
     current: {
