@@ -363,3 +363,42 @@ node --test \
 - **자동 전환 누락 지점:** JSONL 기록 이후, global watcher delivery 이전으로 확정.
 - **parser 결함 여부:** 이번 형식에 대해서는 아님. 사건 파일 replay 성공.
 - **watcher 하위 수준의 단일 원인:** 기존 telemetry 부족으로 확정 불가. 다만 notification 누락을 복구하지 않는 설계가 사건을 영구 누락으로 만든 구조적 root cause임.
+
+## 12. 후속 보강: 다음 사건의 하위 원인 확정과 자동 복구
+
+2026-08-28 후속 조사에서 레거시 `~/codexx`와 비교했다. 레거시는 자신이
+실행한 Codex 세션의 JSONL 한 개를 500ms마다 `stat(size)`하여 offset 이후만
+읽으므로 `fs.watch` 알림 유실에 노출되지 않았다. 반면 agentx의 unmanaged
+전역 watcher는 더 넓은 범위를 지원하면서 알림 기반 dirty queue 뒤에
+주기적인 size reconciliation을 두지 않은 것이 차이였다.
+
+후속 구현은 다음을 추가했다.
+
+1. core 계약에서 filesystem notification을 correctness source가 아닌
+   latency hint로 정의했다.
+2. 최대 1초마다 최근 활동 JSONL의 실제 size와 offset을 재대조한다.
+3. 새 날짜 tree 알림 전체가 사라져도 찾도록 현재/이전 UTC 날짜 디렉터리를
+   재대조한다. 과거 전체 파일 내용은 다시 읽지 않는다.
+4. 복구 원인을 다음 코드로 구분해 `supervisor.global_watch.recovered`에 남긴다.
+   - `file_change_notification_missing`
+   - `new_file_notification_missing`
+   - `directory_watcher_missing`
+   - `notified_change_not_drained`
+5. `supervisor.global_watch.started`, 30초 heartbeat, `turn_bound`, `stopped`
+   이벤트가 supervisor PID, 감시 root, watcher/track/dirty 수, 최근
+   watch/scan/reconcile 시각·소요 시간, 복구 누계를 남긴다.
+6. `agentx-supervisor watcher-status`가 동일한 live snapshot을 반환한다.
+
+따라서 다음 사건에서는 다음과 같이 판정할 수 있다.
+
+- recovery diagnosis 존재: 해당 diagnosis가 최초 전달 경로 실패 원인이다.
+- heartbeat의 sessions root가 실제 rollout 경로와 다름: 잘못된 `CODEX_HOME`이다.
+- 사건 구간 heartbeat 자체가 없음: daemon/watcher가 실행 중이지 않았다.
+- `turn_bound`는 있으나 quota detection이 없음: watcher 이후 parser/delivery
+  구간을 조사한다.
+- `global_quota.detected`는 있으나 switch가 없음: failover/control-plane 구간을
+  조사한다.
+
+알림 callback을 의도적으로 제거한 기존 파일 append와 새 날짜 tree 생성,
+callback 후 dirty queue 유실을 각각 재현하는 회귀 테스트를 추가했으며 모두
+자동 복구와 정확한 diagnosis 기록을 검증한다.

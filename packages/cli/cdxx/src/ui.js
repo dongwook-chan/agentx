@@ -1,18 +1,12 @@
-import { confirm, select } from "@inquirer/prompts";
+import { confirm, input, select } from "@inquirer/prompts";
 import {
-  agentProfileTableHeaders,
-  decideUseProfile,
+  pickAgentProfileAction,
+  agentCliManifests,
   relativeTime,
-  useProfileDisabledReason,
+  renderAgentProfileTable,
 } from "@dong-/agentx-core";
-import Table from "cli-table3";
 import { codexQuotaScopes, formatReset } from "./quota.js";
 import { exhaustedQuotaScopes, profileSelectableReason } from "./selection.js";
-
-function pad(value, width) {
-  const text = String(value ?? "");
-  return text.length >= width ? text : `${text}${" ".repeat(width - text.length)}`;
-}
 
 function profileStatus(profile) {
   if (profile.disabled) return "disabled";
@@ -51,87 +45,55 @@ function profileRows(state) {
   }));
 }
 
-function profileCells(row) {
-  return [
-    row.marker,
-    row.number,
-    row.name,
-    row.expectedEmail,
-    row.actualEmail,
-    row.status,
-    row.quotaReset,
-    row.lastRequest,
-    row.activated,
-    row.verified,
-    row.switches,
-  ];
+export function profilePresentationRows(state) {
+  return profileRows(state).map((row) => ({
+    id: row.profile.name,
+    active: row.marker === "*",
+    selectable: row.selectable,
+    muted: row.status !== "ready" && row.status !== "unknown",
+    disabledReason: row.disabledReason,
+    cells: {
+      marker: row.marker || " ",
+      number: row.number,
+      name: row.name,
+      expectedEmail: row.expectedEmail,
+      actualEmail: row.actualEmail,
+      status: row.status,
+      quotaReset: row.quotaReset,
+      lastRequest: row.lastRequest,
+      activated: row.activated,
+      verified: row.verified,
+      switches: row.switches,
+    },
+  }));
 }
 
 export function printProfiles(state) {
-  if (!state.profiles.length) {
-    console.log("No saved profiles.");
-    return;
-  }
-  const table = new Table({
-    head: [...agentProfileTableHeaders],
-    colAligns: ["center", "right", "left", "left", "left", "left", "left", "left", "left", "left", "right"],
-    style: { head: [], border: [] },
-    wordWrap: false,
+  console.log(renderAgentProfileTable(profilePresentationRows(state)));
+}
+
+export async function pickProfileAction(state, mode, notice) {
+  return await pickAgentProfileAction({
+    rows: profilePresentationRows(state),
+    mode,
+    notice,
+    default: state.activeProfile,
+    capabilities: { delete: true, rename: true },
   });
-  for (const row of profileRows(state)) {
-    table.push(profileCells(row));
-  }
-  console.log(table.toString());
-}
-
-function selectableReason(profile) {
-  return profileSelectableReason(profile);
-}
-
-function useCandidates(state) {
-  return state.profiles.map((profile) => {
-    const reason = selectableReason(profile);
-    return {
-      name: profile.name,
-      active: state.activeProfile === profile.name,
-      selectable: !reason,
-      disabledReason: reason,
-    };
-  });
-}
-
-function profileChoiceLabel(profile, state) {
-  const row = profileRows(state).find((entry) => entry.profile === profile);
-  return row ? profileCells(row).map((value, index) => pad(value || " ", Math.max(agentProfileTableHeaders[index].length, String(value || "").length))).join("  ") : profile.name;
 }
 
 export async function pickProfileForUse(state) {
-  const candidates = useCandidates(state);
-  const decision = decideUseProfile(candidates);
-  if (decision.type === "empty") throw new Error(decision.message);
-  const candidatesByName = new Map(decision.candidates.map((candidate) => [candidate.name, candidate]));
-  const choices = state.profiles.map((profile) => {
-    const candidate = candidatesByName.get(profile.name);
-    const reason = candidate ? useProfileDisabledReason(candidate) : "not selectable";
-    return {
-      name: reason ? `${profileChoiceLabel(profile, state)}  (${reason})` : profileChoiceLabel(profile, state),
-      value: profile.name,
-      description: reason,
-    };
-  });
-  return await select({
-    message: `Select profile\n  ${agentProfileTableHeaders.join("  ")}`,
-    choices,
-    pageSize: 7,
-    loop: true,
-  });
+  const action = await pickProfileAction(state, "use");
+  if (action.type === "select") return action.name;
+  throw new Error("No profile selected.");
 }
 
-export async function confirmProfileUse(profile, reason) {
-  return await confirm({
-    message: `Profile '${profile.name}' is marked ${reason}. Switch anyway?`,
-    default: false,
-  });
+export async function confirmAction(message, defaultValue = false) {
+  return await confirm({ message, default: defaultValue });
+}
+
+export async function promptText(message, defaultValue) {
+  return await input({ message, default: defaultValue });
 }
 
 export async function pickConfigKey(settings) {
@@ -139,7 +101,7 @@ export async function pickConfigKey(settings) {
     message: "Select setting",
     choices: [
       {
-        name: `autoswitch  ${settings.autoswitch ? "on" : "off"}`,
+        name: `autoswitch  ${settings.autoSwitchMode ?? (settings.autoswitch ? "scope-first" : "off")}`,
         value: "autoswitch",
         description: "Switch profiles automatically when quota is exhausted.",
       },
@@ -154,12 +116,16 @@ export async function pickConfigKey(settings) {
 }
 
 export async function pickConfigValue(key, current) {
+  const values = key === "autoswitch"
+    ? agentCliManifests.codex.quotaFailover.supportedAutoSwitchModes
+    : ["on", "off"];
   return await select({
     message: `Select value for ${key}`,
-    choices: [
-      { name: "on", value: "on", description: current === true ? "current" : undefined },
-      { name: "off", value: "off", description: current === false ? "current" : undefined },
-    ],
+    choices: values.map((value) => ({
+      name: value,
+      value,
+      description: current === value ? "current" : undefined,
+    })),
     loop: true,
   });
 }

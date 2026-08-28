@@ -1,7 +1,13 @@
 import { spawn } from "node:child_process";
 import {
   appendAgentEvent,
+  AuthSwitchTransactionOptions,
+  AutoSwitchAction,
+  decideExplicitProfileUse,
+  decideLiveQuotaFailover,
   pauseAllSessions,
+  persistCurrentCredential,
+  quotaSwitchingNotice,
   resumeAllSessions,
   runAuthSwitchTransaction,
   SessionControlAdapter,
@@ -38,7 +44,7 @@ import {
   effectiveAllowIneligibleActivation,
 } from "./config.js";
 import { keychain } from "./keychain.js";
-import { detectCredentialEmail } from "./google_auth.js";
+import { detectCredentialEmail, isValidAgyCredential } from "./google_auth.js";
 import {
   findRealAgy,
   runningAgy,
@@ -269,6 +275,18 @@ function sessionControlAdapter(options: { reason?: string } = {}): SessionContro
       }
       return reply.record ?? { ...record, childPid: undefined, paused: true };
     },
+    notify: async (record, message) => {
+      if ((record as SessionRecord & { launcherId?: string }).launcherId) {
+        await supervisorRequest({
+          command: "notice",
+          launcherId: (record as SessionRecord & { launcherId?: string }).launcherId,
+          message,
+        });
+        return;
+      }
+      const reply = await send(record.socketPath, "notice", { message });
+      if (!reply.ok) throw new Error(reply.error ?? `Failed to notify ${record.id}`);
+    },
     afterPause: async (paused) => {
       if (process.env.AGYX_SKIP_UNMANAGED_AGY_STOP === "1") return;
       const managedPIDs = new Set(paused.map((record) => record.childPid).filter(Boolean));
@@ -295,7 +313,7 @@ function sessionControlAdapter(options: { reason?: string } = {}): SessionContro
 
 async function withPausedAuthSwitch<T>(
   operation: () => Promise<T>,
-  options: { resume?: boolean } = {},
+  options: AuthSwitchTransactionOptions = {},
 ): Promise<T> {
   return await runAuthSwitchTransaction(
     {
@@ -305,6 +323,12 @@ async function withPausedAuthSwitch<T>(
     operation,
     options,
   );
+}
+
+export async function withPausedCredentialOperation<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  return await withPausedAuthSwitch(operation);
 }
 
 export async function pauseAll(): Promise<SessionRecord[]> {
@@ -329,13 +353,15 @@ export interface ProfileSwitchResult {
   alreadyActive?: boolean;
 }
 
-export interface AutoSwitchAction {
-  kind: "none" | "switched" | "stop_retrying";
-  reason?: string;
-  profile?: string;
-  email?: string;
-  message?: string;
-  retryKey?: string;
+export async function persistActiveProfileCredential(
+  state?: State,
+): Promise<boolean> {
+  const currentState = state ?? await loadState();
+  return await persistCurrentCredential({
+    readCurrentCredential: async () => await keychain.readActive().catch(() => undefined),
+    credentialIsValid: isValidAgyCredential,
+    writeProfileCredential: async (name, credential) => await keychain.writeProfile(name, credential),
+  }, currentState.activeProfile);
 }
 
 function resolveProfileName(
@@ -423,6 +449,9 @@ export async function activateProfile(
     if (!state.profiles.some((profile) => profile.name === name)) {
       throw new Error(`Profile not found: ${name}`);
     }
+    // The active Agy slot may contain a newly refreshed access token. Reconcile
+    // it before replacing the slot with another saved profile.
+    await persistActiveProfileCredential(state);
     const credential = await keychain.readProfile(name);
     await keychain.writeActive(credential);
     const email = options.verify ? await verifyActiveCredential(state, name) : undefined;
@@ -432,7 +461,10 @@ export async function activateProfile(
   });
 }
 
-export async function switchProfile(name: string): Promise<ProfileSwitchResult> {
+export async function switchProfile(
+  name: string,
+  options: { force?: boolean } = {},
+): Promise<ProfileSwitchResult> {
   return await withPausedAuthSwitch(async () => {
     const initialState = await loadState();
     const quotaScopes = await activeQuotaScopes();
@@ -456,9 +488,16 @@ export async function switchProfile(name: string): Promise<ProfileSwitchResult> 
       quotaScopes,
       allowIneligibleActivation: effectiveAllowIneligibleActivation(initialState),
     };
-    if (!isProfileSelectable(profile, new Date(), selectionOptions)) {
-      const status = effectiveProfileStatus(profile, new Date(), selectionOptions);
-      throw new Error(`Profile '${name}' is not selectable: ${status}.`);
+    const selectable = isProfileSelectable(profile, new Date(), selectionOptions);
+    const status = effectiveProfileStatus(profile, new Date(), selectionOptions);
+    const decision = decideExplicitProfileUse({
+      name,
+      active: false,
+      selectable,
+      disabledReason: selectable ? undefined : status,
+    });
+    if (decision.type === "confirm" && !options.force) {
+      throw new Error(`Profile '${name}' is not selectable: ${decision.reason}.`);
     }
     const previousCredential = await keychain.readActive().catch(() => undefined);
     try {
@@ -584,6 +623,8 @@ export async function autoSwitchAfterQuota(
   quotaScope: QuotaScope,
 ): Promise<ProfileSwitchResult | undefined> {
   return await withAutoSwitchLock(async () => {
+    const failoverPolicy = decideLiveQuotaFailover(true);
+    if (!failoverPolicy.switchImmediately) return undefined;
     const initialState = await loadState();
     const mode = effectiveAutoSwitchMode(initialState);
     if (mode === "off") {
@@ -690,7 +731,7 @@ export async function autoSwitchAfterQuota(
         });
         throw error;
       }
-    });
+    }, { switchingNotice: quotaSwitchingNotice("agyx") });
   });
 }
 
@@ -718,6 +759,8 @@ export async function autoSwitchAfterQuotaAction(
 
 export async function verifyAllProfiles(): Promise<State> {
   return await withPausedAuthSwitch(async () => {
+    const previousProfile = (await loadState()).activeProfile;
+    await persistActiveProfileCredential();
     const previousCredential = await keychain.readActive().catch(() => undefined);
     try {
       const names = (await loadState()).profiles.map((profile) => profile.name);
@@ -745,7 +788,10 @@ export async function verifyAllProfiles(): Promise<State> {
       }
       return await loadState();
     } finally {
-      if (previousCredential) await keychain.writeActive(previousCredential);
+      const restoredCredential = previousProfile
+        ? await keychain.readProfile(previousProfile).catch(() => previousCredential)
+        : previousCredential;
+      if (restoredCredential) await keychain.writeActive(restoredCredential);
     }
   });
 }

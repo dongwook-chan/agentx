@@ -2,9 +2,13 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  agentCliManifests,
+  AutoSwitchMode as CoreAutoSwitchMode,
   clearExpiredProfileQuota,
+  ensureExhaustedUsageScope,
   markActiveProfile,
   profileNameFromIdentity,
+  resetlessQuotaExpired,
   uniqueProfileName as coreUniqueProfileName,
   validateProfileName as coreValidateProfileName,
 } from "@dong-/agentx-core";
@@ -20,12 +24,22 @@ export interface ScopedQuotaRecord {
   checkedAt?: string;
 }
 
-export type AutoSwitchMode = "off" | "provider-first" | "all-providers";
+export type AutoSwitchMode = CoreAutoSwitchMode;
+export type LegacyAutoSwitchMode = "provider-first" | "all-providers";
 
-export const defaultAutoSwitchMode: AutoSwitchMode = "all-providers";
+export const defaultAutoSwitchMode: AutoSwitchMode =
+  agentCliManifests.agy.quotaFailover.defaultAutoSwitchMode;
+
+export function normalizeAutoSwitchMode(
+  mode: AutoSwitchMode | LegacyAutoSwitchMode | undefined,
+): AutoSwitchMode {
+  if (mode === "provider-first") return "scope-first";
+  if (mode === "all-providers") return "all-scopes";
+  return mode ?? defaultAutoSwitchMode;
+}
 
 export function effectiveAutoSwitchMode(state: Pick<State, "settings">): AutoSwitchMode {
-  return state.settings?.autoSwitchMode ?? defaultAutoSwitchMode;
+  return normalizeAutoSwitchMode(state.settings?.autoSwitchMode);
 }
 
 export const defaultYoloMode = true;
@@ -34,8 +48,8 @@ export function effectiveYoloMode(state: Pick<State, "settings">): boolean {
   return state.settings?.yolo ?? defaultYoloMode;
 }
 
-export const defaultAllowIneligibleActivation = true;
-const resetlessQuotaTtlMs = 24 * 60 * 60 * 1000;
+export const defaultAllowIneligibleActivation =
+  agentCliManifests.agy.quotaFailover.defaultEligibilityMode === "allow";
 
 export function effectiveAllowIneligibleActivation(state: Pick<State, "settings">): boolean {
   return state.settings?.allowIneligibleActivation ?? defaultAllowIneligibleActivation;
@@ -74,7 +88,7 @@ export interface State {
   activeProfile?: string;
   realAgyPath?: string;
   settings?: {
-    autoSwitchMode?: AutoSwitchMode;
+    autoSwitchMode?: AutoSwitchMode | LegacyAutoSwitchMode;
     yolo?: boolean;
     allowIneligibleActivation?: boolean;
   };
@@ -215,7 +229,24 @@ export function markProfileQuotaExhausted(
   const nowString = now.toISOString();
   profile.lastQuotaErrorAt = nowString;
   profile.lastQuotaReason = event.reason;
-  const scope = event.scope ?? "unknown";
+  const normalized = ensureExhaustedUsageScope<QuotaScope>({
+    source: "live",
+    exhausted: true,
+    resetAt: event.resetAt,
+    reason: event.reason,
+    scopes: event.scope ? {
+      [event.scope]: {
+        status: "exhausted",
+        resetAt: event.resetAt,
+        reason: event.reason,
+        checkedAt: nowString,
+      },
+    } : undefined,
+  }, "unknown", nowString);
+  const scope = event.scope
+    ?? (Object.entries(normalized.scopes ?? {})
+      .find(([, quota]) => quota?.status === "exhausted")?.[0] as QuotaScope | undefined)
+    ?? "unknown";
   profile.quotaScopes = profile.quotaScopes ?? {};
   for (const alias of quotaScopeAliases(scope)) {
     if (alias !== scope) delete profile.quotaScopes[alias];
@@ -293,12 +324,7 @@ export function clearExpiredScopedQuotas(
       delete profile.quotaScopes[scope];
     } else if (!quota.resetAt) {
       const checkedAt = quota.errorAt ?? profile.lastQuotaErrorAt ?? profile.updatedAt;
-      const checkedMs = checkedAt ? Date.parse(checkedAt) : undefined;
-      if (
-        typeof checkedMs === "number"
-        && Number.isFinite(checkedMs)
-        && now.getTime() - checkedMs >= resetlessQuotaTtlMs
-      ) {
+      if (resetlessQuotaExpired(checkedAt, now)) {
         delete profile.quotaScopes[scope];
       }
     }

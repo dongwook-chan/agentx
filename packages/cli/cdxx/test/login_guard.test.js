@@ -222,3 +222,23 @@ test("useProfile can force an exhausted profile after CLI confirmation", async (
   assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("exhausted"));
   assert.equal((await config.loadState()).activeProfile, "exhausted");
 });
+
+test("useProfile persists refreshed active auth before replacing the active slot", async () => {
+  await resetState("old");
+  await writeFile(auth.activeAuthPath, codexAuth("old-refreshed"), { mode: 0o600 });
+  await mkdir(join(process.env.CDXX_CONFIG_DIR, "profiles", "next"), { recursive: true });
+  await writeFile(auth.profileAuthPath("next"), codexAuth("next"), { mode: 0o600 });
+  const state = await config.loadState();
+  state.profiles.push({
+    name: "next",
+    accountId: "next",
+    quotaStatus: "available",
+  });
+  await config.saveState(state);
+
+  await auth.useProfile("next");
+
+  assert.equal(await readFile(auth.profileAuthPath("old"), "utf8"), codexAuth("old-refreshed"));
+  assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("next"));
+  assert.equal((await config.loadState()).activeProfile, "next");
+});

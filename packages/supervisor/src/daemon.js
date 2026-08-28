@@ -1,10 +1,11 @@
 import { appendFile, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { activeProfile, detectAgyConversation, parseAgyModelLine, parseAgyQuotaLine, parseCodexProtocolMessage, parseCodexQuotaLine, recordAgyQuota } from "./quota.js";
 import { productConfigDir, supervisorSocketPath, supervisorStatePath } from "./paths.js";
+import { CodexGlobalSessionWatcher } from "./codex_global_watcher.js";
 
 function nowIso() { return new Date().toISOString(); }
 
@@ -29,6 +30,15 @@ export class SupervisorDaemon {
     this.tickRunning = false;
     this.persistQueue = Promise.resolve();
     this.persistSequence = 0;
+    this.closed = false;
+    this.getActiveProfile = options.activeProfile ?? activeProfile;
+    this.eventLogger = options.logEvent;
+    this.globalCodexSessionsDir = options.enableGlobalCodexWatch === false
+      ? undefined
+      : (options.globalCodexSessionsDir
+        ?? join(options.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions"));
+    this.globalCodexWatcherOptions = options.globalCodexWatcherOptions ?? {};
+    this.globalCodexWatcher = undefined;
   }
 
   async start() {
@@ -47,13 +57,42 @@ export class SupervisorDaemon {
     });
     await chmod(this.socketPath, 0o600).catch(() => undefined);
     await this.persist();
+    if (this.globalCodexSessionsDir) {
+      this.globalCodexWatcher = new CodexGlobalSessionWatcher({
+        ...this.globalCodexWatcherOptions,
+        sessionsDir: this.globalCodexSessionsDir,
+        getActiveProfile: async () => await this.getActiveProfile("cdxx"),
+        isManagedSession: (observation) => this.isManagedCodexSession(observation),
+        onQuota: async (observation, event) => await this.handleGlobalCodexQuota(observation, event),
+        onError: async (error, file) => await this.logEvent("cdxx", {
+          event: "supervisor.global_scan.failed",
+          ...(file ? { transcriptPath: file } : {}),
+          error: error?.message ?? String(error),
+        }),
+        onDiagnostic: async (event) => await this.logEvent("cdxx", {
+          supervisorPid: process.pid,
+          ...event,
+        }),
+      });
+      await this.globalCodexWatcher.start();
+    }
     this.timer = setInterval(() => void this.tick(), 200);
     this.timer.unref?.();
   }
 
   async close(options = {}) {
+    if (this.closed) return;
+    this.closed = true;
     if (this.timer) clearInterval(this.timer);
-    if (this.server) await new Promise((resolve) => this.server.close(resolve));
+    this.timer = undefined;
+    if (this.globalCodexWatcher) {
+      if (!options.watcherStopLogged) await this.logWatcherStopped();
+      this.globalCodexWatcher.close();
+    }
+    this.globalCodexWatcher = undefined;
+    const server = this.server;
+    this.server = undefined;
+    if (server?.listening) await new Promise((resolve) => server.close(resolve));
     await rm(this.socketPath, { force: true });
     if (!options.preserveState) await rm(this.statePath, { force: true });
   }
@@ -106,6 +145,7 @@ export class SupervisorDaemon {
       offset: session.offset,
       identityMode: session.identityMode,
       reason: session.reason,
+      switchingNotice: session.switchingNotice,
     };
   }
 
@@ -234,6 +274,14 @@ export class SupervisorDaemon {
         await this.pruneStaleSessions();
         return { ok: true, records: [...this.sessions.values()].map((entry) => this.publicRecord(entry)) };
       }
+      case "watcher-status": return {
+        ok: true,
+        pid: process.pid,
+        watcher: this.globalCodexWatcher?.diagnostics() ?? {
+          active: false,
+          sessionsDir: this.globalCodexSessionsDir,
+        },
+      };
       case "status": {
         const session = this.sessions.get(request.launcherId);
         if (session && !processAlive(session.launcherPid)) {
@@ -245,6 +293,14 @@ export class SupervisorDaemon {
       }
       case "pause": return await this.commandLauncher(request.launcherId, "pause", request.reason);
       case "resume": return await this.commandLauncher(request.launcherId, "resume", request.reason);
+      case "notice": return await this.noticeLauncher(request.launcherId, request.message);
+      case "shutdown": {
+        await this.logWatcherStopped();
+        setImmediate(() => void this.close({ watcherStopLogged: true }).catch((error) => {
+          process.stderr.write(`[agentx-supervisor] shutdown failed: ${error?.stack ?? error}\n`);
+        }));
+        return { ok: true, pid: process.pid };
+      }
       case "resume-all": {
         const records = [];
         for (const session of this.sessions.values()) {
@@ -308,6 +364,16 @@ export class SupervisorDaemon {
     return { ok: true, record: this.publicRecord(session) };
   }
 
+  async noticeLauncher(launcherId, message) {
+    const session = this.sessions.get(launcherId);
+    if (!session) throw new Error(`Unknown launcher: ${launcherId}`);
+    if (typeof message !== "string" || !message) throw new Error("Notice message is required.");
+    session.switchingNotice = message;
+    await this.persist();
+    process.kill(session.launcherPid, "SIGWINCH");
+    return { ok: true, record: this.publicRecord(session) };
+  }
+
   async persist() {
     // Socket requests and the polling loop can persist concurrently. Reusing one
     // PID-based temporary path lets one writer rename another writer's file,
@@ -348,6 +414,7 @@ export class SupervisorDaemon {
         try { await this.scan(session); }
         catch (error) { await this.logEvent(session.product, { event: "supervisor.scan.failed", launcherId: session.launcherId, error: error?.message ?? String(error) }); }
       }
+      await this.globalCodexWatcher?.drain();
     } finally {
       this.tickRunning = false;
     }
@@ -409,6 +476,37 @@ export class SupervisorDaemon {
     await this.failover(session, quota);
   }
 
+  isManagedCodexSession({ file, sessionId }) {
+    const transcript = resolve(file);
+    for (const session of this.sessions.values()) {
+      if (session.product !== "cdxx") continue;
+      if (session.transcriptPath && resolve(session.transcriptPath) === transcript) return true;
+      if (sessionId && (session.sessionId === sessionId || session.threadId === sessionId)) return true;
+    }
+    return false;
+  }
+
+  async handleGlobalCodexQuota(observation, event) {
+    const session = {
+      product: "cdxx",
+      launcherId: "global-codex-sessions",
+      profileName: observation.profileName,
+      sessionId: observation.sessionId,
+      transcriptPath: observation.file,
+      codexHome: dirname(this.globalCodexSessionsDir),
+    };
+    await this.logEvent("cdxx", {
+      event: "supervisor.global_quota.detected",
+      launcherId: session.launcherId,
+      profile: session.profileName,
+      sessionId: session.sessionId,
+      transcriptPath: session.transcriptPath,
+      reachedType: event.reachedType,
+      reason: event.reason,
+    });
+    await this.failover(session, event);
+  }
+
   async runFailover(session, event) {
     const command = session.policyCommand ? process.execPath : (session.product === "agyx" ? "agyx" : "cdxx");
     const args = session.product === "agyx"
@@ -434,9 +532,20 @@ export class SupervisorDaemon {
   }
 
   async logEvent(product, event) {
+    if (this.eventLogger) return await this.eventLogger(product, event);
     const path = join(productConfigDir(product), "events.jsonl");
     await mkdir(productConfigDir(product), { recursive: true, mode: 0o700 });
     await appendFile(path, `${JSON.stringify({ timestamp: nowIso(), product, emitter: "agentx-supervisor", ...event })}\n`, { mode: 0o600 });
+  }
+
+  async logWatcherStopped() {
+    if (!this.globalCodexWatcher) return;
+    await this.logEvent("cdxx", {
+      event: "supervisor.global_watch.stopped",
+      supervisorPid: process.pid,
+      ...this.globalCodexWatcher.diagnostics(),
+      active: false,
+    }).catch(() => undefined);
   }
 }
 

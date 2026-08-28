@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { select } from "@inquirer/prompts";
+import { agentCliManifests, decideExplicitProfileUse, runRefreshableCredentialOperation, usageCheckReasons } from "@dong-/agentx-core";
 import {
   activateProfile,
   activeQuotaScopes,
@@ -11,6 +12,7 @@ import {
   autoSwitchAfterQuotaAction,
   loginProfile,
   pauseAll,
+  persistActiveProfileCredential,
   resumeAll,
   saveCurrent,
   setAllowIneligibleActivation,
@@ -19,6 +21,7 @@ import {
   switchProfile,
   switchToNextProfile,
   verifyAllProfiles,
+  withPausedCredentialOperation,
   withAuthSwitchLock,
 } from "./coordinator.js";
 import {
@@ -28,6 +31,7 @@ import {
   shellIntegrationPath,
 } from "./install.js";
 import { keychain } from "./keychain.js";
+import { isValidAgyCredential } from "./google_auth.js";
 import { buildAgyLaunchArgs } from "./launch_args.js";
 import { maybeRunOnboarding } from "./onboarding.js";
 import { findRealAgy } from "./processes.js";
@@ -48,6 +52,7 @@ import {
 } from "./quota.js";
 import { runNativeSupervisor } from "./native.js";
 import { runUsageProbe } from "./usage_probe.js";
+import { buildProfileViews } from "./profile_view.js";
 import {
   confirmAction,
   decideProfileUse,
@@ -62,7 +67,7 @@ const help = `agyx — multi-account session supervisor for Antigravity CLI
 Preferred shell usage after 'agyx install':
   agy login                            Protected Antigravity login; auto-save and activate profile
   agy x list                           List saved profiles
-  agy x use [name]                     Activate a saved profile
+  agy x use [name] [--force]           Activate a saved profile
   agy x next                           Switch to next selectable profile
   agy x scan [--all|--full]            Check quota via /usage
   agy x status                         Show wrapper status
@@ -80,7 +85,7 @@ Usage:
                                        Save the current active account
   agyx login [name] [--email EMAIL] [--no-resume]
                                        Pause all sessions and add an account
-  agyx use [name]                      Switch account and resume every session
+  agyx use [name] [--force]            Switch account and resume every session
   agyx next                            Rotate to the next selectable account
   agyx scan [--json] [--no-record] [--all|--full]
                                        Check quota via /usage
@@ -100,7 +105,7 @@ Non-interactive --print/--prompt commands are not automatically restarted.`;
 const wrapperHelp = `agyx wrapper commands:
   agy login                            Protected login; auto-save and activate profile
   agy x list                           List saved profiles
-  agy x use [name]                     Activate a saved profile
+  agy x use [name] [--force]           Activate a saved profile
   agy x next                           Switch to next selectable profile
   agy x scan [--all|--full]            Check quota via /usage
   agy x status                         Show wrapper status
@@ -187,20 +192,26 @@ async function runUsageProbeForProfile(
     const geminiDir = join(probeHome, ".gemini");
     const credentialDir = join(geminiDir, "antigravity-cli");
     await mkdir(credentialDir, { recursive: true, mode: 0o700 });
-    await writeFile(join(credentialDir, "antigravity-oauth-token"), credential, { mode: 0o600 });
+    const credentialPath = join(credentialDir, "antigravity-oauth-token");
+    await writeFile(credentialPath, credential, { mode: 0o600 });
     await chmod(credentialDir, 0o700).catch(() => undefined);
-    const result = await runUsageProbe({
-      profileName,
-      record,
-      env: {
-        HOME: probeHome,
-        XDG_CONFIG_HOME: join(probeHome, ".config"),
-      },
-      extraArgs: [
-        `--gemini_dir=${geminiDir}`,
-        "--app_data_dir=antigravity-cli",
-      ],
-    });
+    const result = await runRefreshableCredentialOperation({
+      readCurrentCredential: async () => await readFile(credentialPath).catch(() => undefined),
+      credentialIsValid: isValidAgyCredential,
+      writeProfileCredential: async (name, refreshed) => await keychain.writeProfile(name, refreshed),
+    }, profileName, async () => await runUsageProbe({
+        profileName,
+        record,
+        reason: record ? usageCheckReasons.manualRecord : usageCheckReasons.explicitScan,
+        env: {
+          HOME: probeHome,
+          XDG_CONFIG_HOME: join(probeHome, ".config"),
+        },
+        extraArgs: [
+          `--gemini_dir=${geminiDir}`,
+          "--app_data_dir=antigravity-cli",
+        ],
+      }));
     return { name: profileName, ok: result.ok, result, error: result.error };
   } catch (error) {
     return { name: profileName, ok: false, error: (error as Error).message };
@@ -257,10 +268,12 @@ function takeOptionalName(args: string[], usage: string): string | undefined {
 }
 
 function parseAutoSwitchMode(value: string): AutoSwitchMode {
-  if (["off", "provider-first", "all-providers"].includes(value)) {
+  if (agentCliManifests.agy.quotaFailover.supportedAutoSwitchModes.includes(value as AutoSwitchMode)) {
     return value as AutoSwitchMode;
   }
-  throw new Error("Usage: agyx autoswitch [off|provider-first|all-providers]");
+  if (value === "provider-first") return "scope-first";
+  if (value === "all-providers") return "all-scopes";
+  throw new Error("Usage: agyx autoswitch [off|scope-first|all-scopes]");
 }
 
 function parseIneligibleMode(value: string): boolean {
@@ -343,7 +356,7 @@ async function pickConfigKey(state: Awaited<ReturnType<typeof loadState>>): Prom
 
 async function pickConfigValue(key: ConfigKey, current: string): Promise<string | undefined> {
   const choices = key === "autoswitch"
-    ? ["all-providers", "provider-first", "off"]
+    ? ["all-scopes", "scope-first", "off"]
     : key === "ineligible"
     ? ["allow", "block"]
     : ["on", "off"];
@@ -580,11 +593,31 @@ async function handleImportCurrentCommand(args: string[], command = "import-curr
 }
 
 async function handleUseCommand(args: string[]): Promise<number> {
+  const force = takeFlag(args, "--force");
   const name = args.shift();
-  if (args.length) throw new Error("Usage: agyx use [name]");
+  if (args.length) throw new Error("Usage: agyx use [name] [--force]");
   const selected = name ?? await browseProfiles("use");
   if (!selected) return 0;
-  const result = await switchProfile(selected);
+  const state = await loadState();
+  const quotaScopes = await activeQuotaScopes();
+  const view = buildProfileViews(state, new Date(), { quotaScopes })
+    .find((entry) => entry.profile.name === selected);
+  if (!view) throw new Error(`Profile not found: ${selected}`);
+  const decision = decideExplicitProfileUse({
+    name: selected,
+    active: state.activeProfile === selected,
+    selectable: view.selectable,
+    disabledReason: view.disabledReason,
+  });
+  let allowUnavailable = force;
+  if (decision.type === "confirm" && !force) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      throw new Error(`${decision.message} Re-run with --force in a non-interactive shell.`);
+    }
+    allowUnavailable = await confirmAction(decision.message, decision.defaultValue);
+    if (!allowUnavailable) return 0;
+  }
+  const result = await switchProfile(selected, { force: allowUnavailable });
   printSwitchResult(result);
   return 0;
 }
@@ -595,16 +628,31 @@ async function handleScanCommand(args: string[]): Promise<number> {
   takeFlag(args, "--record");
   const record = !takeFlag(args, "--no-record");
   if (args.length) throw new Error("Usage: agyx scan [--json] [--no-record] [--all|--full]");
-  if (all) {
-    const results = await runUsageProbeForAllProfiles(record);
-    if (asJson) console.log(JSON.stringify(results, null, 2));
-    else printUsageScanAllResults(results);
-    return results.every((result) => result.ok) ? 0 : 1;
-  }
-  const result = await runUsageProbe({ record });
-  if (asJson) console.log(JSON.stringify(result, null, 2));
-  else printUsageScanResult(result);
-  return result.ok ? 0 : 1;
+  return await withPausedCredentialOperation(async () => {
+    const activeProfile = (await loadState()).activeProfile;
+    await persistActiveProfileCredential();
+    try {
+      if (all) {
+        const results = await runUsageProbeForAllProfiles(record);
+        if (asJson) console.log(JSON.stringify(results, null, 2));
+        else printUsageScanAllResults(results);
+        return results.every((result) => result.ok) ? 0 : 1;
+      }
+      const result = await runUsageProbe({
+        record,
+        reason: record ? usageCheckReasons.manualRecord : usageCheckReasons.explicitScan,
+      });
+      if (asJson) console.log(JSON.stringify(result, null, 2));
+      else printUsageScanResult(result);
+      return result.ok ? 0 : 1;
+    } finally {
+      if (activeProfile) {
+        if (!all) await persistActiveProfileCredential();
+        const latestActiveCredential = await keychain.readProfile(activeProfile).catch(() => undefined);
+        if (latestActiveCredential) await keychain.writeActive(latestActiveCredential);
+      }
+    }
+  });
 }
 
 async function handleListCommand(args: string[]): Promise<number> {
@@ -655,7 +703,7 @@ async function runWrapperCommand(command: string, args: string[]): Promise<numbe
       return await configure(args);
     case "autoswitch": {
       const mode = args.shift();
-      if (args.length) throw new Error("Usage: agyx autoswitch [off|provider-first|all-providers]");
+      if (args.length) throw new Error("Usage: agyx autoswitch [off|scope-first|all-scopes]");
       if (!mode) {
         if (!process.stdin.isTTY || !process.stdout.isTTY) {
           console.log(effectiveAutoSwitchMode(await loadState()));
@@ -824,7 +872,7 @@ async function main(): Promise<number> {
       return await handleScanCommand(args);
     case "autoswitch": {
       const mode = args.shift();
-      if (args.length) throw new Error("Usage: agyx autoswitch [off|provider-first|all-providers]");
+      if (args.length) throw new Error("Usage: agyx autoswitch [off|scope-first|all-scopes]");
       if (!mode) {
         if (!process.stdin.isTTY || !process.stdout.isTTY) {
           console.log(effectiveAutoSwitchMode(await loadState()));
@@ -957,7 +1005,10 @@ async function main(): Promise<number> {
         cwd?: string;
         timeoutMs?: number;
       };
-      console.log(JSON.stringify(await runUsageProbe(payload)));
+      console.log(JSON.stringify(await runUsageProbe({
+        ...payload,
+        reason: usageCheckReasons.sessionStart,
+      })));
       return 0;
     }
     case "_usage-transcript-aggregates": {

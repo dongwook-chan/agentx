@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-import { appendAgentEvent } from "@dong-/agentx-core";
+import { agentCliManifests, appendAgentEvent, decideExplicitProfileUse, usageCheckReasons } from "@dong-/agentx-core";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { guardedLoginProfile, removeProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
-import { clearExpiredQuota, effectiveYoloMode, eventLogPath, loadState, profilesDir, saveState } from "./config.js";
+import { guardedLoginProfile, refreshActiveProfileCredential, removeProfile, renameProfile, saveCurrentProfile, useProfile, readActiveAuthSummary } from "./auth.js";
+import { clearExpiredQuota, codexHome, effectiveAutoSwitchMode, effectiveYoloMode, eventLogPath, loadState, profilesDir, saveState } from "./config.js";
 import { decideCodexFailover } from "./failover_policy.js";
 import { codexHooksPath, installShellIntegration, shellInit, shellIntegrationPath } from "./install.js";
 import { buildCodexLaunchArgsFromState } from "./launch_args.js";
@@ -14,7 +14,8 @@ import { findRealCodex } from "./processes.js";
 import { profileSelectableReason } from "./selection.js";
 import { pickNextProfile, runCodexSession } from "./session.js";
 import { formatReset, recordQuotaForActiveProfile, recordQuotaForProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
-import { confirmProfileUse, pickConfigKey, pickConfigValue, pickProfileForUse, printProfiles, printScanSummary } from "./ui.js";
+import { confirmAction, pickConfigKey, pickConfigValue, pickProfileAction, printProfiles, printScanSummary, promptText } from "./ui.js";
+import { refreshProfileStatus } from "./background_status.js";
 
 async function logSwitchEvent(event) {
   await appendAgentEvent(eventLogPath, { product: "cdxx", ...event }).catch(() => undefined);
@@ -34,6 +35,7 @@ Preferred shell usage after 'cdxx install':
   codex x config                 Configure wrapper settings interactively
   codex x config <key> [value]   Configure autoswitch/yolo
   codex x remove <name>          Delete a saved profile
+  codex x rename <old> <new>     Rename a saved profile
   codex x import-current [name]  Import current $CODEX_HOME/auth.json as a profile
   codex --native ...             Bypass cdxx and run the real Codex CLI
 
@@ -53,6 +55,7 @@ Usage:
                                   Check quota via /status
   cdxx config [key] [value]       Configure wrapper settings
   cdxx remove <name>              Delete a saved profile
+  cdxx rename <old> <new>         Rename a saved profile
   cdxx status                     Show wrapper status`;
 
 const wrapperHelp = `cdxx wrapper commands:
@@ -70,6 +73,7 @@ const wrapperHelp = `cdxx wrapper commands:
   codex x config set <key> <val> Set one setting
   codex x config <key> [value]   Set autoswitch/yolo, or pick value interactively
   codex x remove <name>          Delete a saved profile
+  codex x rename <old> <new>     Rename a saved profile
   codex x import-current [name]  Import current active Codex auth as a profile
   codex --native ...             Bypass cdxx and run the real Codex CLI`;
 
@@ -149,12 +153,45 @@ async function withPausedSessions(operation) {
   return await withPausedAuthSwitch(operation);
 }
 
-async function chooseProfileForUse() {
+async function confirmAndRemoveProfile(name) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("Usage: cdxx use [name] or run 'cdxx use' in an interactive terminal.");
+    throw new Error("Refusing to delete without an interactive confirmation.");
   }
-  const state = await loadState();
-  return await pickProfileForUse(state);
+  if (!await confirmAction(`Delete profile '${name}'?`, false)) return false;
+  await removeProfile(name);
+  return true;
+}
+
+async function promptAndRenameProfile(name) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("Refusing to rename without an interactive terminal.");
+  }
+  const nextName = (await promptText(`Rename profile '${name}' to`, name))?.trim();
+  if (!nextName || nextName === name) return undefined;
+  return await renameProfile(name, nextName) ? nextName : undefined;
+}
+
+async function browseProfiles(mode) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    if (mode === "list") {
+      printProfiles(await loadStateForDisplay());
+      return undefined;
+    }
+    throw new Error("Usage: cdxx use <name> or run 'cdxx use' in an interactive terminal.");
+  }
+  let notice;
+  while (true) {
+    const action = await pickProfileAction(await loadStateForDisplay(), mode, notice);
+    notice = undefined;
+    if (action.type === "exit") return undefined;
+    if (action.type === "select") return action.name;
+    if (action.type === "delete" && await confirmAndRemoveProfile(action.name)) {
+      notice = `Removed profile '${action.name}'.`;
+    } else if (action.type === "rename") {
+      const nextName = await promptAndRenameProfile(action.name);
+      if (nextName) notice = `Renamed profile '${action.name}' to '${nextName}'.`;
+    }
+  }
 }
 
 async function switchNext() {
@@ -183,32 +220,35 @@ async function useProfileCommand(name, { force = false } = {}) {
   const state = await loadState();
   const profile = state.profiles.find((entry) => entry.name === name);
   const blocked = profile ? profileSelectableReason(profile) : undefined;
-  let allowBlockedQuota = force;
-  if (blocked && !force) {
-    if (!blocked.startsWith("quota exhausted")) {
-      throw new Error(`Profile '${name}' is not selectable: ${blocked}.`);
-    }
+  const decision = decideExplicitProfileUse({
+    name,
+    active: state.activeProfile === name,
+    selectable: !blocked,
+    disabledReason: blocked,
+  });
+  let allowUnavailable = force;
+  if (decision.type === "confirm" && !force) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      throw new Error(`Profile '${name}' is marked ${blocked}. Re-run with --force to switch anyway.`);
+      throw new Error(`${decision.message} Re-run with --force in a non-interactive shell.`);
     }
-    allowBlockedQuota = await confirmProfileUse(profile ?? { name }, blocked);
-    if (!allowBlockedQuota) return undefined;
+    allowUnavailable = await confirmAction(decision.message, decision.defaultValue);
+    if (!allowUnavailable) return undefined;
   }
   await logSwitchEvent({
     event: "profile.selected",
     trigger: "manual-use",
     fromProfile: state.activeProfile,
     toProfile: name,
-    force: allowBlockedQuota,
+    force: allowUnavailable,
   });
   try {
-    const result = await withPausedSessions(async () => await useProfile(name, { force: allowBlockedQuota }));
+    const result = await withPausedSessions(async () => await useProfile(name, { force: allowUnavailable }));
     await logSwitchEvent({
       event: "switch.completed",
       trigger: "manual-use",
       fromProfile: state.activeProfile,
       toProfile: result.name,
-      force: allowBlockedQuota,
+      force: allowUnavailable,
       actionKind: "sessions_restarted",
     });
     return result;
@@ -218,7 +258,7 @@ async function useProfileCommand(name, { force = false } = {}) {
       trigger: "manual-use",
       fromProfile: state.activeProfile,
       toProfile: name,
-      force: allowBlockedQuota,
+      force: allowUnavailable,
       error: error?.message ?? String(error),
     });
     throw error;
@@ -228,14 +268,21 @@ async function useProfileCommand(name, { force = false } = {}) {
 async function setAutoswitch(value) {
   const state = await loadState();
   if (value === undefined) {
-    console.log(state.settings?.autoswitch ? "on" : "off");
+    console.log(effectiveAutoSwitchMode(state));
     return;
   }
-  if (!["on", "off"].includes(value)) throw new Error("Usage: cdxx autoswitch [on|off]");
+  const mode = value === "on" ? "scope-first" : value;
+  if (mode === "all-scopes") {
+    throw new Error(agentCliManifests.codex.quotaFailover.unsupportedAutoSwitchModes["all-scopes"]);
+  }
+  if (!agentCliManifests.codex.quotaFailover.supportedAutoSwitchModes.includes(mode)) {
+    throw new Error("Usage: cdxx autoswitch [scope-first|off] ('on' is accepted as an alias)");
+  }
   state.settings = state.settings ?? {};
-  state.settings.autoswitch = value === "on";
+  state.settings.autoSwitchMode = mode;
+  state.settings.autoswitch = mode !== "off";
   await saveState(state);
-  console.log(`autoswitch ${value}`);
+  console.log(`autoswitch ${mode}`);
 }
 
 async function setYolo(value) {
@@ -254,7 +301,7 @@ async function setYolo(value) {
 const configKeys = new Set(["autoswitch", "yolo"]);
 
 function configValue(state, key) {
-  if (key === "autoswitch") return state.settings?.autoswitch ? "on" : "off";
+  if (key === "autoswitch") return effectiveAutoSwitchMode(state);
   if (key === "yolo") return effectiveYoloMode(state) ? "on" : "off";
   throw new Error("Usage: cdxx config [list|get|set|autoswitch|yolo]");
 }
@@ -265,10 +312,12 @@ function printConfig(state) {
 }
 
 async function setConfigValue(key, value) {
-  if (!configKeys.has(key)) throw new Error("Usage: cdxx config set <autoswitch|yolo> <on|off>");
-  if (value !== "on" && value !== "off") throw new Error(`Usage: cdxx config ${key} [on|off]`);
+  if (!configKeys.has(key)) throw new Error("Usage: cdxx config set <autoswitch|yolo> <value>");
   if (key === "autoswitch") await setAutoswitch(value);
-  else await setYolo(value);
+  else {
+    if (value !== "on" && value !== "off") throw new Error(`Usage: cdxx config ${key} [on|off]`);
+    await setYolo(value);
+  }
 }
 
 async function configure(args) {
@@ -277,7 +326,7 @@ async function configure(args) {
   if (!subcommand || subcommand === "list") {
     if (!subcommand && process.stdin.isTTY && process.stdout.isTTY) {
       const key = await pickConfigKey(state.settings ?? {});
-      const value = await pickConfigValue(key, configValue(state, key) === "on");
+      const value = await pickConfigValue(key, configValue(state, key));
       await setConfigValue(key, value);
       return 0;
     }
@@ -294,7 +343,9 @@ async function configure(args) {
   if (subcommand === "set") {
     const key = args.shift();
     const value = args.shift();
-    if (!key || !value || args.length) throw new Error("Usage: cdxx config set <autoswitch|yolo> <on|off>");
+    if (!key || !value || args.length) {
+      throw new Error("Usage: cdxx config set autoswitch <scope-first|off> | cdxx config set yolo <on|off>");
+    }
     await setConfigValue(key, value);
     return 0;
   }
@@ -302,13 +353,17 @@ async function configure(args) {
     throw new Error("Usage: cdxx config [list|get|set|autoswitch|yolo]");
   }
   const value = args.shift();
-  if (args.length) throw new Error(`Usage: cdxx config ${subcommand} [on|off]`);
+  if (args.length) {
+    throw new Error(subcommand === "autoswitch"
+      ? "Usage: cdxx config autoswitch [scope-first|off]"
+      : "Usage: cdxx config yolo [on|off]");
+  }
   if (!value) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
       console.log(configValue(state, subcommand));
       return 0;
     }
-    await setConfigValue(subcommand, await pickConfigValue(subcommand, configValue(state, subcommand) === "on"));
+    await setConfigValue(subcommand, await pickConfigValue(subcommand, configValue(state, subcommand)));
     return 0;
   }
   await setConfigValue(subcommand, value);
@@ -349,7 +404,7 @@ async function printStatus() {
   } catch {
     console.log("active auth: missing");
   }
-  console.log(`autoswitch: ${state.settings?.autoswitch ? "on" : "off"}`);
+  console.log(`autoswitch: ${effectiveAutoSwitchMode(state)}`);
   console.log(`yolo: ${effectiveYoloMode(state) ? "on" : "off"}`);
   console.log(`Codex integration: ${state.codexIntegration?.mode ?? "auto-detect"}`);
   console.log(`real codex: ${await findRealCodex().catch(() => "(not found)")}`);
@@ -402,11 +457,12 @@ async function scanAllProfiles({ record }) {
     const name = profile.name;
     try {
       const summary = await scanCodexQuota({
-        reason: record ? "manual-record-all" : "explicit-scan-all",
+        reason: record ? usageCheckReasons.manualRecord : usageCheckReasons.explicitScan,
         allowLocalFallback: false,
         statusOptions: {
           ...fastStatusOptions,
-          codexHome: join(profilesDir, name),
+          codexHome: state.activeProfile === name ? codexHome : join(profilesDir, name),
+          profileName: name,
         },
       });
       if (!profileMatchesStatusAccount(profile, summary.account)) {
@@ -452,14 +508,30 @@ async function handleScanCommand(args) {
   if (args.length) throw new Error("Usage: cdxx scan [--json] [--no-record] [--full] [--jsonl] [--all]");
   if (all && jsonl) throw new Error("Usage: cdxx scan --all cannot be combined with --jsonl.");
   if (all) {
-    const results = await scanAllProfiles({ record });
+    const results = await withPausedSessions(async () => {
+      await refreshActiveProfileCredential();
+      try {
+        return await scanAllProfiles({ record });
+      } finally {
+        await refreshActiveProfileCredential();
+      }
+    });
     if (asJson) console.log(JSON.stringify(results, null, 2));
     else printScanAllResults(results);
     return results.every((result) => result.ok) ? 0 : 1;
   }
   const summary = jsonl
     ? await scanCodexSessions()
-    : await scanCodexQuota({ reason: record ? "manual-record" : "explicit-scan" });
+    : await withPausedSessions(async () => {
+        await refreshActiveProfileCredential();
+        try {
+          return await scanCodexQuota({
+            reason: record ? usageCheckReasons.manualRecord : usageCheckReasons.explicitScan,
+          });
+        } finally {
+          await refreshActiveProfileCredential();
+        }
+      });
   if (record) await recordQuotaForActiveProfile(summary);
   if (asJson) {
     const payload = full ? summary : {
@@ -480,7 +552,7 @@ async function runNativeCodex(args) {
 
 async function statusProbeRecord() {
   const summary = await scanCodexQuota({
-    reason: "session-start",
+    reason: usageCheckReasons.sessionStart,
     allowLocalFallback: false,
     statusOptions: {
       commandDelayMs: 2000,
@@ -491,6 +563,11 @@ async function statusProbeRecord() {
     },
   });
   await recordQuotaForActiveProfile(summary);
+  return 0;
+}
+
+async function statusProbeProfileRecord(args) {
+  await refreshProfileStatus(requireOne(args, "cdxx _status-probe-profile-record <name>"));
   return 0;
 }
 
@@ -513,7 +590,7 @@ async function runWrapperCommand(command, args) {
     }
     case "use": {
       const force = takeFlag(args, "--force") || takeFlag(args, "-f");
-      const name = optionalName(args, "cdxx use [name]") ?? await chooseProfileForUse();
+      const name = optionalName(args, "cdxx use [name]") ?? await browseProfiles("use");
       if (!name) return 0;
       const result = await useProfileCommand(name, { force });
       if (!result) return 0;
@@ -537,7 +614,7 @@ async function runWrapperCommand(command, args) {
       return 0;
     }
     case "list":
-      printProfiles(await loadStateForDisplay());
+      await browseProfiles("list");
       return 0;
     case "current": {
       const state = await loadState();
@@ -551,7 +628,7 @@ async function runWrapperCommand(command, args) {
       return await configure(args);
     case "autoswitch":
       await setAutoswitch(args.shift());
-      if (args.length) throw new Error("Usage: cdxx autoswitch [on|off]");
+      if (args.length) throw new Error("Usage: cdxx autoswitch [scope-first|off]");
       return 0;
     case "yolo":
       await setYolo(args.shift());
@@ -561,6 +638,12 @@ async function runWrapperCommand(command, args) {
       await removeProfile(requireOne(args, "cdxx remove <name>"));
       console.log("Removed.");
       return 0;
+    case "rename": {
+      if (args.length !== 2) throw new Error("Usage: cdxx rename <old> <new>");
+      const renamed = await renameProfile(args[0], args[1]);
+      if (renamed) console.log(`Renamed '${args[0]}' to '${args[1]}'.`);
+      return 0;
+    }
     case "status":
       await printStatus();
       return 0;
@@ -639,7 +722,7 @@ async function main() {
       return await loginProfile(optionalName(args, "cdxx login [name]"));
     case "use": {
       const force = takeFlag(args, "--force") || takeFlag(args, "-f");
-      const name = optionalName(args, "cdxx use [name]") ?? await chooseProfileForUse();
+      const name = optionalName(args, "cdxx use [name]") ?? await browseProfiles("use");
       if (!name) return 0;
       const result = await useProfileCommand(name, { force });
       if (!result) return 0;
@@ -663,7 +746,7 @@ async function main() {
       return 0;
     }
     case "list":
-      printProfiles(await loadStateForDisplay());
+      await browseProfiles("list");
       return 0;
     case "current": {
       const state = await loadState();
@@ -675,7 +758,7 @@ async function main() {
     }
     case "autoswitch":
       await setAutoswitch(args.shift());
-      if (args.length) throw new Error("Usage: cdxx autoswitch [on|off]");
+      if (args.length) throw new Error("Usage: cdxx autoswitch [scope-first|off]");
       return 0;
     case "yolo":
       await setYolo(args.shift());
@@ -686,6 +769,12 @@ async function main() {
     case "remove":
       await removeProfile(requireOne(args, "cdxx remove <name>"));
       return 0;
+    case "rename": {
+      if (args.length !== 2) throw new Error("Usage: cdxx rename <old> <new>");
+      const renamed = await renameProfile(args[0], args[1]);
+      if (renamed) console.log(`Renamed '${args[0]}' to '${args[1]}'.`);
+      return 0;
+    }
     case "status":
       await printStatus();
       return 0;
@@ -695,6 +784,8 @@ async function main() {
       return await supervisorLaunchArgs(args.shift());
     case "_status-probe-record":
       return await statusProbeRecord();
+    case "_status-probe-profile-record":
+      return await statusProbeProfileRecord(args);
     default:
       throw new Error(`Unknown command: ${command}\n\n${help}`);
   }

@@ -155,6 +155,36 @@ export function decideUseProfile(
   return { type: "select", candidates: [...candidates] };
 }
 
+export const explicitProfileUsePolicy = {
+  unavailableProfileAction: "confirm",
+  confirmationDefault: false,
+} as const;
+
+export type ExplicitProfileUseDecision =
+  | { type: "already-active" }
+  | { type: "activate"; force: false }
+  | { type: "confirm"; force: true; reason: string; message: string; defaultValue: false };
+
+/**
+ * Manual profile selection is an explicit user override, not automatic
+ * failover. Unavailable profiles therefore remain chooseable, but require a
+ * negative-default confirmation before adapters bypass their normal guards.
+ */
+export function decideExplicitProfileUse(
+  candidate: UseProfileCandidate,
+): ExplicitProfileUseDecision {
+  if (candidate.active) return { type: "already-active" };
+  if (candidate.selectable) return { type: "activate", force: false };
+  const reason = candidate.disabledReason ?? "not selectable";
+  return {
+    type: explicitProfileUsePolicy.unavailableProfileAction,
+    force: true,
+    reason,
+    message: `Profile '${candidate.name}' is marked ${reason}. Switch anyway?`,
+    defaultValue: explicitProfileUsePolicy.confirmationDefault,
+  };
+}
+
 export interface LoginSemantics {
   command: readonly string[];
   clearsActiveCredentialAtStart: boolean;
@@ -167,6 +197,84 @@ export interface LoginSemantics {
 export interface CredentialSemantics {
   activeLocations: readonly string[];
   savedProfileLocation: string;
+  lifecycle: CredentialLifecyclePolicy;
+}
+
+export interface CredentialLifecyclePolicy {
+  activeCredentialMayMutate: true;
+  persistActiveBeforeReplacement: true;
+  persistAfterRefreshCapableOperation: true;
+  isolatedCredentialMutationsMustMergeBack: true;
+  concurrentRefreshesAllowed: false;
+}
+
+/**
+ * OAuth providers differ in whether refresh tokens rotate, but wrappers must
+ * treat every active credential as mutable. This stricter policy also covers
+ * reusable refresh tokens and keeps saved profiles from retaining expired
+ * access-token snapshots.
+ */
+export const credentialLifecyclePolicy: CredentialLifecyclePolicy = {
+  activeCredentialMayMutate: true,
+  persistActiveBeforeReplacement: true,
+  persistAfterRefreshCapableOperation: true,
+  isolatedCredentialMutationsMustMergeBack: true,
+  concurrentRefreshesAllowed: false,
+};
+
+export interface CredentialPersistenceAdapter<TCredential> {
+  readCurrentCredential(): Promise<TCredential | undefined>;
+  writeProfileCredential(profileName: string, credential: TCredential): Promise<void>;
+  credentialIsValid?(credential: TCredential): boolean | Promise<boolean>;
+}
+
+/** Persist the current mutable credential into its canonical saved profile. */
+export async function persistCurrentCredential<TCredential>(
+  adapter: CredentialPersistenceAdapter<TCredential>,
+  profileName: string | undefined,
+): Promise<boolean> {
+  if (!profileName) return false;
+  const credential = await adapter.readCurrentCredential();
+  if (credential === undefined) return false;
+  if (adapter.credentialIsValid && !await adapter.credentialIsValid(credential)) {
+    throw new Error(`Refusing to persist an invalid credential for profile '${profileName}'.`);
+  }
+  await adapter.writeProfileCredential(profileName, credential);
+  return true;
+}
+
+/**
+ * Merge credential mutations back even when the provider operation later
+ * fails. A refresh can succeed before a quota/status request fails, and losing
+ * that mutation can invalidate rotating refresh-token families.
+ */
+export async function runRefreshableCredentialOperation<TCredential, TResult>(
+  adapter: CredentialPersistenceAdapter<TCredential>,
+  profileName: string,
+  operation: () => Promise<TResult>,
+): Promise<TResult> {
+  let result: TResult | undefined;
+  let operationError: unknown;
+  try {
+    result = await operation();
+  } catch (error) {
+    operationError = error;
+  }
+
+  try {
+    await persistCurrentCredential(adapter, profileName);
+  } catch (persistenceError) {
+    if (operationError !== undefined) {
+      throw new AggregateError(
+        [operationError, persistenceError],
+        `Credential operation and persistence both failed for profile '${profileName}'.`,
+      );
+    }
+    throw persistenceError;
+  }
+
+  if (operationError !== undefined) throw operationError;
+  return result as TResult;
 }
 
 export interface AgentCliManifest {
@@ -175,6 +283,150 @@ export interface AgentCliManifest {
   executable: string;
   login: LoginSemantics;
   credentials: CredentialSemantics;
+  quotaFailover: QuotaFailoverSemantics;
+}
+
+export const autoSwitchModes = ["off", "scope-first", "all-scopes"] as const;
+export type AutoSwitchMode = typeof autoSwitchModes[number];
+export type CandidateQuotaPolicy = "trigger-scope" | "any-scope";
+export const eligibilityModes = ["allow", "block"] as const;
+export type EligibilityMode = typeof eligibilityModes[number];
+export const transcriptRecoveryDiagnoses = [
+  "file_change_notification_missing",
+  "new_file_notification_missing",
+  "directory_watcher_missing",
+  "notified_change_not_drained",
+] as const;
+export type TranscriptRecoveryDiagnosis = typeof transcriptRecoveryDiagnoses[number];
+
+export interface UnmanagedTranscriptObservationSemantics {
+  changeNotifications: "hint";
+  reconcileTrackedFileSizes: boolean;
+  reconcileRecentSessionDirectories: boolean;
+  activeFileHorizonMs: number;
+  maxReconcileDelayMs: number;
+  heartbeatIntervalMs: number;
+  recoveryDiagnoses: readonly TranscriptRecoveryDiagnosis[];
+}
+
+/**
+ * Unmanaged transcript observation cannot rely on best-effort filesystem
+ * notifications for correctness. Notifications reduce latency; bounded metadata
+ * reconciliation provides delivery and the evidence needed to classify misses.
+ */
+export const unmanagedTranscriptObservationPolicy = {
+  changeNotifications: "hint",
+  reconcileTrackedFileSizes: true,
+  reconcileRecentSessionDirectories: true,
+  activeFileHorizonMs: 48 * 60 * 60 * 1000,
+  maxReconcileDelayMs: 1_000,
+  heartbeatIntervalMs: 30_000,
+  recoveryDiagnoses: transcriptRecoveryDiagnoses,
+} as const satisfies UnmanagedTranscriptObservationSemantics;
+
+export interface QuotaFailoverSemantics {
+  definitiveLiveExhaustionSwitchesImmediately: boolean;
+  usageRefreshMayBlockFailover: boolean;
+  observesUnmanagedSessionTranscripts: boolean;
+  supportedAutoSwitchModes: readonly AutoSwitchMode[];
+  defaultAutoSwitchMode: AutoSwitchMode;
+  candidateQuotaPolicy: CandidateQuotaPolicy;
+  unsupportedAutoSwitchModes?: Partial<Record<AutoSwitchMode, string>>;
+  supportedEligibilityModes: readonly EligibilityMode[];
+  defaultEligibilityMode?: EligibilityMode;
+  unsupportedEligibilityReason?: string;
+  unmanagedTranscriptObservation?: UnmanagedTranscriptObservationSemantics;
+}
+
+export interface LiveQuotaFailoverDecision {
+  switchImmediately: boolean;
+  usageRefreshMayBlock: false;
+}
+
+export interface AutoSwitchAction {
+  kind: "none" | "switched" | "sessions_restarted" | "stop_retrying";
+  reason?: string;
+  profile?: string;
+  email?: string;
+  message?: string;
+  retryKey?: string;
+  [key: string]: unknown;
+}
+
+export function stopRetryingAutoSwitch(
+  reason: string,
+  message: string,
+  extra: Record<string, unknown> = {},
+): AutoSwitchAction {
+  return {
+    ok: false,
+    kind: "stop_retrying",
+    reason,
+    message,
+    ...extra,
+  };
+}
+
+export function decideLiveQuotaFailover(
+  definitiveExhaustion: boolean,
+): LiveQuotaFailoverDecision {
+  return {
+    switchImmediately: definitiveExhaustion,
+    usageRefreshMayBlock: false,
+  };
+}
+
+export interface ObservedProfileFailoverDecision {
+  switchProfile: boolean;
+  reason: "profile_matches" | "missing_observed_profile" | "missing_active_profile" | "profile_already_switched";
+}
+
+/**
+ * Gate a quota-triggered auth switch using the profile that owned the turn.
+ * The caller must evaluate this decision while holding its auth-switch lock so
+ * concurrent failures from the previous profile cannot cascade across accounts.
+ */
+export function decideObservedProfileFailover(
+  observedProfile: string | undefined,
+  activeProfile: string | undefined,
+): ObservedProfileFailoverDecision {
+  if (!observedProfile) return { switchProfile: false, reason: "missing_observed_profile" };
+  if (!activeProfile) return { switchProfile: false, reason: "missing_active_profile" };
+  if (observedProfile !== activeProfile) {
+    return { switchProfile: false, reason: "profile_already_switched" };
+  }
+  return { switchProfile: true, reason: "profile_matches" };
+}
+
+/**
+ * Tracks immutable session-to-profile ownership while allowing a parent
+ * session's owner to change between turns. Child ownership is copied when the
+ * child is observed, so later parent turns cannot rewrite existing children.
+ */
+export class SessionProfileOwnershipRegistry {
+  readonly #owners = new Map<string, string>();
+
+  owner(sessionId: string | undefined): string | undefined {
+    return sessionId ? this.#owners.get(sessionId) : undefined;
+  }
+
+  bind(sessionId: string | undefined, profileName: string | undefined): string | undefined {
+    if (!sessionId || !profileName) return undefined;
+    this.#owners.set(sessionId, profileName);
+    return profileName;
+  }
+
+  inherit(
+    sessionId: string | undefined,
+    parentSessionId: string | undefined,
+  ): string | undefined {
+    if (!sessionId || !parentSessionId) return undefined;
+    return this.bind(sessionId, this.owner(parentSessionId));
+  }
+
+  forget(sessionId: string | undefined): void {
+    if (sessionId) this.#owners.delete(sessionId);
+  }
 }
 
 export const agentCliManifests = {
@@ -196,6 +448,17 @@ export const agentCliManifests = {
         "legacy macOS Keychain gemini/antigravity",
       ],
       savedProfileLocation: "agyx credential vault by profile name",
+      lifecycle: credentialLifecyclePolicy,
+    },
+    quotaFailover: {
+      definitiveLiveExhaustionSwitchesImmediately: true,
+      usageRefreshMayBlockFailover: false,
+      observesUnmanagedSessionTranscripts: false,
+      supportedAutoSwitchModes: ["off", "scope-first", "all-scopes"],
+      defaultAutoSwitchMode: "all-scopes",
+      candidateQuotaPolicy: "trigger-scope",
+      supportedEligibilityModes: ["allow", "block"],
+      defaultEligibilityMode: "allow",
     },
   },
   codex: {
@@ -216,6 +479,21 @@ export const agentCliManifests = {
         "~/.codex/auth.json",
       ],
       savedProfileLocation: "cdxx profiles directory by profile name",
+      lifecycle: credentialLifecyclePolicy,
+    },
+    quotaFailover: {
+      definitiveLiveExhaustionSwitchesImmediately: true,
+      usageRefreshMayBlockFailover: false,
+      observesUnmanagedSessionTranscripts: true,
+      supportedAutoSwitchModes: ["off", "scope-first"],
+      defaultAutoSwitchMode: "off",
+      candidateQuotaPolicy: "any-scope",
+      unsupportedAutoSwitchModes: {
+        "all-scopes": "Codex quota windows are cumulative blockers, not independently usable scopes; waiting for all windows would stall after the first exhausted window.",
+      },
+      supportedEligibilityModes: [],
+      unsupportedEligibilityReason: "Codex auth and status data expose no eligibility state separate from credential validity, so cdxx cannot safely offer allow/block eligibility filtering.",
+      unmanagedTranscriptObservation: unmanagedTranscriptObservationPolicy,
     },
   },
 } as const satisfies Record<string, AgentCliManifest>;
@@ -252,6 +530,7 @@ export async function appendAgentEvent(path: string, event: AgentEvent): Promise
 export interface SessionControlAdapter<TRecord extends ManagedSessionRecord> {
   sessionRecords(): Promise<TRecord[]>;
   pause(record: TRecord): Promise<TRecord>;
+  notify?(record: TRecord, message: string): Promise<void>;
   resume?(record: TRecord): Promise<void>;
   afterPause?(paused: readonly TRecord[]): Promise<void>;
   onResumeError?(record: TRecord, error: unknown): void;
@@ -289,14 +568,34 @@ export interface AuthSwitchTransactionAdapter<TRecord extends ManagedSessionReco
   withLock?<T>(operation: () => Promise<T>): Promise<T>;
 }
 
+export const quotaSwitchNoticeLeadingCrLfCount = 3;
+
+export function quotaSwitchingNotice(productName: string): string {
+  return "\r\n".repeat(quotaSwitchNoticeLeadingCrLfCount)
+    + `[${productName}] Quota detected; switching profiles...`;
+}
+
+export interface AuthSwitchTransactionOptions {
+  resume?: boolean;
+  switchingNotice?: string;
+}
+
 export async function runAuthSwitchTransaction<TRecord extends ManagedSessionRecord, TResult>(
   adapter: AuthSwitchTransactionAdapter<TRecord>,
   operation: () => Promise<TResult>,
-  options: { resume?: boolean } = {},
+  options: AuthSwitchTransactionOptions = {},
 ): Promise<TResult> {
   const run = async (): Promise<TResult> => {
     const records = await pauseAllSessions(adapter.sessionControl);
     try {
+      if (options.switchingNotice) {
+        if (!adapter.sessionControl.notify) {
+          throw new Error("Session adapter does not implement switching notices.");
+        }
+        for (const record of records) {
+          await adapter.sessionControl.notify(record, options.switchingNotice);
+        }
+      }
       return await operation();
     } finally {
       if (options.resume ?? true) {
@@ -307,15 +606,36 @@ export async function runAuthSwitchTransaction<TRecord extends ManagedSessionRec
   return adapter.withLock ? await adapter.withLock(run) : await run();
 }
 
-export type UsageCheckReason =
-  | "explicit-scan"
-  | "manual-record"
-  | "live-quota-trigger"
-  | "session-exit"
-  | "list"
-  | "use";
-
 export type UsageCheckMode = "refresh" | "local-scan" | "state-only";
+
+export interface UsageCheckPolicy {
+  mode: UsageCheckMode;
+  foregroundAllowed: boolean;
+}
+
+export const usageCheckPolicies = {
+  "explicit-scan": { mode: "refresh", foregroundAllowed: true },
+  "manual-record": { mode: "refresh", foregroundAllowed: true },
+  "session-start": { mode: "refresh", foregroundAllowed: false },
+  "live-quota-trigger": { mode: "refresh", foregroundAllowed: false },
+  "background-live-quota-refresh": { mode: "refresh", foregroundAllowed: false },
+  "session-exit": { mode: "local-scan", foregroundAllowed: true },
+  list: { mode: "state-only", foregroundAllowed: true },
+  use: { mode: "state-only", foregroundAllowed: true },
+} as const satisfies Record<string, UsageCheckPolicy>;
+
+export type UsageCheckReason = keyof typeof usageCheckPolicies;
+
+export const usageCheckReasons = {
+  explicitScan: "explicit-scan",
+  manualRecord: "manual-record",
+  sessionStart: "session-start",
+  liveQuotaTrigger: "live-quota-trigger",
+  backgroundLiveQuotaRefresh: "background-live-quota-refresh",
+  sessionExit: "session-exit",
+  list: "list",
+  use: "use",
+} as const satisfies Record<string, UsageCheckReason>;
 
 export interface UsageScopeSnapshot {
   status: "available" | "exhausted" | "unknown";
@@ -335,23 +655,43 @@ export interface UsageSnapshot<TScope extends string = string> {
   reason?: string;
 }
 
+/**
+ * Preserve a live exhaustion signal even when an AI CLI cannot identify the
+ * affected quota scope. Explicit scope evidence wins; otherwise the generic
+ * unknown scope becomes exhausted until a later usage refresh supplies detail.
+ */
+export function ensureExhaustedUsageScope<TScope extends string>(
+  snapshot: UsageSnapshot<TScope>,
+  unknownScope: TScope,
+  checkedAt = new Date().toISOString(),
+): UsageSnapshot<TScope> {
+  if (!snapshot.exhausted) return snapshot;
+  const scopes = snapshot.scopes ?? {};
+  if (Object.values(scopes as Record<string, UsageScopeSnapshot | undefined>)
+    .some((scope) => scope?.status === "exhausted")) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    scopes: {
+      ...scopes,
+      [unknownScope]: {
+        status: "exhausted",
+        resetAt: snapshot.resetAt,
+        reason: snapshot.reason ?? "quota exhausted",
+        checkedAt,
+      },
+    },
+  };
+}
+
 export interface UsageRefreshAdapter<TSnapshot extends UsageSnapshot = UsageSnapshot> {
   refreshUsage(reason: UsageCheckReason): Promise<TSnapshot | undefined>;
   scanLocalUsage?(reason: UsageCheckReason): Promise<TSnapshot | undefined>;
 }
 
 export function usageCheckMode(reason: UsageCheckReason): UsageCheckMode {
-  switch (reason) {
-    case "explicit-scan":
-    case "manual-record":
-    case "live-quota-trigger":
-      return "refresh";
-    case "session-exit":
-      return "local-scan";
-    case "list":
-    case "use":
-      return "state-only";
-  }
+  return usageCheckPolicies[reason].mode;
 }
 
 export async function runUsageCheck<TSnapshot extends UsageSnapshot>(
@@ -387,6 +727,190 @@ export interface GenericProfileRecord {
   quotaStatus?: "unknown" | "available" | "exhausted";
   quotaResetAt?: string;
   lastQuotaReason?: string;
+  lastQuotaErrorAt?: string;
+  disabled?: boolean;
+  credentialStatus?: "unknown" | "verified" | "mismatch" | "error";
+  eligibilityStatus?: "unknown" | "eligible" | "ineligible";
+  quotaScopes?: Readonly<Record<string, GenericQuotaScopeRecord | undefined>>;
+}
+
+export interface GenericQuotaScopeRecord {
+  status: "available" | "exhausted" | "unknown";
+  resetAt?: string;
+  checkedAt?: string;
+  errorAt?: string;
+}
+
+export const defaultResetlessQuotaTtlMs = 24 * 60 * 60 * 1000;
+
+export function resetlessQuotaExpired(
+  checkedAt: string | undefined,
+  now = new Date(),
+  ttlMs = defaultResetlessQuotaTtlMs,
+): boolean {
+  if (!checkedAt) return false;
+  const checkedMs = Date.parse(checkedAt);
+  return Number.isFinite(checkedMs) && now.getTime() - checkedMs >= ttlMs;
+}
+
+export interface AutoSwitchSelectionOptions<TScope extends string = string> {
+  mode: AutoSwitchMode;
+  triggerScope: TScope;
+  switchableScopes: readonly TScope[];
+  candidateQuotaPolicy: CandidateQuotaPolicy;
+  unknownScope?: TScope;
+  allowIneligibleActivation?: boolean;
+  scopeAliases?: (scope: TScope) => readonly TScope[];
+  now?: Date;
+}
+
+function quotaResetActive(resetAt: string | undefined, now: Date): boolean {
+  return !resetAt || Date.parse(resetAt) > now.getTime();
+}
+
+function profileWideQuotaActive<TProfile extends GenericProfileRecord, TScope extends string>(
+  profile: TProfile,
+  options: AutoSwitchSelectionOptions<TScope>,
+): boolean {
+  const now = options.now ?? new Date();
+  if (profile.quotaStatus === "exhausted" && quotaResetActive(profile.quotaResetAt, now)) {
+    return true;
+  }
+  const unknownScope = options.unknownScope ?? ("unknown" as TScope);
+  const unknown = profile.quotaScopes?.[unknownScope];
+  return Boolean(
+    unknown?.status === "exhausted"
+    && quotaResetActive(unknown.resetAt, now),
+  );
+}
+
+export function isProfileScopeExhausted<
+  TProfile extends GenericProfileRecord,
+  TScope extends string,
+>(
+  profile: TProfile,
+  scope: TScope,
+  options: AutoSwitchSelectionOptions<TScope>,
+): boolean {
+  const now = options.now ?? new Date();
+  const unknownScope = options.unknownScope ?? ("unknown" as TScope);
+  if (scope === unknownScope) return profileWideQuotaActive(profile, options);
+  if (profileWideQuotaActive(profile, options)) return true;
+  const aliases = options.scopeAliases?.(scope) ?? [scope];
+  return aliases.some((candidate) => {
+    const quota = profile.quotaScopes?.[candidate];
+    return quota?.status === "exhausted" && quotaResetActive(quota.resetAt, now);
+  });
+}
+
+function hasAnySwitchableQuota<TProfile extends GenericProfileRecord, TScope extends string>(
+  profile: TProfile,
+  options: AutoSwitchSelectionOptions<TScope>,
+): boolean {
+  return options.switchableScopes.some((scope) =>
+    isProfileScopeExhausted(profile, scope, options)
+  );
+}
+
+export function shouldAutoSwitchForQuota<
+  TProfile extends GenericProfileRecord,
+  TScope extends string,
+>(
+  profile: TProfile | undefined,
+  options: AutoSwitchSelectionOptions<TScope>,
+): boolean {
+  if (!profile || options.mode === "off") return false;
+  if (options.mode === "scope-first") return true;
+  const unknownScope = options.unknownScope ?? ("unknown" as TScope);
+  if (options.triggerScope === unknownScope) return true;
+  return options.switchableScopes.every((scope) =>
+    isProfileScopeExhausted(profile, scope, options)
+  );
+}
+
+function baseProfileSelectable<TProfile extends GenericProfileRecord>(
+  profile: TProfile,
+  allowIneligibleActivation: boolean,
+): boolean {
+  return !profile.disabled
+    && profile.credentialStatus !== "mismatch"
+    && profile.credentialStatus !== "error"
+    && (profile.eligibilityStatus !== "ineligible" || allowIneligibleActivation);
+}
+
+function earliestActiveQuotaReset<TProfile extends GenericProfileRecord>(
+  profile: TProfile,
+  now: Date,
+): number {
+  const values = [
+    profile.quotaResetAt,
+    ...Object.values(profile.quotaScopes ?? {}).map((quota) => quota?.resetAt),
+  ]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => Date.parse(value))
+    .filter((value) => Number.isFinite(value) && value > now.getTime());
+  return values.length ? Math.min(...values) : 0;
+}
+
+export function selectAutoSwitchCandidate<
+  TProfile extends GenericProfileRecord,
+  TScope extends string,
+>(
+  state: GenericProfileState<TProfile>,
+  options: AutoSwitchSelectionOptions<TScope>,
+): TProfile | undefined {
+  const now = options.now ?? new Date();
+  const activeIndex = state.activeProfile
+    ? state.profiles.findIndex(({ name }) => name === state.activeProfile)
+    : -1;
+  const unknownScope = options.unknownScope ?? ("unknown" as TScope);
+  const targetScopes = options.triggerScope === unknownScope
+    ? options.switchableScopes
+    : [options.triggerScope];
+
+  return state.profiles
+    .map((profile, index) => {
+      if (profile.name === state.activeProfile) return undefined;
+      if (!baseProfileSelectable(profile, options.allowIneligibleActivation ?? true)) return undefined;
+      const blocked = options.candidateQuotaPolicy === "any-scope"
+        ? profileWideQuotaActive(profile, options) || hasAnySwitchableQuota(profile, options)
+        : targetScopes.some((scope) => isProfileScopeExhausted(profile, scope, options));
+      if (blocked) return undefined;
+      const category = options.mode === "all-scopes" && hasAnySwitchableQuota(profile, options)
+        ? 1
+        : 0;
+      const offset = activeIndex < 0
+        ? index
+        : (index - activeIndex + state.profiles.length) % state.profiles.length;
+      return {
+        profile,
+        category,
+        resetAt: earliestActiveQuotaReset(profile, now),
+        offset,
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+    .sort((left, right) =>
+      left.category - right.category
+      || left.resetAt - right.resetAt
+      || left.offset - right.offset
+    )[0]?.profile;
+}
+
+export function selectRoundRobinProfile<TProfile extends GenericProfileRecord>(
+  state: GenericProfileState<TProfile>,
+  selectable: (profile: TProfile) => boolean,
+): TProfile | undefined {
+  if (!state.profiles.length) return undefined;
+  const activeIndex = state.activeProfile
+    ? state.profiles.findIndex(({ name }) => name === state.activeProfile)
+    : -1;
+  const candidateCount = activeIndex < 0 ? state.profiles.length : state.profiles.length - 1;
+  for (let step = 1; step <= candidateCount; step += 1) {
+    const profile = state.profiles[(activeIndex + step + state.profiles.length) % state.profiles.length]!;
+    if (selectable(profile)) return profile;
+  }
+  return undefined;
 }
 
 export interface GenericProfileState<TProfile extends GenericProfileRecord> {
@@ -505,20 +1029,6 @@ export function nativeSupervisorHostStatus(
   };
 }
 
-export const agentProfileTableHeaders = [
-  "",
-  "#",
-  "name",
-  "expected-email",
-  "actual-email",
-  "status",
-  "quota-reset",
-  "last-request",
-  "activated",
-  "verified",
-  "switches",
-] as const;
-
 export function relativeTime(value: string | undefined, now = new Date()): string {
   if (!value) return "-";
   const timestamp = Date.parse(value);
@@ -535,6 +1045,8 @@ export function relativeTime(value: string | undefined, now = new Date()): strin
   const amount = Math.max(1, Math.round(absolute / unitMs));
   return delta >= 0 ? `in ${amount}${suffix}` : `${amount}${suffix} ago`;
 }
+
+export * from "./profile_ui.js";
 
 export interface RestartNoticeOptions {
   productName: string;

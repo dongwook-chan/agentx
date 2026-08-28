@@ -10,7 +10,9 @@ if (command === "daemon") {
   await runHookStdin();
 } else if (command === "sessions") {
   console.log(JSON.stringify(await sendSupervisor({ command: "sessions" }), null, 2));
+} else if (command === "watcher-status") {
+  console.log(JSON.stringify(await sendSupervisor({ command: "watcher-status" }), null, 2));
 } else {
-  console.error("Usage: agentx-supervisor <daemon|codex-hook|sessions>");
+  console.error("Usage: agentx-supervisor <daemon|codex-hook|sessions|watcher-status>");
   process.exitCode = 1;
 }

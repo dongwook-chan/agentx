@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SupervisorDaemon } from "../src/daemon.js";
@@ -10,7 +10,7 @@ import { registerCodexHook } from "../src/hook.js";
 test("SessionStart hook binds exact Codex session id and transcript to launcher", async () => {
   const root = await mkdtemp(join(tmpdir(), "agentx-supervisor-hook-"));
   const socketPath = join(root, "supervisor.sock");
-  const daemon = new SupervisorDaemon({ socketPath, statePath: join(root, "state.json") });
+  const daemon = new SupervisorDaemon({ socketPath, statePath: join(root, "state.json"), enableGlobalCodexWatch: false });
   await daemon.start();
   try {
     await sendSupervisor({
@@ -47,7 +47,7 @@ test("SessionStart hook binds exact Codex session id and transcript to launcher"
 test("stale launchers are pruned without failing pause", async () => {
   const root = await mkdtemp(join(tmpdir(), "agentx-supervisor-stale-"));
   const socketPath = join(root, "supervisor.sock");
-  const daemon = new SupervisorDaemon({ socketPath, statePath: join(root, "state.json") });
+  const daemon = new SupervisorDaemon({ socketPath, statePath: join(root, "state.json"), enableGlobalCodexWatch: false });
   await daemon.start();
   try {
     daemon.sessions.set("stale", {
@@ -170,6 +170,117 @@ test("one Codex failure batch triggers only one failover", async () => {
     await daemon.scan(session);
     assert.equal(events.length, 1);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("daemon global watcher forwards unmanaged Codex quota with its turn-start profile", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentx-supervisor-global-"));
+  const sessionsDir = join(root, "codex", "sessions");
+  const transcript = join(sessionsDir, "rollout-00000000-0000-0000-0000-000000000456.jsonl");
+  const events = [];
+  let activeProfile = "account-a";
+  await mkdir(sessionsDir, { recursive: true });
+  await writeFile(transcript, `${JSON.stringify({
+    type: "session_meta",
+    payload: { id: "00000000-0000-0000-0000-000000000456" },
+  })}\n`);
+  const daemon = new SupervisorDaemon({
+    socketPath: join(root, "supervisor.sock"),
+    statePath: join(root, "state.json"),
+    globalCodexSessionsDir: sessionsDir,
+    activeProfile: async () => activeProfile,
+    failover: async (session, event) => events.push({ session, event }),
+    logEvent: async () => undefined,
+  });
+  await daemon.start();
+  try {
+    await appendFile(transcript, `${JSON.stringify({
+      type: "event_msg",
+      payload: { type: "task_started" },
+    })}\n`);
+    daemon.globalCodexWatcher.markDirty(transcript);
+    await daemon.globalCodexWatcher.drain();
+    activeProfile = "account-b";
+    await appendFile(transcript, `${JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        error: {
+          message: "You've hit your usage limit.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      },
+    })}\n`);
+    daemon.globalCodexWatcher.markDirty(transcript);
+    await daemon.globalCodexWatcher.drain();
+
+    assert.equal(events.length, 1);
+    assert.equal(events[0].session.launcherId, "global-codex-sessions");
+    assert.equal(events[0].session.profileName, "account-a");
+    assert.equal(events[0].session.sessionId, "00000000-0000-0000-0000-000000000456");
+    assert.equal(events[0].event.reachedType, "usage_limit_exceeded");
+  } finally {
+    await daemon.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("daemon records classified recovery and exposes live watcher diagnostics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agentx-supervisor-global-recovery-"));
+  const sessionsDir = join(root, "codex", "sessions");
+  const transcript = join(sessionsDir, "rollout-00000000-0000-0000-0000-000000000789.jsonl");
+  const failovers = [];
+  const logged = [];
+  await mkdir(sessionsDir, { recursive: true });
+  await writeFile(transcript, `${JSON.stringify({
+    type: "session_meta",
+    payload: { id: "00000000-0000-0000-0000-000000000789" },
+  })}\n`);
+  const daemon = new SupervisorDaemon({
+    socketPath: join(root, "supervisor.sock"),
+    statePath: join(root, "state.json"),
+    globalCodexSessionsDir: sessionsDir,
+    globalCodexWatcherOptions: {
+      reconcileIntervalMs: 0,
+      watchFactory: () => ({ on() { return this; }, close() {} }),
+    },
+    activeProfile: async () => "account-a",
+    failover: async (session, event) => failovers.push({ session, event }),
+    logEvent: async (_product, event) => logged.push(event),
+  });
+  await daemon.start();
+  try {
+    await appendFile(transcript, `${JSON.stringify({
+      type: "event_msg",
+      payload: { type: "task_started" },
+    })}\n${JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        error: {
+          message: "You've hit your usage limit.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      },
+    })}\n`);
+    await daemon.globalCodexWatcher.drain();
+
+    assert.equal(failovers.length, 1);
+    assert.ok(logged.some((event) => event.event === "supervisor.global_watch.started"));
+    assert.ok(logged.some((event) => (
+      event.event === "supervisor.global_watch.recovered"
+      && event.diagnosis === "file_change_notification_missing"
+      && event.transcriptPath === transcript
+    )));
+    const status = await daemon.handle({ command: "watcher-status" });
+    assert.equal(status.ok, true);
+    assert.equal(status.pid, process.pid);
+    assert.equal(status.watcher.active, true);
+    assert.equal(status.watcher.sessionsDir, sessionsDir);
+    assert.equal(status.watcher.recoveryCounts.file_change_notification_missing, 1);
+  } finally {
+    await daemon.close();
     await rm(root, { recursive: true, force: true });
   }
 });

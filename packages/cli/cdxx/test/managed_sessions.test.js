@@ -4,13 +4,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { sendSupervisor } from "@dong-/agentx-supervisor";
 
 const root = await mkdtemp(join(tmpdir(), "cdxx-managed-sessions-"));
 process.env.CDXX_CONFIG_DIR = join(root, "config");
+process.env.AGENTX_SUPERVISOR_SOCKET = join(root, "agentx-supervisor.sock");
 
 const sessions = await import("../src/managed_sessions.js");
 
 after(async () => {
+  await sendSupervisor(
+    { command: "shutdown" },
+    { socketPath: process.env.AGENTX_SUPERVISOR_SOCKET, timeoutMs: 100 },
+  ).catch(() => undefined);
   await rm(root, { recursive: true, force: true });
 });
 
@@ -53,6 +59,7 @@ test("pauseAll and resumeAll use the managed session socket protocol", async () 
       return { ok: true, record: { ...record, childPid: undefined, paused: true } };
     }
     if (request.command === "resume") return { ok: true };
+    if (request.command === "notice") return { ok: true };
     return { ok: false, error: "unexpected" };
   });
   try {

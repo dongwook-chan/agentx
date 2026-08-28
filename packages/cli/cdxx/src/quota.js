@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { runUsageCheck } from "@dong-/agentx-core";
+import { ensureExhaustedUsageScope, runUsageCheck, usageCheckReasons } from "@dong-/agentx-core";
 import { codexHome, clearExpiredQuota, loadState, saveState } from "./config.js";
 import { probeCodexStatusQuota } from "./status_probe.js";
 
@@ -232,7 +232,13 @@ export function quotaScopesFromSummary(summary) {
       checkedAt,
     });
   }
-  return Object.keys(scopes).length ? scopes : undefined;
+  return ensureExhaustedUsageScope({
+    source: summary.source ?? "live",
+    exhausted: summary.exhausted,
+    resetAt: summary.resetAt,
+    reason: summary.reason,
+    scopes: Object.keys(scopes).length ? scopes : undefined,
+  }, codexQuotaScopes.unknown, checkedAt).scopes;
 }
 
 function updateSummary(summary, file, lineNumber, event) {
@@ -413,7 +419,7 @@ export async function scanCodexQuota(options = {}) {
     },
     scanLocalUsage: async () => await scanCodexSessions(options),
   };
-  const summary = await runUsageCheck(adapter, options.reason ?? "explicit-scan", {
+  const summary = await runUsageCheck(adapter, options.reason ?? usageCheckReasons.explicitScan, {
     allowLocalFallback: options.allowLocalFallback ?? true,
   });
   if (summary?.refreshError) summary.statusProbeError = summary.refreshError;

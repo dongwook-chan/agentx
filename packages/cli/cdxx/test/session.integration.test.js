@@ -19,6 +19,18 @@ async function waitFor(predicate, timeout = 5000) {
   throw new Error("Timed out waiting for condition");
 }
 
+async function shutdownTestSupervisor(socketPath) {
+  await sendSupervisor({ command: "shutdown" }, { socketPath }).catch(() => undefined);
+  await waitFor(async () => {
+    try {
+      await sendSupervisor({ command: "ping" }, { socketPath, timeoutMs: 50 });
+      return false;
+    } catch {
+      return true;
+    }
+  });
+}
+
 async function runCli(args, env) {
   return await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath, ...args], {
@@ -128,11 +140,12 @@ done
       supervisor.kill("SIGTERM");
       await new Promise((resolve) => supervisor.once("exit", resolve));
     }
+    await shutdownTestSupervisor(env.AGENTX_SUPERVISOR_SOCKET);
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("profile switch restart notice is printed in the supervised Codex terminal", async () => {
+test("quota switching notice is printed after pause in the supervised Codex terminal", async () => {
   const root = await mkdtemp(join(tmpdir(), "cdxx-session-notice-"));
   const fakeCodex = join(root, "codex");
   const launches = join(root, "launches.txt");
@@ -184,11 +197,14 @@ done
       const status = await sendSupervisor({ command: "status", launcherId: record.launcherId }, { socketPath }).catch(() => undefined);
       return status?.record && !status.record.childPid;
     });
+    const notice = "\r\n\r\n\r\n[cdxx] Quota detected; switching profiles...";
+    await sendSupervisor({ command: "notice", launcherId: record.launcherId, message: notice }, { socketPath });
+    await waitFor(async () => supervisorStderr.includes(notice));
     const resumed = await sendSupervisor({ command: "resume", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath });
     assert.equal(resumed.ok, true);
 
     await waitFor(async () =>
-      /Profile switch requested/.test(supervisorStderr)
+      /Quota detected; switching profiles/.test(supervisorStderr)
       && /Resuming Codex session after profile switch/.test(supervisorStderr)
     );
   } finally {
@@ -196,6 +212,7 @@ done
       supervisor.kill("SIGTERM");
       await new Promise((resolve) => supervisor.once("exit", resolve));
     }
+    await shutdownTestSupervisor(env.AGENTX_SUPERVISOR_SOCKET);
     await rm(root, { recursive: true, force: true });
   }
 });

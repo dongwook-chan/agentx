@@ -4,19 +4,29 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { sendSupervisor } from "@dong-/agentx-supervisor";
 
 const root = await mkdtemp(join(tmpdir(), "cdxx-failover-policy-"));
 process.env.CODEX_HOME = join(root, "codex-home");
 process.env.CDXX_CONFIG_DIR = join(root, "config");
+process.env.AGENTX_SUPERVISOR_SOCKET = join(root, "agentx-supervisor.sock");
 
 const auth = await import("../src/auth.js");
 const config = await import("../src/config.js");
 const sessions = await import("../src/managed_sessions.js");
-const { decideCodexFailover } = await import("../src/failover_policy.js");
+const { decideCodexFailover, quotaSummaryFromSupervisorPayload } = await import("../src/failover_policy.js");
 
 after(async () => {
+  await shutdownTestSupervisor();
   await rm(root, { recursive: true, force: true });
 });
+
+async function shutdownTestSupervisor() {
+  await sendSupervisor(
+    { command: "shutdown" },
+    { socketPath: process.env.AGENTX_SUPERVISOR_SOCKET, timeoutMs: 100 },
+  ).catch(() => undefined);
+}
 
 function codexAuth(accountId) {
   return JSON.stringify({
@@ -51,6 +61,7 @@ async function writeProfile(name, accountId = name) {
 }
 
 async function resetState() {
+  await shutdownTestSupervisor();
   await rm(root, { recursive: true, force: true });
   await mkdir(process.env.CODEX_HOME, { recursive: true });
   await mkdir(join(process.env.CDXX_CONFIG_DIR, "run"), { recursive: true });
@@ -92,6 +103,7 @@ test("quota failover switches under the shared paused-session transaction", asyn
     if (request.command === "pause") {
       return { ok: true, record: { ...record, childPid: undefined, paused: true } };
     }
+    if (request.command === "notice") return { ok: true };
     if (request.command === "resume") return { ok: true };
     return { ok: false, error: "unexpected" };
   });
@@ -110,8 +122,12 @@ test("quota failover switches under the shared paused-session transaction", asyn
     assert.equal(action.kind, "sessions_restarted");
     assert.equal(action.profile, "b");
     assert.deepEqual(
-      requests.map((request) => [request.command, request.reason]),
-      [["pause", "profile-switch"], ["resume", "profile-switch"]],
+      requests.map((request) => [request.command, request.reason, request.message]),
+      [
+        ["pause", "profile-switch", undefined],
+        ["notice", undefined, "\r\n\r\n\r\n[cdxx] Quota detected; switching profiles..."],
+        ["resume", "profile-switch", undefined],
+      ],
     );
     assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("b"));
     const state = await config.loadState();
@@ -121,16 +137,109 @@ test("quota failover switches under the shared paused-session transaction", asyn
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));
+    const productEvents = events.filter((event) => event.emitter !== "agentx-supervisor");
     assert.deepEqual(
-      events.map((event) => event.event),
+      productEvents.map((event) => event.event),
       ["quota.detected", "profile.selected", "switch.completed"],
     );
-    assert.equal(events[0].product, "cdxx");
-    assert.equal(events[0].profile, "a");
-    assert.equal(events[1].fromProfile, "a");
-    assert.equal(events[1].toProfile, "b");
-    assert.equal(events[2].actionKind, "sessions_restarted");
+    assert.equal(productEvents[0].product, "cdxx");
+    assert.equal(productEvents[0].profile, "a");
+    assert.equal(productEvents[1].fromProfile, "a");
+    assert.equal(productEvents[1].toProfile, "b");
+    assert.equal(productEvents[2].actionKind, "sessions_restarted");
   } finally {
     server.close();
   }
+});
+
+test("quota failover does not await background status refresh when reset metadata is missing", async () => {
+  await resetState();
+  let scheduledProfile;
+  const never = new Promise(() => undefined);
+
+  const liveSummary = quotaSummaryFromSupervisorPayload({
+    reason: "You've hit your usage limit.",
+  });
+  assert.equal(liveSummary.current.primary, undefined);
+  assert.equal(liveSummary.current.secondary, undefined);
+
+  const action = await Promise.race([
+    decideCodexFailover({
+      profileName: "a",
+      sessionId: "session-a",
+      reachedType: "usage_limit_exceeded",
+      reason: "You've hit your usage limit.",
+      timestamp: "2026-08-07T00:00:00.000Z",
+    }, {
+      scheduleStatusRefresh: (name) => {
+        scheduledProfile = name;
+        return never;
+      },
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("failover waited for status refresh")), 1000)),
+  ]);
+
+  assert.equal(action.kind, "sessions_restarted");
+  assert.equal(action.profile, "b");
+  assert.equal(scheduledProfile, "a");
+  assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("b"));
+  const state = await config.loadState();
+  assert.equal(state.activeProfile, "b");
+  const exhausted = state.profiles.find((profile) => profile.name === "a");
+  assert.equal(exhausted?.quotaStatus, "exhausted");
+  assert.equal(exhausted?.quotaScopes?.unknown?.status, "exhausted");
+});
+
+test("a stale concurrent quota event does not switch past the replacement profile", async () => {
+  await resetState();
+  const first = await decideCodexFailover({
+    profileName: "a",
+    sessionId: "session-a",
+    reachedType: "usage_limit_exceeded",
+    reason: "usage limit reached",
+    timestamp: "2026-08-13T00:00:00.000Z",
+  });
+  assert.equal(first.kind, "sessions_restarted");
+  assert.equal(first.profile, "b");
+
+  const stale = await decideCodexFailover({
+    profileName: "a",
+    sessionId: "session-b",
+    reachedType: "usage_limit_exceeded",
+    reason: "usage limit reached",
+    timestamp: "2026-08-13T00:00:00.100Z",
+  });
+  assert.equal(stale.kind, "none");
+  assert.equal(stale.reason, "profile_already_switched");
+  assert.equal(stale.profile, "b");
+  assert.equal((await config.loadState()).activeProfile, "b");
+});
+
+test("quota failover releases a stale resetless candidate before selection", async () => {
+  await resetState();
+  const state = await config.loadState();
+  const candidate = state.profiles.find((profile) => profile.name === "b");
+  candidate.quotaStatus = "exhausted";
+  candidate.lastQuotaReason = "copied historical usage-limit event";
+  candidate.quotaScopes = {
+    unknown: {
+      status: "exhausted",
+      reason: candidate.lastQuotaReason,
+      checkedAt: "2026-08-13T00:00:00.000Z",
+    },
+  };
+  await config.saveState(state);
+
+  const action = await decideCodexFailover({
+    profileName: "a",
+    sessionId: "session-a",
+    reachedType: "usage_limit_exceeded",
+    reason: "usage limit reached",
+    timestamp: "2026-08-17T00:00:00.000Z",
+  });
+
+  assert.equal(action.kind, "sessions_restarted");
+  assert.equal(action.profile, "b");
+  const updated = await config.loadState();
+  assert.equal(updated.profiles.find((profile) => profile.name === "b")?.quotaStatus, "available");
 });

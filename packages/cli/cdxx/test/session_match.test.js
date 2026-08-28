@@ -267,3 +267,21 @@ test("pickNextProfile never returns the current profile", () => {
 
   assert.equal(pickNextProfile(state), undefined);
 });
+
+test("pickNextProfile rejects candidates exhausted in any Codex quota window", () => {
+  const state = {
+    activeProfile: "a",
+    profiles: [
+      { name: "a", quotaStatus: "exhausted" },
+      {
+        name: "b",
+        quotaScopes: {
+          weekly: { status: "exhausted", resetAt: "2099-01-01T00:00:00.000Z" },
+        },
+      },
+      { name: "c", quotaStatus: "available" },
+    ],
+  };
+
+  assert.equal(pickNextProfile(state, "a", "5h").name, "c");
+});

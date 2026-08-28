@@ -44,6 +44,7 @@ struct SessionRecord {
 struct SessionCommand {
     command: String,
     reason: Option<String>,
+    message: Option<String>,
 }
 
 struct LaunchCommand {
@@ -121,8 +122,6 @@ impl Supervisor {
         self.terminal_log_offset = 0;
         self.usage_transcript_state = json!({ "inUsageView": false });
         let _ = fs::remove_file(&self.terminal_log_path);
-        let probe_profile_name = self.profile_at_start.clone();
-
         let launch_args =
             supervisor_launch_args(&self.args, self.conversation_id.as_deref(), &self.log_path)?;
         let launch_command =
@@ -143,9 +142,6 @@ impl Supervisor {
             .map_err(to_string)?;
         self.child = Some(child);
         self.persist()?;
-        if let Some(profile_name) = probe_profile_name {
-            start_usage_probe_thread(profile_name, self.real_agy.clone(), self.cwd.clone());
-        }
         Ok(())
     }
 
@@ -481,15 +477,18 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
     let mut guard = supervisor.lock().map_err(to_string)?;
     let reply = match request.command.as_str() {
         "pause" => {
-            if request.reason.as_deref() == Some("profile-switch") {
-                eprintln!(
-                    "[agyx] Profile switch requested; this agy session will restart with the active profile."
-                );
-            }
             guard.paused = true;
             guard.stop_child()?;
             let record = guard.persist()?;
             json!({ "ok": true, "record": record })
+        }
+        "notice" => {
+            let message = request.message.as_deref().ok_or("notice message is required")?;
+            std::io::stderr()
+                .write_all(format!("{message}\r\n").as_bytes())
+                .map_err(to_string)?;
+            std::io::stderr().flush().map_err(to_string)?;
+            json!({ "ok": true })
         }
         "resume" => {
             if request.reason.as_deref() == Some("profile-switch") {
@@ -748,141 +747,6 @@ fn usage_transcript_result(text: &str, state: &Value) -> Option<Value> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).ok()
-}
-
-fn usage_probe_result(profile_name: &str, real_agy: &str, cwd: &str) -> (Vec<String>, Vec<Value>) {
-    let payload = json!({
-        "profileName": profile_name,
-        "realAgy": real_agy,
-        "cwd": cwd,
-    });
-    let Ok(payload) = serde_json::to_string(&payload) else {
-        return (Vec::new(), Vec::new());
-    };
-    let output = if let Ok(cli_path) = env::var("AGYX_CLI_PATH") {
-        let node_path = env::var("AGYX_NODE_PATH").unwrap_or_else(|_| "node".to_string());
-        Command::new(node_path)
-            .arg(cli_path)
-            .arg("_usage-probe")
-            .arg(payload)
-            .stdin(Stdio::null())
-            .output()
-            .ok()
-    } else {
-        Command::new("agyx")
-            .arg("_usage-probe")
-            .arg(payload)
-            .stdin(Stdio::null())
-            .output()
-            .ok()
-    };
-    let Some(output) = output else {
-        return (Vec::new(), Vec::new());
-    };
-    if !output.status.success() {
-        return (Vec::new(), Vec::new());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) else {
-        return (Vec::new(), Vec::new());
-    };
-    let scopes = value
-        .get("exhaustedScopes")
-        .and_then(Value::as_array)
-        .map(|scopes| {
-            scopes
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let aggregates = value
-        .get("aggregates")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    (scopes, aggregates)
-}
-
-fn start_usage_probe_thread(profile_name: String, real_agy: String, cwd: String) {
-    thread::spawn(move || {
-        let mut probe_profile_name = Some(profile_name);
-        for _ in 0..5 {
-            let Some(current_profile_name) = probe_profile_name.clone() else {
-                return;
-            };
-            let (scopes, aggregates) = usage_probe_result(&current_profile_name, &real_agy, &cwd);
-            let had_exhausted_scope = !scopes.is_empty();
-            let mut triggered_scopes = HashSet::new();
-            for scope in scopes {
-                if !triggered_scopes.insert(scope.clone()) {
-                    continue;
-                }
-                if let Some(action) = trigger_auto_switch(&scope) {
-                    if action.get("kind").and_then(Value::as_str) == Some("switched") {
-                        print_usage_quota_scan(&current_profile_name, &aggregates);
-                    }
-                    if let Some(message) = action.get("message").and_then(Value::as_str) {
-                        eprintln!("{message}");
-                    }
-                }
-            }
-            let active = active_profile().ok().flatten();
-            if !had_exhausted_scope || active.as_deref() == Some(current_profile_name.as_str()) {
-                return;
-            }
-            probe_profile_name = active;
-        }
-    });
-}
-
-fn quota_scan_status(aggregates: &[Value], scope: &str) -> String {
-    let entry = aggregates.iter().find(|aggregate| {
-        aggregate.get("scope").and_then(Value::as_str) == Some(scope)
-    });
-    let Some(entry) = entry else {
-        return "unknown".to_string();
-    };
-    let percent = entry
-        .get("remainingPercent")
-        .and_then(Value::as_f64)
-        .map(color_quota_percent)
-        .unwrap_or_else(|| "unknown".to_string());
-    percent
-}
-
-fn color_enabled() -> bool {
-    env::var("AGYX_NO_COLOR").is_err()
-        && env::var("NO_COLOR").is_err()
-        && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
-}
-
-fn color_quota_percent(value: f64) -> String {
-    let percent = format!("{value:.2}%");
-    if !color_enabled() {
-        return percent;
-    }
-    let code = if value <= 20.0 {
-        "\x1b[31m"
-    } else if value < 50.0 {
-        "\x1b[38;5;208m"
-    } else {
-        "\x1b[32m"
-    };
-    format!("{code}{percent}\x1b[0m")
-}
-
-fn print_usage_quota_scan(profile_name: &str, aggregates: &[Value]) {
-    if aggregates.is_empty() {
-        return;
-    }
-    eprintln!(
-        "[agyx] usage scan: profile '{}' gemini {} claude {}.",
-        profile_name,
-        quota_scan_status(aggregates, "gemini"),
-        quota_scan_status(aggregates, "claude"),
-    );
 }
 
 fn find_real_agy() -> Result<String, String> {

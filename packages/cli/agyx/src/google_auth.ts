@@ -1,6 +1,7 @@
 interface GoogleKeyringCredential {
   token?: {
     access_token?: string;
+    refresh_token?: string;
   };
 }
 
@@ -15,6 +16,11 @@ function parseCredential(credential: Buffer): GoogleKeyringCredential | undefine
   } catch {
     return undefined;
   }
+}
+
+export function isValidAgyCredential(credential: Buffer): boolean {
+  const token = parseCredential(credential)?.token;
+  return Boolean(token?.access_token || token?.refresh_token);
 }
 
 async function fetchEmailFromUserInfo(accessToken: string): Promise<string | undefined> {

@@ -1,9 +1,10 @@
-import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { codexHome, ensureConfig, ensureDir, loadState, markActive, profileNameFromIdentity, profilesDir, saveState, uniqueProfileName, upsertProfile, validateProfileName } from "./config.js";
 import { withAuthSwitchLock } from "./lock.js";
 import { profileSelectableReason } from "./selection.js";
+import { decideExplicitProfileUse, persistCurrentCredential } from "@dong-/agentx-core";
 
 export const activeAuthPath = join(codexHome, "auth.json");
 
@@ -158,32 +159,43 @@ function resolveProfileName(state, summary) {
   return uniqueProfileName(profileNameFromIdentity(identity), state);
 }
 
-export async function refreshActiveProfileCredential() {
-  return await withAuthSwitchLock(async () => {
-    const state = await loadState();
-    if (!state.activeProfile) return undefined;
-    const active = state.profiles.find((profile) => profile.name === state.activeProfile);
-    if (!active) return undefined;
-    await stat(activeAuthPath).catch(() => undefined);
-    const raw = await readFile(activeAuthPath, "utf8").catch(() => undefined);
-    if (!raw) return undefined;
-    const target = profileAuthPath(active.name);
-    await ensureDir(join(profilesDir, active.name));
-    await writeFile(target, raw, { mode: 0o600 });
-    await chmod(target, 0o600).catch(() => undefined);
-    const summary = summarizeAuthJson(JSON.parse(raw));
-    Object.assign(active, {
-      email: summary.email ?? active.email,
-      accountId: summary.accountId ?? active.accountId,
-      authMode: summary.authMode ?? active.authMode,
-      hasApiKey: summary.hasApiKey,
-      hasRefreshToken: summary.hasRefreshToken,
-      credentialStatus: "saved",
-      updatedAt: new Date().toISOString(),
-    });
-    await saveState(state);
-    return { name: active.name, ...summary };
+async function persistActiveProfileCredentialUnlocked(state = undefined) {
+  const currentState = state ?? await loadState();
+  if (!currentState.activeProfile) return undefined;
+  const active = currentState.profiles.find((profile) => profile.name === currentState.activeProfile);
+  if (!active) return undefined;
+  let persistedRaw;
+  const persisted = await persistCurrentCredential({
+    readCurrentCredential: async () => {
+      persistedRaw = await readFile(activeAuthPath, "utf8").catch(() => undefined);
+      return persistedRaw;
+    },
+    credentialIsValid: isValidCodexAuth,
+    writeProfileCredential: async (name, raw) => {
+      await ensureDir(join(profilesDir, name));
+      await writeFile(profileAuthPath(name), raw, { mode: 0o600 });
+      await chmod(profileAuthPath(name), 0o600).catch(() => undefined);
+    },
+  }, active.name);
+  if (!persisted || !persistedRaw) return undefined;
+  const summary = summarizeAuthJson(JSON.parse(persistedRaw));
+  Object.assign(active, {
+    email: summary.email ?? active.email,
+    accountId: summary.accountId ?? active.accountId,
+    authMode: summary.authMode ?? active.authMode,
+    hasApiKey: summary.hasApiKey,
+    hasRefreshToken: summary.hasRefreshToken,
+    credentialStatus: "saved",
+    updatedAt: new Date().toISOString(),
   });
+  await saveState(currentState);
+  return { name: active.name, ...summary };
+}
+
+export async function refreshActiveProfileCredential() {
+  return await withAuthSwitchLock(async () =>
+    await persistActiveProfileCredentialUnlocked()
+  );
 }
 
 export async function useProfile(inputName, options = {}) {
@@ -196,7 +208,18 @@ export async function useProfile(inputName, options = {}) {
     const state = await loadState();
     const profile = state.profiles.find((entry) => entry.name === name);
     const blocked = profile ? profileSelectableReason(profile) : undefined;
-    if (blocked && !options.force) throw new Error(`Profile '${name}' is not selectable: ${blocked}.`);
+    const decision = decideExplicitProfileUse({
+      name,
+      active: state.activeProfile === name,
+      selectable: !blocked,
+      disabledReason: blocked,
+    });
+    if (decision.type === "confirm" && !options.force) {
+      throw new Error(`Profile '${name}' is not selectable: ${decision.reason}.`);
+    }
+    // Codex can rotate its refresh token in this active slot. Save that
+    // mutation before replacing the slot with another profile snapshot.
+    await persistActiveProfileCredentialUnlocked(state);
     await ensureDir(codexHome);
     await copyFile(source, activeAuthPath);
     await chmod(activeAuthPath, 0o600).catch(() => undefined);
@@ -215,5 +238,31 @@ export async function removeProfile(inputName) {
     state.profiles = state.profiles.filter((profile) => profile.name !== name);
     if (state.activeProfile === name) state.activeProfile = undefined;
     await saveState(state);
+  });
+}
+
+export async function renameProfile(oldNameInput, newNameInput) {
+  return await withAuthSwitchLock(async () => {
+    const oldName = validateProfileName(oldNameInput);
+    const newName = validateProfileName(newNameInput);
+    if (oldName === newName) return false;
+    const state = await loadState();
+    const profile = state.profiles.find((entry) => entry.name === oldName);
+    if (!profile) throw new Error(`Profile not found: ${oldName}`);
+    if (state.profiles.some((entry) => entry.name === newName)) {
+      throw new Error(`Profile already exists: ${newName}`);
+    }
+    await rename(join(profilesDir, oldName), join(profilesDir, newName));
+    profile.name = newName;
+    profile.updatedAt = new Date().toISOString();
+    if (state.activeProfile === oldName) state.activeProfile = newName;
+    state.profiles.sort((left, right) => left.name.localeCompare(right.name));
+    try {
+      await saveState(state);
+    } catch (error) {
+      await rename(join(profilesDir, newName), join(profilesDir, oldName)).catch(() => undefined);
+      throw error;
+    }
+    return true;
   });
 }

@@ -4,6 +4,11 @@ import { access, readFile } from "node:fs/promises";
 import { delimiter } from "node:path";
 import { join, resolve } from "node:path";
 import {
+  runUsageCheck,
+  UsageCheckReason,
+  usageCheckReasons,
+} from "@dong-/agentx-core";
+import {
   cleanupRuntimeFile,
   ensureDirectories,
   loadState,
@@ -34,9 +39,11 @@ export interface UsageProbeOptions {
   record?: boolean;
   env?: NodeJS.ProcessEnv;
   extraArgs?: string[];
+  reason?: UsageCheckReason;
 }
 
 export interface UsageProbeResult {
+  source: "usage";
   ok: boolean;
   skipped?: boolean;
   reason?: string;
@@ -45,6 +52,7 @@ export interface UsageProbeResult {
   exhaustedScopes: QuotaScope[];
   recorded?: boolean;
   error?: string;
+  exhausted?: boolean;
 }
 
 function shellQuote(value: string): string {
@@ -287,13 +295,14 @@ async function recordUsageAggregates(
   return exhaustedScopes;
 }
 
-export async function runUsageProbe(options: UsageProbeOptions = {}): Promise<UsageProbeResult> {
+async function executeUsageProbe(options: UsageProbeOptions): Promise<UsageProbeResult> {
   try {
     await ensureDirectories();
     const state = await loadState();
     const profileName = options.profileName ?? state.activeProfile;
     if (!profileName) {
       return {
+        source: "usage",
         ok: true,
         skipped: true,
         reason: "no active profile",
@@ -326,11 +335,13 @@ export async function runUsageProbe(options: UsageProbeOptions = {}): Promise<Us
         ? await recordUsageAggregates(profileName, aggregates)
         : exhaustedScopesFromAggregates(aggregates);
       return {
+        source: "usage",
         ok: true,
         profileName,
         aggregates,
         exhaustedScopes,
         recorded: shouldRecord,
+        exhausted: exhaustedScopes.length > 0,
       };
     } finally {
       if (process.env.AGYX_KEEP_USAGE_PROBE_LOGS !== "1") {
@@ -340,10 +351,27 @@ export async function runUsageProbe(options: UsageProbeOptions = {}): Promise<Us
     }
   } catch (error) {
     return {
+      source: "usage",
       ok: false,
       error: (error as Error).message,
       aggregates: [],
       exhaustedScopes: [],
     };
   }
+}
+
+export async function runUsageProbe(options: UsageProbeOptions = {}): Promise<UsageProbeResult> {
+  const result = await runUsageCheck({
+    refreshUsage: async () => await executeUsageProbe(options),
+  }, options.reason ?? usageCheckReasons.explicitScan, {
+    allowLocalFallback: false,
+  });
+  return result ?? {
+    source: "usage",
+    ok: true,
+    skipped: true,
+    reason: "state-only usage policy",
+    aggregates: [],
+    exhaustedScopes: [],
+  };
 }

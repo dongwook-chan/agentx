@@ -23,4 +23,6 @@ export interface LauncherOptions {
   }): Promise<string[]> | string[];
 }
 
+export function shouldHandleResumeSignal(paused: boolean, resumeRequested: boolean): boolean;
+
 export function runLauncher(options: LauncherOptions): Promise<number>;

@@ -9,6 +9,10 @@ import { productConfigDir } from "./paths.js";
 
 function launcherId(product) { return `${product}-${process.pid}-${randomBytes(6).toString("hex")}`; }
 
+export function shouldHandleResumeSignal(paused, resumeRequested) {
+  return paused && !resumeRequested;
+}
+
 export async function runLauncher({ product, executable, args, buildArgs, restartable = true, socketPath, policyCommand, identityMode, createTransport }) {
   const id = launcherId(product);
   const cwd = process.cwd();
@@ -111,28 +115,25 @@ export async function runLauncher({ product, executable, args, buildArgs, restar
   };
   process.on("SIGUSR1", () => {
     requestRestart();
+  });
+  process.on("SIGWINCH", () => {
     void request({ command: "status", launcherId: id }).then((status) => {
-      if (status.record?.reason !== "profile-switch") return;
-      if (product === "agyx") process.stderr.write("[agyx] Profile switch requested; this agy session will restart with the active profile.\n");
-      else process.stderr.write("[cdxx] Profile switch requested; this Codex session will restart with the active profile.\n");
+      if (status.record?.switchingNotice) {
+        process.stderr.write(`${status.record.switchingNotice}\r\n`);
+      }
     }).catch(() => undefined);
   });
-  process.on("SIGUSR2", () => {
+  const handleResumeSignal = () => {
+    if (!shouldHandleResumeSignal(paused, resumeRequested)) return;
     resume();
     void request({ command: "status", launcherId: id }).then((status) => {
       if (status.record?.reason !== "profile-switch") return;
       if (product === "agyx") process.stderr.write("[agyx] Resuming agy session after profile switch.\n");
       else process.stderr.write("[cdxx] Resuming Codex session after profile switch.\n");
     }).catch(() => undefined);
-  });
-  process.on("SIGCONT", () => {
-    resume();
-    void request({ command: "status", launcherId: id }).then((status) => {
-      if (status.record?.reason !== "profile-switch") return;
-      if (product === "agyx") process.stderr.write("[agyx] Resuming agy session after profile switch.\n");
-      else process.stderr.write("[cdxx] Resuming Codex session after profile switch.\n");
-    }).catch(() => undefined);
-  });
+  };
+  process.on("SIGUSR2", handleResumeSignal);
+  process.on("SIGCONT", handleResumeSignal);
   process.on("SIGINT", () => { stopping = true; stopChild("SIGINT"); });
   process.on("SIGTERM", () => { stopping = true; stopChild("SIGTERM"); });
 

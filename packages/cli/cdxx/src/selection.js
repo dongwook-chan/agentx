@@ -1,4 +1,7 @@
 import { clearExpiredQuota } from "./config.js";
+import { agentCliManifests, selectAutoSwitchCandidate } from "@dong-/agentx-core";
+
+export const codexQuotaScopes = ["5h", "weekly", "monthly"];
 
 export function exhaustedQuotaScopes(profile) {
   clearExpiredQuota(profile);
@@ -20,18 +23,18 @@ export function isProfileSelectable(profile) {
   return !profileSelectableReason(profile);
 }
 
-export function pickNextProfile(state, currentName = state.activeProfile) {
-  const profiles = [...state.profiles].sort((left, right) => left.name.localeCompare(right.name));
-  if (!profiles.length) return undefined;
-  for (const profile of profiles) clearExpiredQuota(profile);
-  const start = profiles.findIndex((profile) => profile.name === currentName);
-  // Never return the current profile: doing so reports a successful switch
-  // while reinstalling the same exhausted credential.
-  const candidateCount = start < 0 ? profiles.length : profiles.length - 1;
-  for (let step = 1; step <= candidateCount; step += 1) {
-    const candidate = profiles[(start + step + profiles.length) % profiles.length];
-    if (!isProfileSelectable(candidate)) continue;
-    return candidate;
-  }
-  return undefined;
+export function pickNextProfile(
+  state,
+  currentName = state.activeProfile,
+  triggerScope = "unknown",
+  mode = agentCliManifests.codex.quotaFailover.supportedAutoSwitchModes.find((value) => value !== "off"),
+) {
+  for (const profile of state.profiles) clearExpiredQuota(profile);
+  return selectAutoSwitchCandidate({ ...state, activeProfile: currentName }, {
+    mode,
+    triggerScope,
+    switchableScopes: codexQuotaScopes,
+    candidateQuotaPolicy: agentCliManifests.codex.quotaFailover.candidateQuotaPolicy,
+    unknownScope: "unknown",
+  });
 }

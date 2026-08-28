@@ -519,11 +519,6 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
     let mut guard = supervisor.lock().map_err(to_string)?;
     let reply = match command {
         "pause" => {
-            if request.get("reason").and_then(Value::as_str) == Some("profile-switch") {
-                terminal_line(
-                    "[cdxx] Profile switch requested; this Codex session will restart with the active profile."
-                );
-            }
             log_event(json!({
                 "event": "session.pause.requested",
                 "reason": request.get("reason").and_then(Value::as_str),
@@ -538,6 +533,14 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
             guard.stop_child()?;
             guard.capture_matched_session()?;
             json!({ "ok": true, "record": guard.record() })
+        }
+        "notice" => {
+            let message = request
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or("notice message is required")?;
+            terminal_line(message);
+            json!({ "ok": true })
         }
         "resume" => {
             if request.get("reason").and_then(Value::as_str) == Some("profile-switch") {

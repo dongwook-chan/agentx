@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { runRefreshableCredentialOperation } from "@dong-/agentx-core";
 import { codexHome, configDir } from "./config.js";
+import { isValidCodexAuth } from "./auth.js";
 import { findRealCodex } from "./processes.js";
 
 const CONTROL_RE = /\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]/g;
@@ -260,10 +262,22 @@ async function runCodexStatusInPty(realCodex, probeHome, options = {}) {
 export async function probeCodexStatusQuota(options = {}) {
   const home = options.codexHome ?? codexHome;
   const realCodex = options.realCodex ?? await findRealCodex();
+  const runStatus = options.runStatus ?? runCodexStatusInPty;
   const probeHome = options.probeHome ?? await prepareProbeHome(home);
   const ownsProbeHome = !options.probeHome;
   try {
-    return await runCodexStatusInPty(realCodex, probeHome, options);
+    return await runRefreshableCredentialOperation({
+      readCurrentCredential: async () =>
+        await readFile(join(probeHome, "auth.json"), "utf8").catch(() => undefined),
+      credentialIsValid: isValidCodexAuth,
+      writeProfileCredential: async (_profileName, credential) => {
+        await mkdir(home, { recursive: true, mode: 0o700 });
+        await writeFile(join(home, "auth.json"), credential, { mode: 0o600 });
+        await chmod(join(home, "auth.json"), 0o600).catch(() => undefined);
+      },
+    }, options.profileName ?? home, async () =>
+      await runStatus(realCodex, probeHome, options)
+    );
   } finally {
     if (ownsProbeHome) await rm(probeHome, { recursive: true, force: true });
   }

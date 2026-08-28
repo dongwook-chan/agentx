@@ -187,6 +187,14 @@ export function sessionControlAdapter(options = {}) {
       if (!reply.ok) throw new Error(reply.error ?? `Failed to pause ${record.id}`);
       return reply.record ?? { ...record, childPid: undefined, paused: true };
     },
+    notify: async (record, message) => {
+      if (record.launcherId) {
+        await supervisorRequest({ command: "notice", launcherId: record.launcherId, message });
+        return;
+      }
+      const reply = await send(record.socketPath, "notice", { message }, options);
+      if (!reply.ok) throw new Error(reply.error ?? `Failed to notify ${record.id}`);
+    },
     resume: async (record) => {
       if (record.launcherId) {
         await supervisorRequest({ command: "resume", launcherId: record.launcherId, reason: options.reason });

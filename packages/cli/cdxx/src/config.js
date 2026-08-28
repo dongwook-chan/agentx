@@ -3,9 +3,11 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  agentCliManifests,
   clearExpiredProfileQuota,
   markActiveProfile,
   profileNameFromIdentity as coreProfileNameFromIdentity,
+  resetlessQuotaExpired,
   uniqueProfileName as coreUniqueProfileName,
   validateProfileName as coreValidateProfileName,
 } from "@dong-/agentx-core";
@@ -20,7 +22,6 @@ export const profilesDir = join(configDir, "profiles");
 export const runtimeDir = join(configDir, "run");
 export const statePath = join(configDir, "state.json");
 export const eventLogPath = join(configDir, "events.jsonl");
-const resetlessQuotaTtlMs = 24 * 60 * 60 * 1000;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -65,6 +66,12 @@ export async function saveCodexIntegration(integration) {
 
 export function effectiveYoloMode(state) {
   return state.settings?.yolo ?? true;
+}
+
+export function effectiveAutoSwitchMode(state) {
+  const mode = state.settings?.autoSwitchMode;
+  if (agentCliManifests.codex.quotaFailover.supportedAutoSwitchModes.includes(mode)) return mode;
+  return state.settings?.autoswitch ? "scope-first" : agentCliManifests.codex.quotaFailover.defaultAutoSwitchMode;
 }
 
 export async function loadState() {
@@ -153,8 +160,7 @@ export function clearExpiredQuota(profile, now = new Date()) {
       quota.reason = undefined;
     } else if (!quota.resetAt) {
       const checkedAt = quota.checkedAt ?? quota.errorAt ?? profile.lastQuotaErrorAt ?? profile.updatedAt;
-      const checkedMs = checkedAt ? Date.parse(checkedAt) : undefined;
-      if (Number.isFinite(checkedMs) && now.getTime() - checkedMs >= resetlessQuotaTtlMs) {
+      if (resetlessQuotaExpired(checkedAt, now)) {
         quota.status = "available";
         quota.reason = undefined;
         quota.usedPercent = undefined;

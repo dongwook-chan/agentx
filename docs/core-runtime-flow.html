@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentx core 실제 동작 순서</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #121a2f;
+      --panel-2: #17213a;
+      --line: #2a385a;
+      --text: #eef3ff;
+      --muted: #9eabc8;
+      --core: #7dd3fc;
+      --adapter: #c4b5fd;
+      --background: #86efac;
+      --gate: #fbbf24;
+      --danger: #fda4af;
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(56, 189, 248, .13), transparent 30rem),
+        radial-gradient(circle at 92% 12%, rgba(167, 139, 250, .12), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, Pretendard, "Noto Sans KR", system-ui, sans-serif;
+      line-height: 1.55;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 64px 0 80px;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { font-size: clamp(2rem, 5vw, 4rem); line-height: 1.05; letter-spacing: -.045em; }
+    h2 { margin-bottom: 20px; font-size: 1.35rem; letter-spacing: -.02em; }
+    h3 { margin-bottom: 8px; font-size: 1rem; }
+    code { color: #d8e4ff; font-family: "SFMono-Regular", Consolas, monospace; }
+
+    .eyebrow {
+      margin-bottom: 14px;
+      color: var(--core);
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    .lede {
+      max-width: 780px;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin: 34px 0 48px;
+    }
+
+    .summary article,
+    .section {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(18, 26, 47, .86);
+      box-shadow: 0 18px 60px rgba(0, 0, 0, .2);
+    }
+
+    .summary article { padding: 18px; }
+    .summary strong { display: block; margin-bottom: 4px; font-size: 1.05rem; }
+    .summary span { color: var(--muted); font-size: .9rem; }
+    .section { margin-top: 18px; padding: clamp(20px, 4vw, 34px); }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+      margin-bottom: 28px;
+      color: var(--muted);
+      font-size: .86rem;
+    }
+
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 42px minmax(0, 1fr);
+      gap: 0 18px;
+      align-items: stretch;
+    }
+
+    .rail {
+      position: relative;
+      grid-column: 2;
+      display: grid;
+      place-items: start center;
+    }
+
+    .rail::before {
+      content: "";
+      position: absolute;
+      top: 18px;
+      bottom: -18px;
+      width: 2px;
+      background: var(--line);
+    }
+
+    .flow-row:last-child .rail::before { bottom: 18px; }
+
+    .number {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border: 2px solid var(--core);
+      border-radius: 50%;
+      background: var(--bg);
+      color: var(--core);
+      font-size: .8rem;
+      font-weight: 900;
+    }
+
+    .flow-row { display: contents; }
+
+    .step {
+      margin-bottom: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel-2);
+    }
+
+    .step.left { grid-column: 1; }
+    .step.right { grid-column: 3; }
+    .step.empty { visibility: hidden; }
+    .step p { margin: 0; color: var(--muted); font-size: .91rem; }
+
+    .owner {
+      display: inline-block;
+      margin-bottom: 9px;
+      padding: 3px 8px;
+      border: 1px solid currentColor;
+      border-radius: 999px;
+      font-size: .68rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .owner.core { color: var(--core); }
+    .owner.adapter { color: var(--adapter); }
+    .owner.background { color: var(--background); }
+    .owner.gate { color: var(--gate); }
+
+    .transaction {
+      margin-top: 12px;
+      padding: 14px;
+      border-left: 3px solid var(--core);
+      border-radius: 8px;
+      background: rgba(125, 211, 252, .07);
+    }
+
+    .transaction ol { margin: 8px 0 0; padding-left: 20px; color: var(--muted); }
+    .transaction li + li { margin-top: 5px; }
+
+    .parallel {
+      display: grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap: 16px;
+    }
+
+    .lane {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel-2);
+    }
+
+    .lane.switch { border-top: 3px solid var(--core); }
+    .lane.background { border-top: 3px solid var(--background); }
+    .lane ul { margin: 12px 0 0; padding-left: 20px; color: var(--muted); }
+    .lane li + li { margin-top: 6px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .9rem;
+    }
+
+    th, td { padding: 13px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+
+    .callout {
+      margin-top: 18px;
+      padding: 16px 18px;
+      border: 1px solid rgba(251, 191, 36, .4);
+      border-radius: 12px;
+      background: rgba(251, 191, 36, .07);
+      color: #fde68a;
+    }
+
+    .callout p { margin: 0; color: #e9d99d; }
+    .file { color: var(--muted); font-size: .8rem; }
+
+    @media (max-width: 760px) {
+      main { padding-top: 40px; }
+      .summary, .parallel { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 30px minmax(0, 1fr); gap: 0 12px; }
+      .rail { grid-column: 1; grid-row: auto; }
+      .step.left, .step.right { grid-column: 2; }
+      .step.empty { display: none; }
+      table { display: block; overflow-x: auto; white-space: nowrap; }
+    }
+
+    @media print {
+      :root { color-scheme: light; --bg: #fff; --panel: #fff; --panel-2: #f7f9fc; --line: #ccd5e5; --text: #111827; --muted: #475569; }
+      body { background: #fff; }
+      main { width: 100%; padding: 20px; }
+      .section, .summary article { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">agentx architecture · actual runtime</p>
+      <h1>Core가 실제로 동작하는 순서</h1>
+      <p class="lede">
+        Core는 독립 실행 프로세스가 아니라 <code>agyx</code>와 <code>cdxx</code>가 호출하는 공유 라이브러리다.
+        감지·파싱·credential I/O는 CLI 어댑터가 담당하고, 공통 결정과 session transaction은 core가 담당한다.
+      </p>
+    </header>
+
+    <section class="summary" aria-label="핵심 원칙">
+      <article><strong>Core first</strong><span>공통 정책과 계약을 먼저 선언한다.</span></article>
+      <article><strong>Switch immediately</strong><span>확정적인 live exhaustion은 status probe를 기다리지 않는다.</span></article>
+      <article><strong>Adapter boundary</strong><span>CLI별 차이는 감지·파싱·저장 구현에 한정한다.</span></article>
+    </section>
+
+    <section class="section">
+      <h2>Quota failover의 실제 호출 순서</h2>
+      <div class="legend" aria-label="소유권 범례">
+        <span><i class="dot" style="background:var(--adapter)"></i> CLI 어댑터</span>
+        <span><i class="dot" style="background:var(--core)"></i> 공유 Core</span>
+        <span><i class="dot" style="background:var(--background)"></i> 백그라운드 보강</span>
+      </div>
+
+      <div class="flow">
+        <div class="flow-row">
+          <article class="step left">
+            <span class="owner adapter">CLI adapter</span>
+            <h3>Live quota 이벤트 감지</h3>
+            <p><code>agyx</code>는 로그·terminal usage 이벤트를, <code>cdxx</code>는 supervisor/app-server·JSONL 이벤트를 감지한다.</p>
+          </article>
+          <div class="rail"><span class="number">1</span></div>
+          <article class="step empty" aria-hidden="true"></article>
+        </div>
+
+        <div class="flow-row">
+          <article class="step empty" aria-hidden="true"></article>
+          <div class="rail"><span class="number">2</span></div>
+          <article class="step right">
+            <span class="owner adapter">CLI adapter</span>
+            <h3>이벤트 정규화 및 현재 프로필 기록</h3>
+            <p>제품별 payload를 quota 상태로 바꾸고 exhausted scope, reason, reset metadata를 해당 프로필 상태에 기록한다. 명시된 exhausted scope가 없으면 core가 즉시 <code>unknown</code> scope를 exhausted로 보존하고, background probe가 나중에 상세 scope와 reset을 보강한다.</p>
+          </article>
+        </div>
+
+        <div class="flow-row">
+          <article class="step left">
+            <span class="owner core">Shared core</span>
+            <h3><code>decideLiveQuotaFailover()</code></h3>
+            <p>확정 exhaustion이면 <code>switchImmediately: true</code>, 항상 <code>usageRefreshMayBlock: false</code>를 반환한다.</p>
+          </article>
+          <div class="rail"><span class="number">3</span></div>
+          <article class="step empty" aria-hidden="true"></article>
+        </div>
+
+        <div class="flow-row">
+          <article class="step empty" aria-hidden="true"></article>
+          <div class="rail"><span class="number">4</span></div>
+          <article class="step right">
+            <span class="owner core">Shared core</span>
+            <h3><code>shouldAutoSwitchForQuota()</code> → <code>selectAutoSwitchCandidate()</code></h3>
+            <p>adapter가 정규화한 scope와 manifest capability를 입력받아 mode, eligibility, quota 차단, reset ordering을 공통 적용한다. 후보가 없으면 여기서 중단한다.</p>
+          </article>
+        </div>
+
+        <div class="flow-row">
+          <article class="step left">
+            <span class="owner core">Shared core</span>
+            <h3><code>runAuthSwitchTransaction()</code></h3>
+            <p>어댑터가 제공한 lock과 session control을 사용해 credential 교체를 하나의 공통 transaction으로 감싼다.</p>
+            <div class="transaction">
+              <strong>내부 실행 순서</strong>
+              <ol>
+                <li><code>withLock</code> 획득</li>
+                <li><code>sessionRecords()</code> 조회</li>
+                <li>각 session을 순차적으로 <code>pause()</code></li>
+                <li><code>afterPause()</code> 실행</li>
+                <li>각 paused terminal에 CRLF 3회 + quota switching notice</li>
+                <li>CLI 어댑터의 credential 교체 operation 실행</li>
+                <li><code>finally</code>에서 각 session을 순차적으로 <code>resume()</code></li>
+              </ol>
+            </div>
+          </article>
+          <div class="rail"><span class="number">5</span></div>
+          <article class="step empty" aria-hidden="true"></article>
+        </div>
+
+        <div class="flow-row">
+          <article class="step empty" aria-hidden="true"></article>
+          <div class="rail"><span class="number">6</span></div>
+          <article class="step right">
+            <span class="owner adapter">CLI adapter</span>
+            <h3>Credential 교체</h3>
+            <p><code>agyx</code>는 keychain credential을 활성화·검증하고, <code>cdxx</code>는 선택한 프로필의 <code>auth.json</code>을 활성 위치에 반영한다.</p>
+          </article>
+        </div>
+
+        <div class="flow-row">
+          <article class="step left">
+            <span class="owner adapter">CLI adapter</span>
+            <h3>재개 및 완료 기록</h3>
+            <p>Core transaction의 resume 이후 adapter가 <code>switch.completed</code>를 기록하고 재시작된 session이 기존 대화를 이어간다.</p>
+          </article>
+          <div class="rail"><span class="number">7</span></div>
+          <article class="step empty" aria-hidden="true"></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Generic policy와 CLI capability</h2>
+      <table>
+        <thead>
+          <tr><th>정책</th><th>agyx</th><th>cdxx</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Autoswitch mode</td><td><code>off</code>, <code>scope-first</code>, <code>all-scopes</code></td><td><code>off</code>, <code>scope-first</code></td></tr>
+          <tr><td>기본값</td><td><code>all-scopes</code></td><td><code>off</code></td></tr>
+          <tr><td>후보 quota 기준</td><td>trigger scope가 사용 가능하면 후보</td><td>어느 누적 window든 exhausted면 제외</td></tr>
+          <tr><td>Eligibility</td><td><code>allow</code> / <code>block</code></td><td>별도 eligibility 신호가 없어 미지원</td></tr>
+        </tbody>
+      </table>
+      <p class="file">미지원 사유도 core manifest에 선언하며 상세 설명은 docs/cli-differences.md에 기록한다.</p>
+    </section>
+
+    <section class="section">
+      <h2>Foreground switch와 usage 보강의 분리</h2>
+      <div class="parallel">
+        <article class="lane switch">
+          <span class="owner core">Foreground</span>
+          <h3>사용자가 기다리는 경로</h3>
+          <ul>
+            <li>live exhaustion을 switch 근거로 즉시 사용</li>
+            <li>후보 선택 후 session pause → switching notice → credential 교체 → resume</li>
+            <li><code>/status</code> 또는 <code>/usage</code> 결과를 await하지 않음</li>
+          </ul>
+        </article>
+        <article class="lane background">
+          <span class="owner background">Background</span>
+          <h3>Reset metadata 보강 경로</h3>
+          <ul>
+            <li><code>cdxx</code>: reset 정보가 없으면 detached process에서 <code>/status</code></li>
+            <li><code>agyx</code>: child 시작 후 별도 thread에서 <code>/usage</code></li>
+            <li>결과는 프로필 quota 상태만 갱신하며 switch를 차단하지 않음</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2><code>runUsageCheck()</code>의 실제 분기</h2>
+      <table>
+        <thead>
+          <tr><th>Core mode</th><th>Reason</th><th>동작</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>refresh</code></td>
+            <td>explicit-scan, manual-record, session-start, live/background quota refresh</td>
+            <td>adapter의 remote refresh 실행 → 실패 시 허용된 경우 local scan fallback</td>
+          </tr>
+          <tr>
+            <td><code>local-scan</code></td>
+            <td>session-exit</td>
+            <td>remote probe 없이 adapter의 local usage scan 실행</td>
+          </tr>
+          <tr>
+            <td><code>state-only</code></td>
+            <td>list, use</td>
+            <td>probe를 실행하지 않고 저장된 상태만 사용</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="file">정의: packages/core/src/index.ts · 구현 입력: 각 CLI의 UsageRefreshAdapter</p>
+    </section>
+
+    <section class="section">
+      <h2>Core와 CLI의 소유권 경계</h2>
+      <table>
+        <thead>
+          <tr><th>공유 Core 소유</th><th>CLI 어댑터 소유</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>live quota failover 결정</td><td>로그·protocol·terminal 이벤트 감지와 파싱</td></tr>
+          <tr><td>usage reason registry와 mode</td><td><code>/status</code>, <code>/usage</code>, JSONL scan 구현</td></tr>
+          <tr><td>session pause/resume transaction</td><td>session socket/supervisor 통신</td></tr>
+          <tr><td>프로필 이름·활성화·quota 만료 primitive</td><td>auth.json, keychain 등 credential I/O</td></tr>
+          <tr><td>autoswitch mode·eligibility·후보 필터/순서</td><td>제품 scope alias와 capability mapping</td></tr>
+          <tr><td>profile table·list/use picker renderer</td><td>제품별 row 데이터와 추가 컬럼</td></tr>
+          <tr><td>pause 이후 CRLF 3회·switching notice 순서</td><td>terminal notice transport</td></tr>
+          <tr><td>CLI manifest의 명시적 차이</td><td>제품별 사용자 메시지와 transport</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2>개발 타임 게이트</h2>
+      <p class="lede">
+        아키텍처 준수 여부는 production 런타임에서 검사하지 않는다. private contracts 테스트가 개발·CI 시점에 다음 위반을 차단한다.
+      </p>
+      <div class="callout">
+        <span class="owner gate">Development only</span>
+        <p>
+          core registry 밖의 usage reason, failover foreground에 status probe 재도입,
+          공통 failover·후보 선택·quota TTL·profile renderer·post-pause notice 미사용,
+          core manifest에 없는 capability 구현을 테스트 실패로 처리한다.
+        </p>
+      </div>
+      <p class="file">게이트: packages/contracts/test/core_policy_boundary.test.js · 작업 규칙: AGENTS.md</p>
+    </section>
+  </main>
+</body>
+</html>

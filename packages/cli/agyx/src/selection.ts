@@ -1,10 +1,19 @@
 import {
   AutoSwitchMode,
+  defaultAllowIneligibleActivation,
   effectiveAllowIneligibleActivation,
+  LegacyAutoSwitchMode,
+  normalizeAutoSwitchMode,
   ProfileRecord,
   State,
 } from "./config.js";
 import { QuotaScope, quotaScopeAliases } from "./quota.js";
+import {
+  agentCliManifests,
+  selectAutoSwitchCandidate,
+  selectRoundRobinProfile,
+  shouldAutoSwitchForQuota,
+} from "@dong-/agentx-core";
 
 export type ProfileRuntimeStatus =
   | "ready"
@@ -60,7 +69,7 @@ export function isScopeQuotaExhausted(
 }
 
 function allowIneligibleActivation(options: EffectiveStatusOptions): boolean {
-  return options.allowIneligibleActivation ?? true;
+  return options.allowIneligibleActivation ?? defaultAllowIneligibleActivation;
 }
 
 function isBaseSelectable(
@@ -74,10 +83,6 @@ function isBaseSelectable(
       profile.eligibilityStatus !== "ineligible"
       || allowIneligibleActivation(options)
     );
-}
-
-function targetScopesFor(scope: QuotaScope): QuotaScope[] {
-  return scope === "unknown" ? providerQuotaScopes : [scope];
 }
 
 export function scopedQuotaResetAt(
@@ -131,90 +136,40 @@ export function effectiveProfileStatus(
   return exhaustedQuotaScopeForOptions(profile, options, now) ? "exhausted" : "ready";
 }
 
-function earliestQuotaReset(profile: ProfileRecord): number {
-  const resetTimes = [
-    profile.quotaResetAt,
-    ...Object.values(profile.quotaScopes ?? {}).map((quota) => quota?.resetAt),
-  ]
-    .filter((value): value is string => Boolean(value))
-    .map((value) => Date.parse(value))
-    .filter((value) => !Number.isNaN(value));
-  return resetTimes.length ? Math.min(...resetTimes) : 0;
-}
-
-function hasAnyProviderQuota(profile: ProfileRecord, now: Date): boolean {
-  return providerQuotaScopes.some((scope) => isScopeQuotaExhausted(profile, scope, now));
-}
-
-function hasAllProviderQuotas(profile: ProfileRecord, now: Date): boolean {
-  return providerQuotaScopes.every((scope) => isScopeQuotaExhausted(profile, scope, now));
-}
-
-function autoSwitchCategory(
-  profile: ProfileRecord,
-  mode: Exclude<AutoSwitchMode, "off">,
-  quotaScope: QuotaScope,
-  now: Date,
-  options: EffectiveStatusOptions = {},
-): number | undefined {
-  if (!isBaseSelectable(profile, options)) return undefined;
-
-  const targetScopes = targetScopesFor(quotaScope);
-  if (targetScopes.some((scope) => isScopeQuotaExhausted(profile, scope, now))) {
-    return undefined;
-  }
-
-  if (mode === "provider-first") return 0;
-
-  return hasAnyProviderQuota(profile, now) ? 1 : 0;
-}
-
 export function shouldAutoSwitchAfterQuota(
   profile: ProfileRecord | undefined,
-  mode: AutoSwitchMode | undefined,
+  mode: AutoSwitchMode | LegacyAutoSwitchMode | undefined,
   quotaScope: QuotaScope,
   now = new Date(),
 ): boolean {
-  if (!profile || !mode || mode === "off") return false;
-  if (mode === "provider-first") return true;
-  if (quotaScope === "unknown") return true;
-  return hasAllProviderQuotas(profile, now);
+  return shouldAutoSwitchForQuota(profile, {
+    mode: normalizeAutoSwitchMode(mode),
+    triggerScope: quotaScope,
+    switchableScopes: providerQuotaScopes,
+    candidateQuotaPolicy: agentCliManifests.agy.quotaFailover.candidateQuotaPolicy,
+    unknownScope: "unknown",
+    scopeAliases: quotaScopeAliases,
+    now,
+  });
 }
 
 export function selectAutoSwitchProfile(
   state: State,
-  mode: Exclude<AutoSwitchMode, "off">,
+  mode: Exclude<AutoSwitchMode, "off"> | LegacyAutoSwitchMode,
   quotaScope: QuotaScope,
   now = new Date(),
 ): ProfileRecord {
   if (!state.profiles.length) throw new Error("No saved profiles.");
-  const options: EffectiveStatusOptions = {
+  const selected = selectAutoSwitchCandidate(state, {
+    mode: normalizeAutoSwitchMode(mode),
+    triggerScope: quotaScope,
+    switchableScopes: providerQuotaScopes,
+    candidateQuotaPolicy: agentCliManifests.agy.quotaFailover.candidateQuotaPolicy,
+    unknownScope: "unknown",
+    scopeAliases: quotaScopeAliases,
     allowIneligibleActivation: effectiveAllowIneligibleActivation(state),
-  };
-  const activeIndex = state.activeProfile
-    ? state.profiles.findIndex(({ name }) => name === state.activeProfile)
-    : -1;
-  const candidates = state.profiles
-    .map((profile, index) => {
-      const category = profile.name === state.activeProfile
-        ? undefined
-        : autoSwitchCategory(profile, mode, quotaScope, now, options);
-      if (category === undefined) return undefined;
-      const offset = (index - activeIndex + state.profiles.length) % state.profiles.length;
-      return {
-        profile,
-        category,
-        resetAt: earliestQuotaReset(profile),
-        offset,
-      };
-    })
-    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
-    .sort((left, right) =>
-      left.category - right.category
-      || left.resetAt - right.resetAt
-      || left.offset - right.offset
-    );
-  const selected = candidates[0]?.profile;
+    now,
+  });
   if (!selected) throw new Error("No selectable profile for automatic quota failover.");
   return selected;
 }
@@ -239,15 +194,11 @@ export function selectNextProfile(
     allowIneligibleActivation: options.allowIneligibleActivation
       ?? effectiveAllowIneligibleActivation(state),
   };
-  const activeIndex = state.activeProfile
-    ? state.profiles.findIndex(({ name }) => name === state.activeProfile)
-    : -1;
-
-  for (let offset = 1; offset <= state.profiles.length; offset += 1) {
-    const profile = state.profiles[(activeIndex + offset + state.profiles.length)
-      % state.profiles.length]!;
-    if (isProfileSelectable(profile, now, effectiveOptions)) return profile;
-  }
+  const selected = selectRoundRobinProfile(
+    state,
+    (profile) => isProfileSelectable(profile, now, effectiveOptions),
+  );
+  if (selected) return selected;
 
   const resetEntries = state.profiles.flatMap((profile) => {
     const resets: Array<{ name: string; resetAt: string }> = [];

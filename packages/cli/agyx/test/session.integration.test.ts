@@ -26,6 +26,18 @@ async function waitFor(
   throw new Error("Timed out waiting for condition");
 }
 
+async function shutdownTestSupervisor(socketPath: string): Promise<void> {
+  await sendSupervisor({ command: "shutdown" }, { socketPath }).catch(() => undefined);
+  await waitFor(async () => {
+    try {
+      await sendSupervisor({ command: "ping" }, { socketPath, timeoutMs: 50 });
+      return false;
+    } catch {
+      return true;
+    }
+  });
+}
+
 function runCLI(
   args: string[],
   environment: NodeJS.ProcessEnv,
@@ -137,11 +149,12 @@ while :; do sleep 1; done
         supervisor.once("exit", () => resolvePromise())
       );
     }
+    await shutdownTestSupervisor(environment.AGENTX_SUPERVISOR_SOCKET);
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("profile switch restart notice is printed in the supervised agy terminal", async () => {
+test("quota switching notice is printed after pause in the supervised agy terminal", async () => {
   const root = await mkdtemp(join(tmpdir(), "agyx-integration-"));
   const fakeAgy = join(root, "agy");
   const launches = join(root, "launches.txt");
@@ -183,11 +196,14 @@ while :; do sleep 1; done
       const status = await sendSupervisor({ command: "status", launcherId: record.launcherId }, { socketPath: environment.AGENTX_SUPERVISOR_SOCKET });
       return Boolean(status.record && !(status.record as { childPid?: number }).childPid);
     });
+    const notice = "\r\n\r\n\r\n[agyx] Quota detected; switching profiles...";
+    await sendSupervisor({ command: "notice", launcherId: record.launcherId, message: notice }, { socketPath: environment.AGENTX_SUPERVISOR_SOCKET });
+    await waitFor(async () => supervisorStderr.includes(notice));
     const resumed = await sendSupervisor({ command: "resume", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath: environment.AGENTX_SUPERVISOR_SOCKET });
     assert.equal(resumed.ok, true);
 
     await waitFor(async () =>
-      /Profile switch requested/.test(supervisorStderr)
+      /Quota detected; switching profiles/.test(supervisorStderr)
       && /Resuming agy session after profile switch/.test(supervisorStderr)
     );
   } finally {
@@ -197,6 +213,7 @@ while :; do sleep 1; done
         supervisor.once("exit", () => resolvePromise())
       );
     }
+    await shutdownTestSupervisor(environment.AGENTX_SUPERVISOR_SOCKET);
     await rm(root, { recursive: true, force: true });
   }
 });

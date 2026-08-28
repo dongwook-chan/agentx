@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { runLauncher } from "@dong-/agentx-supervisor";
 import { findRealCodex, isInteractiveCodex } from "./processes.js";
@@ -7,19 +6,6 @@ import { loadState } from "./config.js";
 import { codexHooksInstalled } from "./install.js";
 import { createCodexRemoteTransport, probeCodexRemoteSupport, withCodexRemote } from "./remote.js";
 export { pickNextProfile } from "./selection.js";
-
-function startStatusProbeRecord() {
-  const child = spawn(process.execPath, [
-    fileURLToPath(new URL("./cli.js", import.meta.url)),
-    "_status-probe-record",
-  ], {
-    cwd: process.cwd(),
-    env: process.env,
-    stdio: "ignore",
-    detached: true,
-  });
-  child.unref();
-}
 
 async function runUnmanagedCodex(executable, args, reason) {
   process.stderr.write(`[cdxx] Agentx Codex integration is unavailable: ${reason}\n`);
@@ -59,12 +45,6 @@ export async function runCodexSession(args) {
     : { mode: "none" };
   if (integration.mode === "disabled") {
     return await runUnmanagedCodex(realCodex, args, integration.reason);
-  }
-  if (
-    interactive
-    && process.env.CDXX_DISABLE_STARTUP_STATUS_PROBE !== "1"
-  ) {
-    startStatusProbeRecord();
   }
   if (!interactive) {
     return await runLauncher({

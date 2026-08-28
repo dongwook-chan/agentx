@@ -84,7 +84,7 @@ codex x use personal
 codex x next
 codex x status
 codex x config
-codex x config autoswitch on
+codex x config autoswitch scope-first
 codex x config yolo off
 codex x remove personal
 codex --native --help      # bypass cdxx and run real Codex
@@ -125,8 +125,13 @@ Switch profiles:
 codex x list
 codex x use
 codex x use personal
+codex x use personal --force
 codex x next
 ```
+
+Unavailable profiles remain selectable for an explicit `use`; cdxx asks for
+confirmation before switching. Use `--force` for the same override in a
+non-interactive shell. `next` and automatic quota failover still skip them.
 
 `cdxx` stores profile credentials under `~/.config/cdxx/profiles/<name>/auth.json`
 with owner-only permissions. The active Codex credential remains
@@ -152,6 +157,8 @@ By default, `scan` records the active profile's 5-hour and weekly quota windows
 and reset times from the current `/status` result. Use `--no-record` only when
 you want a dry run. Use `--all` to run isolated `/status` probes for every saved
 profile and record their reset windows without replacing the active auth file.
+Scans pause live sessions and merge any rotated `auth.json` from the isolated
+probe back into that profile before removing its temporary home.
 `--jsonl` remains available as an explicit diagnostic command for local
 transcript scanning. Codex `/status` can briefly lag right after a fresh TUI
 starts or a quota event, so remote sessions use app-server rate-limit and turn
@@ -174,16 +181,33 @@ The `agy` flag `--dangerously-skip-permissions` is rejected when passed through
 Enable live profile failover:
 
 ```bash
-codex x config autoswitch on
+codex x config autoswitch scope-first
 ```
+
+`on` remains accepted as a compatibility alias for `scope-first`. Codex quota
+windows are cumulative blockers, so `all-scopes` is intentionally unsupported:
+waiting for every window would stall after the first exhausted window. Codex
+also exposes no eligibility state separate from credential validity, so the
+agyx `ineligible allow|block` option is not available in cdxx.
 
 With autoswitch enabled, the supervisor observes app-server events (or the
 approved hook transcript in compatibility mode). If Codex reports an exhausted
 rate limit, `cdxx` switches to the next available saved profile and starts
 `codex resume <session_id>` from the same working directory.
 
-Non-interactive commands such as `codex exec`, `codex review`, `codex login`,
-and `codex doctor` are not supervised.
+A definitive live quota event starts failover immediately. If the event does
+not include reset metadata, `cdxx` refreshes that exhausted profile with
+`/status` in a detached background process; the probe never blocks profile
+selection, credential replacement, or session restart.
+
+Non-interactive commands such as `codex exec` and SDK-launched turns are not
+process-supervised or automatically restarted. The singleton supervisor does,
+however, observe appended quota records across `$CODEX_HOME/sessions`, so an
+unmanaged turn can still trigger auth failover for later turns. Existing JSONL
+content is never replayed at startup.
+Subagent rollouts inherit their parent rollout's profile ownership. A quota
+record whose owner cannot be established is left unattributed instead of being
+charged to whichever profile is currently active.
 
 If every saved profile is disabled, exhausted, or otherwise not selectable,
 `cdxx` prints a stop message and suppresses further failover attempts for that
@@ -203,9 +227,9 @@ existing single-log-path adapter and conversation-ID parser.
 
 ## Notes
 
-- Remote-mode supervision does not read Codex JSONL transcripts. Explicit
-  `codex x scan --jsonl` and approved hook compatibility mode can still read
-  transcript metadata and quota events.
+- Remote-mode session identity and control do not depend on Codex JSONL.
+  Separately, the singleton global quota observer tails only appended JSONL
+  bytes and excludes transcripts already owned by a managed session.
 - A profile is treated as exhausted when Codex reports 5-hour
   `primary.used_percent >= 100`, weekly `secondary.used_percent >= 100`, or a
   non-null `rate_limit_reached_type`.

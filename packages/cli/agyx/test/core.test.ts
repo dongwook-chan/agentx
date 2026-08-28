@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { decideExplicitProfileUse } from "@dong-/agentx-core";
 import { detectEmail } from "../src/coordinator.js";
 import {
   effectiveAllowIneligibleActivation,
@@ -115,11 +116,15 @@ test("native supervisor is scoped to supported arm64 Unix hosts", () => {
   assert.equal(nativeSupervisorHostStatus("linux", "x64").supported, false);
 });
 
-test("default autoswitch mode is all-providers", () => {
-  assert.equal(effectiveAutoSwitchMode({}), "all-providers");
+test("default autoswitch mode is all-scopes and legacy values normalize", () => {
+  assert.equal(effectiveAutoSwitchMode({}), "all-scopes");
   assert.equal(
     effectiveAutoSwitchMode({ settings: { autoSwitchMode: "provider-first" } }),
-    "provider-first",
+    "scope-first",
+  );
+  assert.equal(
+    effectiveAutoSwitchMode({ settings: { autoSwitchMode: "all-providers" } }),
+    "all-scopes",
   );
 });
 
@@ -471,6 +476,30 @@ test("builds one shared profile view for list and picker", () => {
   );
 });
 
+test("agy manual use requires confirmation instead of hiding an unavailable profile", () => {
+  const now = new Date("2026-06-26T00:00:00.000Z");
+  const [view] = buildProfileViews({
+    profiles: [{
+      name: "blocked",
+      disabled: true,
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    }],
+  }, now);
+
+  assert.deepEqual(decideExplicitProfileUse({
+    name: view!.profile.name,
+    selectable: view!.selectable,
+    disabledReason: view!.disabledReason,
+  }), {
+    type: "confirm",
+    force: true,
+    reason: "disabled",
+    message: "Profile 'blocked' is marked disabled. Switch anyway?",
+    defaultValue: false,
+  });
+});
+
 test("profile view shows reset time for available scoped usage windows", () => {
   const now = new Date("2026-06-26T00:00:00.000Z");
   const views = buildProfileViews({
@@ -783,7 +812,28 @@ test("tracks provider-scoped quota only from model log context", () => {
     "exhausted",
   );
   assert.equal(selectNextProfile(state, now, { quotaScopes: ["gemini-flash"] }).name, "b");
-  assert.equal(selectNextProfile(state, now, { quotaScopes: ["claude-gpt"] }).name, "a");
+  assert.throws(
+    () => selectNextProfile(state, now, { quotaScopes: ["claude-gpt"] }),
+    /No selectable profiles/,
+  );
+});
+
+test("live quota without provider context is preserved in the shared unknown scope", () => {
+  const now = new Date("2026-08-07T04:29:18.580Z");
+  const state: State = {
+    version: 1,
+    activeProfile: "a",
+    profiles: [{
+      name: "a",
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+    }],
+  };
+
+  markProfileQuotaExhausted(state, "a", { reason: "usage limit reached" }, now);
+
+  assert.equal(state.profiles[0]!.quotaStatus, "exhausted");
+  assert.equal(state.profiles[0]!.quotaScopes?.unknown?.status, "exhausted");
 });
 
 test("clears stale resetless scoped quota", () => {

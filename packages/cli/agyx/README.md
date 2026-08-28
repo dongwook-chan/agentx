@@ -92,7 +92,7 @@ agy x next
 agy x scan
 agy x status
 agy x config
-agy x config autoswitch all-providers
+agy x config autoswitch all-scopes
 agy x config ineligible block
 agy x config yolo off
 agy --native --help         # bypass agyx and run real agy
@@ -166,6 +166,7 @@ agy x import-current personal
 agy x list
 agy x use work
 agy x use
+agy x use work --force
 agy x next
 agy x config
 agy x status
@@ -179,6 +180,10 @@ terminal table. Both show profile metadata:
 - `last-request`: when a supervised `agy` log last showed a model request
 - `activated`: when agyx last made the profile active
 - `switches`: how many times agyx selected the profile through login/use/next
+
+Unavailable profiles remain selectable for an explicit `use`; agyx asks for
+confirmation before switching. Use `--force` for the same override in a
+non-interactive shell. `next` and automatic quota failover still skip them.
 
 `agyx next` uses name-sorted round-robin order, starting after the currently
 active profile. It skips profiles marked `disabled`, credential-mismatched, or
@@ -225,10 +230,11 @@ By default, `scan` records the active profile's quota windows and reset times
 from the current `/usage` result. Use `--no-record` only when you want a dry
 run. Use `--all` to run isolated `/usage` probes for every saved profile by
 placing each saved credential in a temporary HOME, without replacing the active
-credential. Supervised sessions also run a startup `/usage` probe to seed this
-metadata when possible. The `/usage` view can briefly lag right after a fresh
-session starts, so live quota exhaustion is still triggered from session logs;
-the scan path is mainly for current window and `resetAt` refresh.
+credential. Scans pause live sessions while a refresh-capable probe runs and
+merge any refreshed credential back into the saved profile before removing the
+temporary HOME. The `/usage` view can briefly lag right after a fresh session
+starts, so live quota exhaustion is still triggered from session logs; the scan
+path is mainly for current window and `resetAt` refresh.
 
 When the active model can be inferred from the same session log, quota is stored
 per free-tier quota group: `gemini-flash`, `gemini-pro`, or `claude-gpt`.
@@ -240,15 +246,20 @@ Automatic quota failover is configured with:
 
 ```bash
 agy x config
-agy x config autoswitch all-providers
-agy x config autoswitch provider-first
+agy x config autoswitch all-scopes
+agy x config autoswitch scope-first
 agy x config autoswitch off
+agy x config ineligible allow
+agy x config ineligible block
 ```
 
-The default is `all-providers`: agyx waits until all known free-tier quota groups
-are exhausted for the active profile before switching accounts. `provider-first`
-switches as soon as the current provider scope is exhausted. Automatic switching
-uses the same global pause/switch/resume transaction as `agyx next`.
+The default is `all-scopes`: agyx waits until all known free-tier quota groups
+are exhausted for the active profile before switching accounts. `scope-first`
+switches as soon as the current quota scope is exhausted. The legacy names
+`all-providers` and `provider-first` remain accepted as aliases. `ineligible`
+controls whether profiles marked ineligible may be selected; its default is
+`allow`. Automatic switching uses the same global pause/switch/resume
+transaction as `agyx next`.
 
 If no profile is selectable, the policy helper reports the reason to the active
 terminal and the supervisor suppresses repeated autoswitch attempts for that

@@ -1,10 +1,11 @@
-import { appendAgentEvent } from "@dong-/agentx-core";
-import { loadState } from "./config.js";
-import { eventLogPath } from "./config.js";
-import { recordQuotaForProfile, scanCodexQuota } from "./quota.js";
+import { appendAgentEvent, decideLiveQuotaFailover, decideObservedProfileFailover, quotaSwitchingNotice, stopRetryingAutoSwitch } from "@dong-/agentx-core";
+import { effectiveAutoSwitchMode, eventLogPath, loadState } from "./config.js";
+import { recordQuotaForProfile } from "./quota.js";
 import { useProfile } from "./auth.js";
-import { pickNextProfile } from "./selection.js";
+import { exhaustedQuotaScopes, pickNextProfile } from "./selection.js";
 import { withPausedAuthSwitch } from "./managed_sessions.js";
+import { startBackgroundProfileStatusRefresh } from "./background_status.js";
+import { withAuthSwitchLock } from "./lock.js";
 
 async function logFailoverEvent(event) {
   await appendAgentEvent(eventLogPath, { product: "cdxx", ...event }).catch(() => undefined);
@@ -12,8 +13,12 @@ async function logFailoverEvent(event) {
 
 export function quotaSummaryFromSupervisorPayload(payload) {
   const now = new Date().toISOString();
-  const primary = Number(payload.primary ?? 0);
-  const secondary = Number(payload.secondary ?? 0);
+  const primary = payload.primary === undefined || payload.primary === null
+    ? undefined
+    : Number(payload.primary);
+  const secondary = payload.secondary === undefined || payload.secondary === null
+    ? undefined
+    : Number(payload.secondary);
   const reachedType = payload.reachedType ?? null;
   return {
     scannedFiles: 1,
@@ -29,7 +34,9 @@ export function quotaSummaryFromSupervisorPayload(payload) {
     exhaustedEvents: 1,
     reason: payload.reason ?? (reachedType
       ? `rate_limit_reached_type=${reachedType}`
-      : (primary >= 100 ? "primary rate limit reached" : "secondary rate limit reached")),
+      : (primary >= 100
+        ? "primary rate limit reached"
+        : (secondary >= 100 ? "secondary rate limit reached" : "quota exhausted"))),
     resetAt: payload.resetAt,
     reachedTypes: reachedType ? [String(reachedType)] : [],
     current: {
@@ -47,133 +54,152 @@ export function quotaSummaryFromSupervisorPayload(payload) {
   };
 }
 
-export function stopRetryingAction(reason, message, extra = {}) {
-  return {
-    ok: false,
-    kind: "stop_retrying",
-    reason,
-    message,
-    retryKey: extra.retryKey,
-    ...extra,
-  };
+function quotaSummaryForFailover(payload) {
+  return payload.summary ?? quotaSummaryFromSupervisorPayload(payload);
 }
 
-async function quotaSummaryForFailover(payload) {
-  if (payload.summary) return payload.summary;
-  const fallback = quotaSummaryFromSupervisorPayload(payload);
-  if (fallback.resetAt) return fallback;
-  try {
-    const statusSummary = await scanCodexQuota({
-      reason: "live-quota-trigger",
-      allowLocalFallback: false,
-    });
-    if (statusSummary?.source === "status") return statusSummary;
-  } catch {
-    // The supervisor payload is still a reliable live trigger if /status probing fails.
-  }
-  return fallback;
-}
-
-export async function decideCodexFailover(payload) {
-  const summary = await quotaSummaryForFailover(payload);
-  const profile = await recordQuotaForProfile(summary, payload.profileName);
-  await logFailoverEvent({
-    event: "quota.detected",
-    trigger: "supervisor",
-    profile: payload.profileName,
-    sessionId: payload.sessionId,
-    exhausted: summary.exhausted,
-    reason: summary.reason,
-    resetAt: summary.resetAt,
-    source: summary.source ?? "supervisor-payload",
-    reachedType: payload.reachedType,
-  });
-  if (!profile) {
+export async function decideCodexFailover(payload, options = {}) {
+  const summary = quotaSummaryForFailover(payload);
+  const policy = decideLiveQuotaFailover(Boolean(summary.exhausted));
+  return await withAuthSwitchLock(async () => {
+    const profile = await recordQuotaForProfile(summary, payload.profileName);
     await logFailoverEvent({
-      event: "switch.stopped",
-      trigger: "autoswitch",
-      reason: "profile_not_found",
-      fromProfile: payload.profileName,
+      event: "quota.detected",
+      trigger: "supervisor",
+      profile: payload.profileName,
       sessionId: payload.sessionId,
+      exhausted: summary.exhausted,
+      reason: summary.reason,
+      resetAt: summary.resetAt,
+      source: summary.source ?? "supervisor-payload",
+      reachedType: payload.reachedType,
     });
-    return stopRetryingAction(
-      "profile_not_found",
-      `[cdxx] Active profile '${payload.profileName ?? "(none)"}' was not found; quota failover stopped.`,
-    );
-  }
+    if (!profile) {
+      await logFailoverEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: "profile_not_found",
+        fromProfile: payload.profileName,
+        sessionId: payload.sessionId,
+      });
+      return stopRetryingAutoSwitch(
+        "profile_not_found",
+        `[cdxx] Active profile '${payload.profileName ?? "(none)"}' was not found; quota failover stopped.`,
+      );
+    }
 
-  if (!summary.exhausted) {
+    if (!policy.switchImmediately) {
+      await logFailoverEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: "quota_available_by_status",
+        fromProfile: profile.name,
+        sessionId: payload.sessionId,
+      });
+      return stopRetryingAutoSwitch(
+        "quota_available_by_status",
+        `[cdxx] /status no longer reports quota exhaustion for '${profile.name}'; failover stopped.`,
+        { profile: profile.name },
+      );
+    }
+
+    const shouldRefreshStatusAfterSwitch = !summary.resetAt && !policy.usageRefreshMayBlock;
+
+    const state = await loadState();
+    const ownership = decideObservedProfileFailover(profile.name, state.activeProfile);
+    if (!ownership.switchProfile) {
+      await logFailoverEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: ownership.reason,
+        fromProfile: profile.name,
+        activeProfile: state.activeProfile,
+        sessionId: payload.sessionId,
+      });
+      return {
+        ok: true,
+        kind: "none",
+        reason: ownership.reason,
+        profile: state.activeProfile,
+        sessionId: payload.sessionId,
+        message: `[cdxx] Quota was reported for '${profile.name}', but '${state.activeProfile ?? "(none)"}' is already active; no additional profile switch was made.`,
+      };
+    }
+
+    const autoSwitchMode = effectiveAutoSwitchMode(state);
+    if (autoSwitchMode === "off") {
+      await logFailoverEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: "autoswitch_off",
+        fromProfile: profile.name,
+        sessionId: payload.sessionId,
+      });
+      return stopRetryingAutoSwitch(
+        "autoswitch_off",
+        "[cdxx] Autoswitch is off; quota failover stopped.",
+        { profile: profile.name },
+      );
+    }
+
+    const triggerScope = exhaustedQuotaScopes(profile)[0] ?? "unknown";
+    const next = pickNextProfile(state, profile.name, triggerScope, autoSwitchMode);
+    if (!next) {
+      await logFailoverEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: "no_selectable_profile",
+        fromProfile: profile.name,
+        sessionId: payload.sessionId,
+      });
+      return stopRetryingAutoSwitch(
+        "no_selectable_profile",
+        "[cdxx] No selectable profiles remain; quota failover stopped. Add another profile or wait for quota reset.",
+        { profile: profile.name },
+      );
+    }
+
     await logFailoverEvent({
-      event: "switch.stopped",
+      event: "profile.selected",
       trigger: "autoswitch",
-      reason: "quota_available_by_status",
       fromProfile: profile.name,
+      toProfile: next.name,
       sessionId: payload.sessionId,
+      reason: summary.reason,
+      resetAt: summary.resetAt,
     });
-    return stopRetryingAction(
-      "quota_available_by_status",
-      `[cdxx] /status no longer reports quota exhaustion for '${profile.name}'; failover stopped.`,
-      { profile: profile.name },
+    const switched = await withPausedAuthSwitch(
+      async () => await useProfile(next.name),
+      { switchingNotice: quotaSwitchingNotice("cdxx") },
     );
-  }
-
-  const state = await loadState();
-  if (!state.settings?.autoswitch) {
+    if (shouldRefreshStatusAfterSwitch) {
+      const scheduleStatusRefresh = options.scheduleStatusRefresh ?? startBackgroundProfileStatusRefresh;
+      try {
+        // Probe the exhausted profile only after its sessions have stopped and
+        // the new profile is active, avoiding concurrent refreshes in one token
+        // family while still keeping status off the failover foreground path.
+        const scheduled = scheduleStatusRefresh(profile.name);
+        if (scheduled && typeof scheduled.catch === "function") void scheduled.catch(() => undefined);
+      } catch {
+        // Status metadata is best-effort; failover policy must still proceed.
+      }
+    }
     await logFailoverEvent({
-      event: "switch.stopped",
+      event: "switch.completed",
       trigger: "autoswitch",
-      reason: "autoswitch_off",
       fromProfile: profile.name,
+      toProfile: switched.name ?? next.name,
       sessionId: payload.sessionId,
+      reason: summary.reason,
+      resetAt: summary.resetAt,
+      actionKind: "sessions_restarted",
     });
-    return stopRetryingAction(
-      "autoswitch_off",
-      "[cdxx] Autoswitch is off; quota failover stopped.",
-      { profile: profile.name },
-    );
-  }
-
-  const next = pickNextProfile(state, profile.name);
-  if (!next) {
-    await logFailoverEvent({
-      event: "switch.stopped",
-      trigger: "autoswitch",
-      reason: "no_selectable_profile",
-      fromProfile: profile.name,
+    return {
+      ok: true,
+      kind: "sessions_restarted",
+      profile: switched.name ?? next.name,
       sessionId: payload.sessionId,
-    });
-    return stopRetryingAction(
-      "no_selectable_profile",
-      "[cdxx] No selectable profiles remain; quota failover stopped. Add another profile or wait for quota reset.",
-      { profile: profile.name },
-    );
-  }
-
-  await logFailoverEvent({
-    event: "profile.selected",
-    trigger: "autoswitch",
-    fromProfile: profile.name,
-    toProfile: next.name,
-    sessionId: payload.sessionId,
-    reason: summary.reason,
-    resetAt: summary.resetAt,
+      message: `[cdxx] Switched to '${switched.name ?? next.name}' after quota was reached; supervised Codex sessions are restarting with the active profile.`,
+    };
   });
-  const switched = await withPausedAuthSwitch(async () => await useProfile(next.name));
-  await logFailoverEvent({
-    event: "switch.completed",
-    trigger: "autoswitch",
-    fromProfile: profile.name,
-    toProfile: switched.name ?? next.name,
-    sessionId: payload.sessionId,
-    reason: summary.reason,
-    resetAt: summary.resetAt,
-    actionKind: "sessions_restarted",
-  });
-  return {
-    ok: true,
-    kind: "sessions_restarted",
-    profile: switched.name ?? next.name,
-    sessionId: payload.sessionId,
-    message: `[cdxx] Switched to '${switched.name ?? next.name}' after quota was reached; supervised Codex sessions are restarting with the active profile.`,
-  };
 }

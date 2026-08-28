@@ -19,7 +19,7 @@ Published CLI packages:
 
 After installation, daily use stays on the original CLI names. Wrapper
 management commands use the `x` namespace, such as `agy x list` and
-`codex x config autoswitch on`; protected `agy login` and `codex login` are
+`codex x config autoswitch scope-first`; protected `agy login` and `codex login` are
 owned by the wrappers so credentials can be saved automatically and restored on
 failed login attempts.
 
