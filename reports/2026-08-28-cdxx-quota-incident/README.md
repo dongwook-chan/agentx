@@ -389,6 +389,46 @@ node --test \
    watch/scan/reconcile 시각·소요 시간, 복구 누계를 남긴다.
 6. `agentx-supervisor watcher-status`가 동일한 live snapshot을 반환한다.
 
+## 13. 13:42 UTC 재발과 추가 확정 원인
+
+watcher 보강 배포 후 13:42:17 UTC에 `dtjp_86`의 5시간 window 100%를
+global watcher가 정상 감지했고, 212ms 뒤 failover 정책까지 전달했다. 이번
+전환 실패는 watcher 누락이 아니었다. 저장 state에서 `zqop.38`이 8월 25일의
+exhausted record와 미래 reset을 계속 가지고 있어 후보 선택이
+`no_selectable_profile`로 끝났다. 13:43:44 UTC 수동 전환 뒤 실제
+`zqop.38` status는 5h 1~15%, weekly 17~19%로 사용 가능했다.
+
+13:44:46 UTC부터는 새 subagent rollout이 부모 transcript의 과거
+`token_count`를 첫 `task_started` 앞에 복제하는 형식도 확인됐다. watcher는
+부모 profile ownership을 상속한 즉시 이 preamble을 신규 quota로 처리했고,
+`limit_id=premium`, `has_credits=false`인 정보성 record를 전체 quota
+exhaustion으로 해석해 정상 `zqop.38` state까지 다시 오염시켰다.
+
+후속 수정 계약은 다음과 같다.
+
+1. Codex 자동 전환과 `next`는 저장 quota cache로 후보를 허용하거나 차단하지 않는다.
+2. inactive profile 전체를 profile별 격리 `CODEX_HOME`에서 동시에 `/status` 조회한다.
+3. 이번 verification round에서 available인 profile만 core round-robin 정책으로 선택한다.
+4. probe failure는 exhaustion과 분리해 `candidate_verification_failed`로 보고한다.
+5. 조회 결과는 순차 저장해 `list/use` 표시 cache만 갱신한다.
+6. quota window는 slot 이름이 아니라 `window_minutes`로 정규화한다.
+7. subagent의 첫 `task_started` 이전 quota preamble은 무시한다.
+8. 구매 credit 잔액 0만으로는 exhaustion을 판정하지 않는다.
+
+14:18~14:20 UTC의 첫 실운영 검증에서는 `dtjp_86` `/status`가 available로
+성공했지만 자동 전환이 계속 `no_selectable_profile`로 끝났다. 원인은 quota
+cache가 아니라 profile의 `disabled=true`와 과거
+`credentialError=refresh token family invalidated`였다. 성공한 status probe가
+quota만 갱신하고 이 credential-failure marker를 해제하지 않아 core의 일반
+eligibility filter가 후보를 제거했다. 성공한 격리 status는 저장 credential의
+현재 사용 가능성도 증명하므로, 후속 수정에서 이 marker와 error를 함께
+해제하도록 했다.
+
+최종 정책은 더 강하게 정리했다. 자동 전환의 이번 격리 `/status`가
+available이면 저장된 `disabled`, credential error, quota cache를 모두 무시하고
+후보로 인정한다. 성공한 실제 provider 요청보다 오래된 로컬 marker를 더 높은
+권위로 취급하지 않는다.
+
 따라서 다음 사건에서는 다음과 같이 판정할 수 있다.
 
 - recovery diagnosis 존재: 해당 diagnosis가 최초 전달 경로 실패 원인이다.

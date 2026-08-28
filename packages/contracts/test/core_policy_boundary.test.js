@@ -48,10 +48,23 @@ test("CLI usage reasons must be declared by core before adapter implementation",
   );
 });
 
-test("CLI adapters cannot put status probing back on the failover foreground path", async () => {
+test("Codex failover verifies every candidate through the core live-status contract", async () => {
   const failover = await readFile(join(cdxxSourceDir, "failover_policy.js"), "utf8");
-  assert.doesNotMatch(failover, /scanCodexQuota|probeCodexStatusQuota|refreshProfileStatus/);
+  assert.match(failover, /verifyProfileStatuses/);
+  assert.match(failover, /selectVerifiedAutoSwitchCandidate/);
+  assert.doesNotMatch(failover, /pickNextProfile|profileSelectableReason/);
   assert.match(failover, /startBackgroundProfileStatusRefresh/);
+  const cdxxCli = await readFile(join(cdxxSourceDir, "cli.js"), "utf8");
+  assert.match(cdxxCli, /selectVerifiedAutoSwitchCandidate/);
+  assert.match(cdxxCli, /verifyProfileStatuses/);
+  assert.equal(
+    agentCliManifests.codex.quotaFailover.automaticCandidateQuotaSource,
+    "isolated-live-status",
+  );
+  assert.equal(
+    agentCliManifests.codex.quotaFailover.verifyAllAutomaticCandidatesBeforeSelection,
+    true,
+  );
 
   const background = await readFile(join(cdxxSourceDir, "background_status.js"), "utf8");
   assert.match(background, /usageCheckReasons\.backgroundLiveQuotaRefresh/);
@@ -78,7 +91,7 @@ test("both CLI adapters consume the shared credential persistence abstraction", 
   assert.match(cdxxStatus, /runRefreshableCredentialOperation/);
 });
 
-test("neither adapter launches a refresh-capable probe beside a live CLI session", async () => {
+test("neither adapter launches a refresh-capable probe during ordinary session startup", async () => {
   const agyxSupervisor = await readFile(
     join(repoRoot, "packages/cli/agyx/native/agyx-supervisor/src/main.rs"),
     "utf8",

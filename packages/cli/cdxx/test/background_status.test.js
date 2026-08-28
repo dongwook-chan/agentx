@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   refreshProfileStatus,
   startBackgroundProfileStatusRefresh,
+  verifyProfileStatuses,
 } from "../src/background_status.js";
 import { profilesDir } from "../src/config.js";
 
@@ -65,4 +66,50 @@ test("profile refresh probes and records the requested saved profile", async () 
     },
   });
   assert.deepEqual(recorded, { value: summary, name: "profile-a" });
+});
+
+test("candidate verification probes all profiles before recording snapshots", async () => {
+  const calls = [];
+  const recorded = [];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const pending = verifyProfileStatuses(["profile-a", "profile-b"], {
+    scan: async (options) => {
+      calls.push(options);
+      await gate;
+      const exhausted = options.statusOptions.profileName === "profile-b";
+      return {
+        source: "status",
+        exhausted,
+        statusRemaining: { primary: exhausted ? 0 : 50 },
+        current: { primary: exhausted ? 100 : 50 },
+      };
+    },
+    record: async (summary, profileName) => recorded.push({ summary, profileName }),
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 2, "all isolated probes must start concurrently");
+  release();
+
+  assert.deepEqual(await pending, [
+    { profileName: "profile-a", status: "available" },
+    { profileName: "profile-b", status: "exhausted" },
+  ]);
+  assert.deepEqual(calls.map((call) => call.reason), [
+    "automatic-candidate-verification",
+    "automatic-candidate-verification",
+  ]);
+  assert.deepEqual(recorded.map((entry) => entry.profileName), ["profile-a", "profile-b"]);
+});
+
+test("candidate verification reports missing quota windows as failure", async () => {
+  const result = await verifyProfileStatuses(["profile-a"], {
+    scan: async () => ({ source: "status", exhausted: false, current: {} }),
+    record: async () => assert.fail("invalid status must not be recorded"),
+  });
+
+  assert.equal(result[0].profileName, "profile-a");
+  assert.equal(result[0].status, "failed");
+  assert.match(result[0].reason, /did not return a quota window/);
 });

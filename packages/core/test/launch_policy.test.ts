@@ -17,6 +17,7 @@ import {
   markActiveProfile,
   nativeSupervisorHostStatus,
   profileNameFromIdentity,
+  quotaScopeFromWindowDuration,
   quotaSwitchingNotice,
   readFirstLineBounded,
   persistCurrentCredential,
@@ -27,6 +28,7 @@ import {
   runUsageCheck,
   SessionProfileOwnershipRegistry,
   selectAutoSwitchCandidate,
+  selectVerifiedAutoSwitchCandidate,
   selectRoundRobinProfile,
   shouldAutoSwitchForQuota,
   usageCheckPolicies,
@@ -448,6 +450,56 @@ test("generic round-robin and resetless quota TTL are core policy", () => {
     true,
   );
   assert.equal(resetlessQuotaExpired(undefined, new Date("2026-08-07T00:00:00.000Z")), false);
+});
+
+test("live-verified candidate selection ignores persisted quota cache", () => {
+  const state = {
+    activeProfile: "a",
+    profiles: [
+      { name: "a", quotaStatus: "exhausted" as const },
+      {
+        name: "b",
+        quotaStatus: "exhausted" as const,
+        disabled: true,
+        credentialStatus: "error" as const,
+      },
+      { name: "c", quotaStatus: "available" as const },
+    ],
+  };
+
+  assert.deepEqual(selectVerifiedAutoSwitchCandidate(state, [
+    { profileName: "b", status: "available" },
+    { profileName: "c", status: "exhausted" },
+  ]), {
+    profile: state.profiles[1],
+    reason: "verified_available",
+    failedProfiles: [],
+  });
+  assert.deepEqual(selectVerifiedAutoSwitchCandidate(state, [
+    { profileName: "b", status: "exhausted" },
+    { profileName: "c", status: "exhausted" },
+  ]), {
+    reason: "all_verified_exhausted",
+    failedProfiles: [],
+  });
+  assert.deepEqual(selectVerifiedAutoSwitchCandidate(state, [
+    { profileName: "b", status: "failed", reason: "probe timed out" },
+    { profileName: "c", status: "exhausted" },
+  ]), {
+    reason: "candidate_verification_failed",
+    failedProfiles: ["b"],
+  });
+});
+
+test("quota windows are normalized by duration before slot-name fallback", () => {
+  const windows = [
+    { scope: "5h", durationMinutes: 300 },
+    { scope: "weekly", durationMinutes: 10_080 },
+  ];
+  assert.equal(quotaScopeFromWindowDuration(windows, 300, "5h"), "5h");
+  assert.equal(quotaScopeFromWindowDuration(windows, 10_080, "5h"), "weekly");
+  assert.equal(quotaScopeFromWindowDuration(windows, undefined, "5h"), "5h");
+  assert.equal(quotaScopeFromWindowDuration(windows, 1_440, "5h"), "unknown");
 });
 
 test("generic profile presentation renders shared table and picker rows", () => {

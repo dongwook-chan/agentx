@@ -327,6 +327,10 @@ export const unmanagedTranscriptObservationPolicy = {
 export interface QuotaFailoverSemantics {
   definitiveLiveExhaustionSwitchesImmediately: boolean;
   usageRefreshMayBlockFailover: boolean;
+  automaticCandidateQuotaSource: "persisted-quota" | "isolated-live-status";
+  verifyAllAutomaticCandidatesBeforeSelection: boolean;
+  quotaWindows?: readonly { scope: string; durationMinutes: number }[];
+  successfulStatusVerificationClearsCredentialFailure: boolean;
   observesUnmanagedSessionTranscripts: boolean;
   supportedAutoSwitchModes: readonly AutoSwitchMode[];
   defaultAutoSwitchMode: AutoSwitchMode;
@@ -341,6 +345,16 @@ export interface QuotaFailoverSemantics {
 export interface LiveQuotaFailoverDecision {
   switchImmediately: boolean;
   usageRefreshMayBlock: false;
+}
+
+export function quotaScopeFromWindowDuration(
+  windows: readonly { scope: string; durationMinutes: number }[] | undefined,
+  durationMinutes: unknown,
+  fallbackScope: string,
+): string {
+  const duration = Number(durationMinutes);
+  if (!Number.isFinite(duration)) return fallbackScope;
+  return windows?.find((window) => window.durationMinutes === duration)?.scope ?? "unknown";
 }
 
 export interface AutoSwitchAction {
@@ -453,6 +467,9 @@ export const agentCliManifests = {
     quotaFailover: {
       definitiveLiveExhaustionSwitchesImmediately: true,
       usageRefreshMayBlockFailover: false,
+      automaticCandidateQuotaSource: "persisted-quota",
+      verifyAllAutomaticCandidatesBeforeSelection: false,
+      successfulStatusVerificationClearsCredentialFailure: false,
       observesUnmanagedSessionTranscripts: false,
       supportedAutoSwitchModes: ["off", "scope-first", "all-scopes"],
       defaultAutoSwitchMode: "all-scopes",
@@ -484,6 +501,14 @@ export const agentCliManifests = {
     quotaFailover: {
       definitiveLiveExhaustionSwitchesImmediately: true,
       usageRefreshMayBlockFailover: false,
+      automaticCandidateQuotaSource: "isolated-live-status",
+      verifyAllAutomaticCandidatesBeforeSelection: true,
+      successfulStatusVerificationClearsCredentialFailure: true,
+      quotaWindows: [
+        { scope: "5h", durationMinutes: 300 },
+        { scope: "weekly", durationMinutes: 10_080 },
+        { scope: "monthly", durationMinutes: 43_200 },
+      ],
       observesUnmanagedSessionTranscripts: true,
       supportedAutoSwitchModes: ["off", "scope-first"],
       defaultAutoSwitchMode: "off",
@@ -619,6 +644,7 @@ export const usageCheckPolicies = {
   "session-start": { mode: "refresh", foregroundAllowed: false },
   "live-quota-trigger": { mode: "refresh", foregroundAllowed: false },
   "background-live-quota-refresh": { mode: "refresh", foregroundAllowed: false },
+  "automatic-candidate-verification": { mode: "refresh", foregroundAllowed: false },
   "session-exit": { mode: "local-scan", foregroundAllowed: true },
   list: { mode: "state-only", foregroundAllowed: true },
   use: { mode: "state-only", foregroundAllowed: true },
@@ -632,6 +658,7 @@ export const usageCheckReasons = {
   sessionStart: "session-start",
   liveQuotaTrigger: "live-quota-trigger",
   backgroundLiveQuotaRefresh: "background-live-quota-refresh",
+  automaticCandidateVerification: "automatic-candidate-verification",
   sessionExit: "session-exit",
   list: "list",
   use: "use",
@@ -895,6 +922,49 @@ export function selectAutoSwitchCandidate<
       || left.resetAt - right.resetAt
       || left.offset - right.offset
     )[0]?.profile;
+}
+
+export type CandidateQuotaVerificationStatus = "available" | "exhausted" | "failed";
+
+export interface CandidateQuotaVerification {
+  profileName: string;
+  status: CandidateQuotaVerificationStatus;
+  reason?: string;
+}
+
+export interface VerifiedAutoSwitchCandidateDecision<TProfile extends GenericProfileRecord> {
+  profile?: TProfile;
+  reason: "verified_available" | "all_verified_exhausted" | "candidate_verification_failed";
+  failedProfiles: string[];
+}
+
+/**
+ * Selects an automatic failover target only from the results of the current
+ * isolated verification round. Persisted quota fields are intentionally not
+ * consulted: they are presentation/cache data and cannot veto a live-verified
+ * candidate or authorize an unverified one. A successful isolated status probe
+ * also overrides older disabled/credential markers for this selection round.
+ */
+export function selectVerifiedAutoSwitchCandidate<
+  TProfile extends GenericProfileRecord,
+>(
+  state: GenericProfileState<TProfile>,
+  verifications: readonly CandidateQuotaVerification[],
+): VerifiedAutoSwitchCandidateDecision<TProfile> {
+  const byProfile = new Map(verifications.map((result) => [result.profileName, result]));
+  const candidates = state.profiles.filter((profile) => profile.name !== state.activeProfile);
+  const failedProfiles = candidates
+    .filter((profile) => byProfile.get(profile.name)?.status !== "available"
+      && byProfile.get(profile.name)?.status !== "exhausted")
+    .map((profile) => profile.name);
+  const profile = selectRoundRobinProfile(state, (candidate) =>
+    byProfile.get(candidate.name)?.status === "available"
+  );
+  if (profile) return { profile, reason: "verified_available", failedProfiles };
+  if (failedProfiles.length) {
+    return { reason: "candidate_verification_failed", failedProfiles };
+  }
+  return { reason: "all_verified_exhausted", failedProfiles };
 }
 
 export function selectRoundRobinProfile<TProfile extends GenericProfileRecord>(

@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { ensureExhaustedUsageScope, runUsageCheck, usageCheckReasons } from "@dong-/agentx-core";
+import { agentCliManifests, ensureExhaustedUsageScope, quotaScopeFromWindowDuration, runUsageCheck, usageCheckReasons } from "@dong-/agentx-core";
 import { codexHome, clearExpiredQuota, loadState, saveState } from "./config.js";
 import { probeCodexStatusQuota } from "./status_probe.js";
 
@@ -51,16 +51,10 @@ function numericPercent(value) {
 }
 
 function creditsExhausted(rateLimits) {
-  const credits = rateLimits?.credits;
-  if (!credits || typeof credits !== "object") return false;
-  if (rateLimits.limit_id !== "premium" && (rateLimits.primary || rateLimits.secondary)) return false;
-  if (credits.unlimited === true) return false;
-  if (credits.has_credits === true) return false;
-  if (credits.has_credits !== false) return false;
-  const balance = typeof credits.balance === "number"
-    ? credits.balance
-    : Number.parseFloat(String(credits.balance ?? ""));
-  return Number.isFinite(balance) && balance <= 0;
+  // A zero purchased-credit balance is normal for included plans. Exhaustion
+  // must come from a reached type, a 100% usage window, or an explicit
+  // usage_limit_exceeded event instead of this informational field.
+  return false;
 }
 
 export function createQuotaSummary() {
@@ -208,7 +202,12 @@ export function quotaScopesFromSummary(summary) {
     };
   }
   const scopes = {};
-  for (const { key, scope, label } of statusLimitScopes) {
+  for (const { key, scope: fallbackScope, label } of statusLimitScopes) {
+    const scope = quotaScopeFromWindowDuration(
+      agentCliManifests.codex.quotaFailover.quotaWindows,
+      summary.current.windowMinutes?.[key],
+      fallbackScope,
+    );
     const current = summary.current[key];
     const remaining = summary.statusRemaining?.[key]
       ?? (typeof current === "number" ? Math.max(0, 100 - current) : undefined);
@@ -228,7 +227,7 @@ export function quotaScopesFromSummary(summary) {
       remainingPercent: remaining,
       resetAt,
       resetText: summary.statusResetText?.[key],
-      reason: exhausted ? `${label} quota exhausted` : undefined,
+      reason: exhausted ? `${scope === "unknown" ? label : scope} quota exhausted` : undefined,
       checkedAt,
     });
   }
@@ -269,6 +268,11 @@ function updateSummary(summary, file, lineNumber, event) {
       resetAtByScope: {
         primary: epochSecondsToIso(rateLimits.primary?.resets_at),
         secondary: epochSecondsToIso(rateLimits.secondary?.resets_at),
+        monthly: undefined,
+      },
+      windowMinutes: {
+        primary: numericPercent(rateLimits.primary?.window_minutes),
+        secondary: numericPercent(rateLimits.secondary?.window_minutes),
         monthly: undefined,
       },
       credits: rateLimits.credits,
@@ -432,6 +436,14 @@ export async function recordQuotaForProfile(summary, profileName) {
   if (!profile) return undefined;
   clearExpiredQuota(profile);
   const now = new Date().toISOString();
+  if (
+    summary.source === "status"
+    && agentCliManifests.codex.quotaFailover.successfulStatusVerificationClearsCredentialFailure
+  ) {
+    profile.disabled = false;
+    profile.credentialStatus = state.activeProfile === profile.name ? "active" : "saved";
+    profile.credentialError = undefined;
+  }
   profile.lastScanAt = now;
   profile.lastUsage = {
     source: summary.source,

@@ -328,6 +328,7 @@ export class CodexGlobalSessionWatcher {
       sessionId: sessionIdFromPath(path),
       parentSessionId: undefined,
       profileName: undefined,
+      turnStarted: offset > 0,
       pendingQuota: undefined,
       quotaHandled: false,
       consumedWatchSequence: this.watchSignals.get(path)?.sequence ?? 0,
@@ -475,6 +476,7 @@ export class CodexGlobalSessionWatcher {
       track.carry = "";
       track.profileName = undefined;
       track.parentSessionId = undefined;
+      track.turnStarted = false;
       track.pendingQuota = undefined;
       track.quotaHandled = false;
     }
@@ -511,7 +513,10 @@ export class CodexGlobalSessionWatcher {
           : this.ownership.owner(track.sessionId) ?? track.profileName;
       }
       if (lifecycle?.turnStarted) {
-        track.profileName = await this.getActiveProfile();
+        track.turnStarted = true;
+        track.profileName = track.parentSessionId
+          ? (track.profileName ?? this.ownership.inherit(track.sessionId, track.parentSessionId))
+          : await this.getActiveProfile();
         this.ownership.bind(track.sessionId, track.profileName);
         track.pendingQuota = undefined;
         track.quotaHandled = false;
@@ -525,7 +530,7 @@ export class CodexGlobalSessionWatcher {
       }
 
       const quota = parseCodexQuotaLine(line);
-      if (!quota || track.quotaHandled) continue;
+      if (!quota || !track.turnStarted || track.quotaHandled) continue;
       track.profileName ??= this.ownership.owner(track.sessionId)
         ?? this.ownership.inherit(track.sessionId, track.parentSessionId);
       if (!track.profileName) {

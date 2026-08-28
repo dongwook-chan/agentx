@@ -103,7 +103,7 @@ test("scanCodexSessions marks current future reset exhaustion", async () => {
   }
 });
 
-test("scanCodexSessions treats depleted premium credits as exhaustion", async () => {
+test("scanCodexSessions does not treat zero purchased credits as exhaustion", async () => {
   const root = await mkdtemp(join(tmpdir(), "cdxx-quota-"));
   try {
     const sessions = join(root, "sessions");
@@ -116,8 +116,8 @@ test("scanCodexSessions treats depleted premium credits as exhaustion", async ()
     const summary = await scanCodexSessions({ sessionsDir: sessions });
 
     assert.equal(summary.tokenCountRecords, 1);
-    assert.equal(summary.exhausted, true);
-    assert.equal(summary.reason, "credits exhausted");
+    assert.equal(summary.exhausted, false);
+    assert.equal(summary.reason, undefined);
     assert.deepEqual(summary.lastCredits, { has_credits: false, unlimited: false, balance: "0" });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -239,6 +239,28 @@ test("quotaScopesFromSummary preserves both Codex status windows", () => {
   assert.equal(scopes.weekly.status, "available");
   assert.equal(scopes.weekly.remainingPercent, 62);
   assert.equal(scopes.weekly.resetAt, "2026-07-07T09:13:00.000Z");
+});
+
+test("quotaScopesFromSummary classifies a primary weekly-only payload by duration", () => {
+  const scopes = quotaScopesFromSummary({
+    source: "supervisor-payload",
+    exhausted: true,
+    reason: "primary rate limit reached",
+    resetAt: "2026-08-31T05:09:04.000Z",
+    lastAt: "2026-08-25T00:33:38.307Z",
+    current: {
+      timestamp: "2026-08-25T00:33:38.307Z",
+      primary: 100,
+      secondary: undefined,
+      resetAt: "2026-08-31T05:09:04.000Z",
+      windowMinutes: { primary: 10_080, secondary: undefined },
+    },
+  });
+
+  assert.equal(scopes["5h"], undefined);
+  assert.equal(scopes.weekly.status, "exhausted");
+  assert.equal(scopes.weekly.usedPercent, 100);
+  assert.equal(scopes.weekly.reason, "weekly quota exhausted");
 });
 
 test("quotaScopesFromSummary preserves free monthly status window", () => {

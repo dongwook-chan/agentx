@@ -129,6 +129,9 @@ test("all CLI manifests obey the core live-quota failover policy", () => {
   ]);
   assert.equal(agentCliManifests.agy.quotaFailover.defaultAutoSwitchMode, "all-scopes");
   assert.equal(agentCliManifests.agy.quotaFailover.candidateQuotaPolicy, "trigger-scope");
+  assert.equal(agentCliManifests.agy.quotaFailover.automaticCandidateQuotaSource, "persisted-quota");
+  assert.equal(agentCliManifests.agy.quotaFailover.verifyAllAutomaticCandidatesBeforeSelection, false);
+  assert.equal(agentCliManifests.agy.quotaFailover.successfulStatusVerificationClearsCredentialFailure, false);
   assert.deepEqual(agentCliManifests.agy.quotaFailover.supportedEligibilityModes, ["allow", "block"]);
   assert.equal(agentCliManifests.agy.quotaFailover.defaultEligibilityMode, "allow");
   assert.equal(agentCliManifests.agy.quotaFailover.observesUnmanagedSessionTranscripts, false);
@@ -139,6 +142,14 @@ test("all CLI manifests obey the core live-quota failover policy", () => {
   ]);
   assert.equal(agentCliManifests.codex.quotaFailover.defaultAutoSwitchMode, "off");
   assert.equal(agentCliManifests.codex.quotaFailover.candidateQuotaPolicy, "any-scope");
+  assert.equal(agentCliManifests.codex.quotaFailover.automaticCandidateQuotaSource, "isolated-live-status");
+  assert.equal(agentCliManifests.codex.quotaFailover.verifyAllAutomaticCandidatesBeforeSelection, true);
+  assert.equal(agentCliManifests.codex.quotaFailover.successfulStatusVerificationClearsCredentialFailure, true);
+  assert.deepEqual(agentCliManifests.codex.quotaFailover.quotaWindows, [
+    { scope: "5h", durationMinutes: 300 },
+    { scope: "weekly", durationMinutes: 10_080 },
+    { scope: "monthly", durationMinutes: 43_200 },
+  ]);
   assert.equal(agentCliManifests.codex.quotaFailover.observesUnmanagedSessionTranscripts, true);
   assert.deepEqual(agentCliManifests.codex.quotaFailover.unmanagedTranscriptObservation, {
     changeNotifications: "hint",

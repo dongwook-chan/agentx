@@ -16,7 +16,25 @@ test("parses Codex quota token_count events", () => {
     },
   }));
   assert.equal(event.primary, 100);
+  assert.equal(event.primaryWindowMinutes, undefined);
   assert.equal(event.resetAt, new Date(1900000000 * 1000).toISOString());
+});
+
+test("preserves quota window durations for downstream scope normalization", () => {
+  const event = parseCodexQuotaLine(JSON.stringify({
+    timestamp: "2026-08-25T00:33:38.307Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      rate_limits: {
+        primary: { used_percent: 100, window_minutes: 10080, resets_at: 1788152944 },
+        secondary: null,
+        rate_limit_reached_type: null,
+      },
+    },
+  }));
+  assert.equal(event.primaryWindowMinutes, 10080);
+  assert.equal(event.secondaryWindowMinutes, undefined);
 });
 
 test("does not treat absent purchased credits as exhausted included usage", () => {
@@ -28,6 +46,24 @@ test("does not treat absent purchased credits as exhausted included usage", () =
       rate_limits: {
         limit_id: "codex",
         primary: { used_percent: 43, window_minutes: 10080 },
+        secondary: null,
+        credits: { has_credits: false, unlimited: false, balance: "0" },
+        rate_limit_reached_type: null,
+      },
+    },
+  }));
+  assert.equal(event, undefined);
+});
+
+test("does not treat a premium record with zero purchased credits as quota exhaustion", () => {
+  const event = parseCodexQuotaLine(JSON.stringify({
+    timestamp: "2026-08-28T13:44:46.500Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      rate_limits: {
+        limit_id: "premium",
+        primary: null,
         secondary: null,
         credits: { has_credits: false, unlimited: false, balance: "0" },
         rate_limit_reached_type: null,

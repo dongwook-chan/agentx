@@ -1,10 +1,9 @@
-import { appendAgentEvent, decideLiveQuotaFailover, decideObservedProfileFailover, quotaSwitchingNotice, stopRetryingAutoSwitch } from "@dong-/agentx-core";
+import { appendAgentEvent, decideLiveQuotaFailover, decideObservedProfileFailover, quotaSwitchingNotice, selectVerifiedAutoSwitchCandidate, stopRetryingAutoSwitch } from "@dong-/agentx-core";
 import { effectiveAutoSwitchMode, eventLogPath, loadState } from "./config.js";
 import { recordQuotaForProfile } from "./quota.js";
 import { useProfile } from "./auth.js";
-import { exhaustedQuotaScopes, pickNextProfile } from "./selection.js";
 import { withPausedAuthSwitch } from "./managed_sessions.js";
-import { startBackgroundProfileStatusRefresh } from "./background_status.js";
+import { startBackgroundProfileStatusRefresh, verifyProfileStatuses } from "./background_status.js";
 import { withAuthSwitchLock } from "./lock.js";
 
 async function logFailoverEvent(event) {
@@ -49,6 +48,11 @@ export function quotaSummaryFromSupervisorPayload(payload) {
       resetAt: payload.resetAt,
       credits: undefined,
       planType: payload.planType,
+      windowMinutes: {
+        primary: payload.primaryWindowMinutes,
+        secondary: payload.secondaryWindowMinutes,
+        monthly: undefined,
+      },
     },
     highWatermarks: [],
   };
@@ -142,8 +146,41 @@ export async function decideCodexFailover(payload, options = {}) {
       );
     }
 
-    const triggerScope = exhaustedQuotaScopes(profile)[0] ?? "unknown";
-    const next = pickNextProfile(state, profile.name, triggerScope, autoSwitchMode);
+    const verifyCandidates = options.verifyCandidates ?? verifyProfileStatuses;
+    const candidateNames = state.profiles
+      .filter((candidate) => candidate.name !== profile.name)
+      .map((candidate) => candidate.name);
+    const verifications = await verifyCandidates(candidateNames);
+    for (const verification of verifications) {
+      await logFailoverEvent({
+        event: "candidate.verified",
+        trigger: "autoswitch",
+        fromProfile: profile.name,
+        candidateProfile: verification.profileName,
+        status: verification.status,
+        reason: verification.reason,
+        recordError: verification.recordError,
+        sessionId: payload.sessionId,
+      });
+    }
+    const verifiedState = await loadState();
+    const selection = selectVerifiedAutoSwitchCandidate(verifiedState, verifications);
+    const next = selection.profile;
+    if (!next && selection.reason === "candidate_verification_failed") {
+      await logFailoverEvent({
+        event: "switch.stopped",
+        trigger: "autoswitch",
+        reason: "candidate_verification_failed",
+        fromProfile: profile.name,
+        failedProfiles: selection.failedProfiles,
+        sessionId: payload.sessionId,
+      });
+      return stopRetryingAutoSwitch(
+        "candidate_verification_failed",
+        `[cdxx] Could not verify a usable failover profile: ${selection.failedProfiles.join(", ")}.`,
+        { profile: profile.name, failedProfiles: selection.failedProfiles },
+      );
+    }
     if (!next) {
       await logFailoverEvent({
         event: "switch.stopped",
@@ -169,7 +206,7 @@ export async function decideCodexFailover(payload, options = {}) {
       resetAt: summary.resetAt,
     });
     const switched = await withPausedAuthSwitch(
-      async () => await useProfile(next.name),
+      async () => await useProfile(next.name, { force: true }),
       { switchingNotice: quotaSwitchingNotice("cdxx") },
     );
     if (shouldRefreshStatusAfterSwitch) {

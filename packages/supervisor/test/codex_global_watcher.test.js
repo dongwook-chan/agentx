@@ -109,7 +109,7 @@ test("global watcher leaves managed Codex sessions to their registered observer"
   }
 });
 
-test("global watcher inherits a subagent rollout's immutable parent profile", async () => {
+test("global watcher ignores copied subagent history before its first live turn", async () => {
   const root = await mkdtemp(join(tmpdir(), "agentx-global-subagent-"));
   const sessionsDir = join(root, "sessions");
   const parentFile = join(sessionsDir, `rollout-${sessionId}.jsonl`);
@@ -141,6 +141,15 @@ test("global watcher inherits a subagent rollout's immutable parent profile", as
         },
       },
     }) + quotaFailure());
+    watcher.markDirty(childFile);
+    await watcher.drain();
+
+    assert.equal(events.length, 0, "copied parent quota in the child preamble must be ignored");
+
+    await appendFile(
+      childFile,
+      line("event_msg", { type: "task_started" }) + quotaFailure(),
+    );
     watcher.markDirty(childFile);
     await watcher.drain();
 

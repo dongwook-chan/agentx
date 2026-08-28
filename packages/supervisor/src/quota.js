@@ -30,15 +30,10 @@ export function parseCodexQuotaLine(line) {
   const primary = Number(limits?.primary?.used_percent ?? 0);
   const secondary = Number(limits?.secondary?.used_percent ?? 0);
   const reachedType = limits?.rate_limit_reached_type ?? null;
-  const credits = limits?.credits;
-  // A Plus account commonly has no purchased credits while its included usage
-  // window is still available. Only treat credits as the exhausted resource
-  // when Codex identifies the active limit as premium/credits (or supplies no
-  // usage windows at all).
-  const creditsExhausted = credits?.has_credits === false
-    && credits?.unlimited !== true
-    && (limits?.limit_id === "premium" || (!limits?.primary && !limits?.secondary));
-  if (primary < 100 && secondary < 100 && reachedType === null && !creditsExhausted) return undefined;
+  // `has_credits=false` is also emitted for Plus accounts that simply have no
+  // purchased overage balance. It is informational unless Codex reports an
+  // actual reached type or usage-limit error.
+  if (primary < 100 && secondary < 100 && reachedType === null) return undefined;
   const resetsAt = primary >= 100
     ? limits?.primary?.resets_at
     : (secondary >= 100 ? limits?.secondary?.resets_at : limits?.primary?.resets_at ?? limits?.secondary?.resets_at);
@@ -46,6 +41,12 @@ export function parseCodexQuotaLine(line) {
     timestamp: value.timestamp,
     primary,
     secondary,
+    primaryWindowMinutes: Number.isFinite(Number(limits?.primary?.window_minutes))
+      ? Number(limits.primary.window_minutes)
+      : undefined,
+    secondaryWindowMinutes: Number.isFinite(Number(limits?.secondary?.window_minutes))
+      ? Number(limits.secondary.window_minutes)
+      : undefined,
     reachedType,
     resetAt: Number.isFinite(Number(resetsAt)) ? new Date(Number(resetsAt) * 1000).toISOString() : undefined,
     planType: limits?.plan_type,
@@ -60,11 +61,7 @@ export function parseCodexProtocolMessage(message) {
     const primary = Number(limits.primary?.usedPercent ?? 0);
     const secondary = Number(limits.secondary?.usedPercent ?? 0);
     const reachedType = limits.rateLimitReachedType ?? null;
-    const credits = limits.credits;
-    const creditsExhausted = credits?.hasCredits === false
-      && credits?.unlimited !== true
-      && (limits.limitId === "premium" || (!limits.primary && !limits.secondary));
-    if (primary < 100 && secondary < 100 && reachedType === null && !creditsExhausted) return undefined;
+    if (primary < 100 && secondary < 100 && reachedType === null) return undefined;
     const resetsAt = primary >= 100
       ? limits.primary?.resetsAt
       : limits.secondary?.resetsAt;
@@ -72,6 +69,12 @@ export function parseCodexProtocolMessage(message) {
       timestamp: new Date().toISOString(),
       primary,
       secondary,
+      primaryWindowMinutes: Number.isFinite(Number(limits.primary?.windowDurationMins ?? limits.primary?.windowMinutes))
+        ? Number(limits.primary?.windowDurationMins ?? limits.primary?.windowMinutes)
+        : undefined,
+      secondaryWindowMinutes: Number.isFinite(Number(limits.secondary?.windowDurationMins ?? limits.secondary?.windowMinutes))
+        ? Number(limits.secondary?.windowDurationMins ?? limits.secondary?.windowMinutes)
+        : undefined,
       reachedType,
       reason: reachedType
         ? `rate_limit_reached_type=${reachedType}`

@@ -14,11 +14,12 @@ process.env.AGENTX_SUPERVISOR_SOCKET = join(root, "agentx-supervisor.sock");
 const auth = await import("../src/auth.js");
 const config = await import("../src/config.js");
 const sessions = await import("../src/managed_sessions.js");
+const quota = await import("../src/quota.js");
 const { decideCodexFailover, quotaSummaryFromSupervisorPayload } = await import("../src/failover_policy.js");
 
 after(async () => {
   await shutdownTestSupervisor();
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 async function shutdownTestSupervisor() {
@@ -62,7 +63,7 @@ async function writeProfile(name, accountId = name) {
 
 async function resetState() {
   await shutdownTestSupervisor();
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
   await mkdir(process.env.CODEX_HOME, { recursive: true });
   await mkdir(join(process.env.CDXX_CONFIG_DIR, "run"), { recursive: true });
   await writeProfile("a");
@@ -78,6 +79,10 @@ async function resetState() {
     settings: { autoswitch: true, yolo: true },
     sessions: {},
   })}\n`);
+}
+
+async function verifyAvailable(candidateNames) {
+  return candidateNames.map((profileName) => ({ profileName, status: "available" }));
 }
 
 test("quota failover switches under the shared paused-session transaction", async () => {
@@ -117,7 +122,7 @@ test("quota failover switches under the shared paused-session transaction", asyn
       resetAt: "2026-07-11T02:32:55.000Z",
       timestamp: "2026-07-11T00:54:34.245Z",
       planType: "plus",
-    });
+    }, { verifyCandidates: verifyAvailable });
 
     assert.equal(action.kind, "sessions_restarted");
     assert.equal(action.profile, "b");
@@ -140,13 +145,14 @@ test("quota failover switches under the shared paused-session transaction", asyn
     const productEvents = events.filter((event) => event.emitter !== "agentx-supervisor");
     assert.deepEqual(
       productEvents.map((event) => event.event),
-      ["quota.detected", "profile.selected", "switch.completed"],
+      ["quota.detected", "candidate.verified", "profile.selected", "switch.completed"],
     );
     assert.equal(productEvents[0].product, "cdxx");
     assert.equal(productEvents[0].profile, "a");
-    assert.equal(productEvents[1].fromProfile, "a");
-    assert.equal(productEvents[1].toProfile, "b");
-    assert.equal(productEvents[2].actionKind, "sessions_restarted");
+    assert.equal(productEvents[1].candidateProfile, "b");
+    assert.equal(productEvents[2].fromProfile, "a");
+    assert.equal(productEvents[2].toProfile, "b");
+    assert.equal(productEvents[3].actionKind, "sessions_restarted");
   } finally {
     server.close();
   }
@@ -171,6 +177,7 @@ test("quota failover does not await background status refresh when reset metadat
       reason: "You've hit your usage limit.",
       timestamp: "2026-08-07T00:00:00.000Z",
     }, {
+      verifyCandidates: verifyAvailable,
       scheduleStatusRefresh: (name) => {
         scheduledProfile = name;
         return never;
@@ -198,7 +205,7 @@ test("a stale concurrent quota event does not switch past the replacement profil
     reachedType: "usage_limit_exceeded",
     reason: "usage limit reached",
     timestamp: "2026-08-13T00:00:00.000Z",
-  });
+  }, { verifyCandidates: verifyAvailable });
   assert.equal(first.kind, "sessions_restarted");
   assert.equal(first.profile, "b");
 
@@ -215,16 +222,17 @@ test("a stale concurrent quota event does not switch past the replacement profil
   assert.equal((await config.loadState()).activeProfile, "b");
 });
 
-test("quota failover releases a stale resetless candidate before selection", async () => {
+test("quota failover ignores a persisted exhausted candidate after live verification", async () => {
   await resetState();
   const state = await config.loadState();
   const candidate = state.profiles.find((profile) => profile.name === "b");
   candidate.quotaStatus = "exhausted";
   candidate.lastQuotaReason = "copied historical usage-limit event";
   candidate.quotaScopes = {
-    unknown: {
+    "5h": {
       status: "exhausted",
-      reason: candidate.lastQuotaReason,
+      resetAt: "2026-08-31T00:00:00.000Z",
+      reason: "5h quota exhausted",
       checkedAt: "2026-08-13T00:00:00.000Z",
     },
   };
@@ -236,10 +244,100 @@ test("quota failover releases a stale resetless candidate before selection", asy
     reachedType: "usage_limit_exceeded",
     reason: "usage limit reached",
     timestamp: "2026-08-17T00:00:00.000Z",
-  });
+  }, { verifyCandidates: verifyAvailable });
 
   assert.equal(action.kind, "sessions_restarted");
   assert.equal(action.profile, "b");
-  const updated = await config.loadState();
-  assert.equal(updated.profiles.find((profile) => profile.name === "b")?.quotaStatus, "available");
+});
+
+test("quota failover rejects cached available profiles that live verification finds exhausted", async () => {
+  await resetState();
+  const action = await decideCodexFailover({
+    profileName: "a",
+    sessionId: "session-a",
+    reachedType: "usage_limit_exceeded",
+    reason: "usage limit reached",
+    timestamp: "2026-08-28T13:42:17.000Z",
+  }, {
+    verifyCandidates: async (candidateNames) => candidateNames.map((profileName) => ({
+      profileName,
+      status: "exhausted",
+    })),
+  });
+
+  assert.equal(action.kind, "stop_retrying");
+  assert.equal(action.reason, "no_selectable_profile");
+  assert.equal((await config.loadState()).activeProfile, "a");
+});
+
+test("quota failover distinguishes verification failure from exhaustion", async () => {
+  await resetState();
+  const action = await decideCodexFailover({
+    profileName: "a",
+    sessionId: "session-a",
+    reachedType: "usage_limit_exceeded",
+    reason: "usage limit reached",
+    timestamp: "2026-08-28T13:42:17.000Z",
+  }, {
+    verifyCandidates: async (candidateNames) => candidateNames.map((profileName) => ({
+      profileName,
+      status: "failed",
+      reason: "probe timed out",
+    })),
+  });
+
+  assert.equal(action.kind, "stop_retrying");
+  assert.equal(action.reason, "candidate_verification_failed");
+  assert.deepEqual(action.failedProfiles, ["b"]);
+});
+
+test("successful status verification clears an older credential-failure disable marker", async () => {
+  await resetState();
+  const state = await config.loadState();
+  const candidate = state.profiles.find((profile) => profile.name === "b");
+  candidate.disabled = true;
+  candidate.credentialStatus = "error";
+  candidate.credentialError = "refresh token family invalidated; re-authentication required";
+  await config.saveState(state);
+
+  await quota.recordQuotaForProfile({
+    source: "status",
+    exhausted: false,
+    scannedFiles: 0,
+    tokenCountRecords: 0,
+    statusRemaining: { primary: 100, secondary: 68 },
+    lastAt: "2026-08-28T14:20:37.125Z",
+    current: {
+      timestamp: "2026-08-28T14:20:37.125Z",
+      primary: 0,
+      secondary: 32,
+    },
+    highWatermarks: [],
+  }, "b");
+
+  const updated = (await config.loadState()).profiles.find((profile) => profile.name === "b");
+  assert.equal(updated.disabled, false);
+  assert.equal(updated.credentialStatus, "saved");
+  assert.equal(updated.credentialError, undefined);
+});
+
+test("live-verified failover ignores disabled and credential-error cache", async () => {
+  await resetState();
+  const state = await config.loadState();
+  const candidate = state.profiles.find((profile) => profile.name === "b");
+  candidate.disabled = true;
+  candidate.credentialStatus = "error";
+  candidate.credentialError = "old local failure";
+  await config.saveState(state);
+
+  const action = await decideCodexFailover({
+    profileName: "a",
+    sessionId: "session-a",
+    reachedType: "usage_limit_exceeded",
+    reason: "usage limit reached",
+    timestamp: "2026-08-28T14:18:02.000Z",
+  }, { verifyCandidates: verifyAvailable });
+
+  assert.equal(action.kind, "sessions_restarted");
+  assert.equal(action.profile, "b");
 });

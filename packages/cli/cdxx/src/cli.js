@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { agentCliManifests, appendAgentEvent, decideExplicitProfileUse, usageCheckReasons } from "@dong-/agentx-core";
+import { agentCliManifests, appendAgentEvent, decideExplicitProfileUse, selectVerifiedAutoSwitchCandidate, usageCheckReasons } from "@dong-/agentx-core";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,10 +12,10 @@ import { buildCodexLaunchArgsFromState } from "./launch_args.js";
 import { pauseAll, resumeAll, resumeManaged, sessionRecords, withPausedAuthSwitch } from "./managed_sessions.js";
 import { findRealCodex } from "./processes.js";
 import { profileSelectableReason } from "./selection.js";
-import { pickNextProfile, runCodexSession } from "./session.js";
+import { runCodexSession } from "./session.js";
 import { formatReset, recordQuotaForActiveProfile, recordQuotaForProfile, scanCodexQuota, scanCodexSessions } from "./quota.js";
 import { confirmAction, pickConfigKey, pickConfigValue, pickProfileAction, printProfiles, printScanSummary, promptText } from "./ui.js";
-import { refreshProfileStatus } from "./background_status.js";
+import { refreshProfileStatus, verifyProfileStatuses } from "./background_status.js";
 
 async function logSwitchEvent(event) {
   await appendAgentEvent(eventLogPath, { product: "cdxx", ...event }).catch(() => undefined);
@@ -196,16 +196,24 @@ async function browseProfiles(mode) {
 
 async function switchNext() {
   const state = await loadState();
-  for (const profile of state.profiles) clearExpiredQuota(profile);
-  const next = pickNextProfile(state);
-  if (!next) throw new Error("No selectable profile found.");
+  const candidateNames = state.profiles
+    .filter((profile) => profile.name !== state.activeProfile)
+    .map((profile) => profile.name);
+  const verifications = await verifyProfileStatuses(candidateNames);
+  const current = await loadState();
+  const selection = selectVerifiedAutoSwitchCandidate(current, verifications);
+  const next = selection.profile;
+  if (!next && selection.reason === "candidate_verification_failed") {
+    throw new Error(`Could not verify a usable profile: ${selection.failedProfiles.join(", ")}.`);
+  }
+  if (!next) throw new Error("No live-verified available profile found.");
   await logSwitchEvent({
     event: "profile.selected",
     trigger: "manual-next",
     fromProfile: state.activeProfile,
     toProfile: next.name,
   });
-  const result = await withPausedSessions(async () => await useProfile(next.name));
+  const result = await withPausedSessions(async () => await useProfile(next.name, { force: true }));
   await logSwitchEvent({
     event: "switch.completed",
     trigger: "manual-next",

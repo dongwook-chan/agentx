@@ -111,6 +111,27 @@ Codex auth and status data also provide no eligibility state separate from
 credential validity. cdxx cannot offer `ineligible allow|block`; it continues
 to reject invalid credentials through the shared candidate contract.
 
+Codex automatic failover does not use persisted quota fields to authorize or
+reject a target profile. Those fields are presentation cache for `list` and
+`use`. When a live exhaustion event requires a switch, cdxx probes every
+otherwise eligible inactive profile with its saved credential in an isolated
+`CODEX_HOME`, records the returned status for presentation, and selects only a
+profile reported available by that verification round. Probe failures remain
+distinct from exhaustion; if no available profile was verified, they stop the
+attempt as `candidate_verification_failed` instead of falsely reporting that
+all profiles are exhausted.
+
+For automatic Codex target selection, a result of `/status = available`
+overrides stored `disabled`, credential-error, and quota fields. These are all
+older local metadata; the successful isolated request proves that the saved
+auth is currently usable. Manual `list/use` may still display cached metadata.
+
+A successful isolated Codex status probe also proves that the saved credential
+is usable. cdxx therefore clears an older credential-failure `disabled` marker
+and credential error before selection. Without this reconciliation, a profile
+could be live-verified as available and still be silently rejected by stale
+credential state.
+
 Codex additionally observes appended records under `$CODEX_HOME/sessions` so
 SDK and other non-interactive clients that bypass the wrapper can still trigger
 auth failover. Existing files are indexed at EOF, managed session identities
@@ -132,6 +153,10 @@ returns the same live snapshot.
 Both adapters enter usage probing through core `runUsageCheck`. The probes
 remain product-specific transport: agyx drives `/usage`, while cdxx drives
 `/status` and uses app-server or hook events for the live exhaustion trigger.
+The live trigger itself is never delayed by rechecking the exhausted account.
+Codex target selection is a separate background-control operation: inactive
+credentials are probed concurrently in isolated homes before the supervisor
+commits an auth switch.
 When the live trigger has no scope metadata, both adapters use the core
 `unknown` exhausted scope immediately. A product background probe may later
 replace it with authoritative scope and reset metadata.
