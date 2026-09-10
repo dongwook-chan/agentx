@@ -135,6 +135,7 @@ test("all CLI manifests obey the core live-quota failover policy", () => {
   assert.deepEqual(agentCliManifests.agy.quotaFailover.supportedEligibilityModes, ["allow", "block"]);
   assert.equal(agentCliManifests.agy.quotaFailover.defaultEligibilityMode, "allow");
   assert.equal(agentCliManifests.agy.quotaFailover.observesUnmanagedSessionTranscripts, false);
+  assert.equal(agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt, undefined);
 
   assert.deepEqual(agentCliManifests.codex.quotaFailover.supportedAutoSwitchModes, [
     "off",
@@ -151,6 +152,7 @@ test("all CLI manifests obey the core live-quota failover policy", () => {
     { scope: "monthly", durationMinutes: 43_200 },
   ]);
   assert.equal(agentCliManifests.codex.quotaFailover.observesUnmanagedSessionTranscripts, true);
+  assert.equal(agentCliManifests.codex.quotaFailover.postSwitchContinuationPrompt, "continue");
   assert.deepEqual(agentCliManifests.codex.quotaFailover.unmanagedTranscriptObservation, {
     changeNotifications: "hint",
     reconcileTrackedFileSizes: true,

@@ -146,6 +146,7 @@ export class SupervisorDaemon {
       identityMode: session.identityMode,
       reason: session.reason,
       switchingNotice: session.switchingNotice,
+      resumePrompt: session.resumePrompt,
     };
   }
 
@@ -246,6 +247,7 @@ export class SupervisorDaemon {
         if (!session) throw new Error(`Unknown launcher: ${request.launcherId}`);
         session.childPid = request.childPid;
         session.generation = request.generation;
+        if (request.consumedResumePrompt) session.resumePrompt = undefined;
         if (request.profileName) session.profileName = request.profileName;
         session.paused = false;
         session.quotaHandled = false;
@@ -292,7 +294,7 @@ export class SupervisorDaemon {
         return session ? { ok: true, record: this.publicRecord(session) } : { ok: false, error: "session not found" };
       }
       case "pause": return await this.commandLauncher(request.launcherId, "pause", request.reason);
-      case "resume": return await this.commandLauncher(request.launcherId, "resume", request.reason);
+      case "resume": return await this.commandLauncher(request.launcherId, "resume", request.reason, request.prompt);
       case "notice": return await this.noticeLauncher(request.launcherId, request.message);
       case "shutdown": {
         await this.logWatcherStopped();
@@ -314,7 +316,7 @@ export class SupervisorDaemon {
     }
   }
 
-  async commandLauncher(launcherId, command, reason) {
+  async commandLauncher(launcherId, command, reason, prompt) {
     const session = this.sessions.get(launcherId);
     if (!session) throw new Error(`Unknown launcher: ${launcherId}`);
     if (!processAlive(session.launcherPid)) {
@@ -322,6 +324,7 @@ export class SupervisorDaemon {
       await this.persist();
       return { ok: true, stale: true, record: { ...this.publicRecord(session), childPid: undefined, paused: true } };
     }
+    if (command === "resume") session.resumePrompt = typeof prompt === "string" && prompt ? prompt : undefined;
     if (command === "resume" && session.paused && !session.childPid) {
       session.reason = reason;
       session.paused = false;
@@ -340,7 +343,10 @@ export class SupervisorDaemon {
       return { ok: true, record: this.publicRecord(session) };
     }
     const signal = command === "pause" ? "SIGUSR1" : "SIGCONT";
-    if (command === "pause") session.resumeAfterPause = false;
+    if (command === "pause") {
+      session.resumeAfterPause = false;
+      session.resumePrompt = undefined;
+    }
     session.reason = reason;
     try { process.kill(session.launcherPid, signal); }
     catch (error) {
@@ -511,7 +517,12 @@ export class SupervisorDaemon {
     const command = session.policyCommand ? process.execPath : (session.product === "agyx" ? "agyx" : "cdxx");
     const args = session.product === "agyx"
       ? ["_auto-next", event.scope ?? "unknown"]
-      : ["_supervisor-failover", Buffer.from(JSON.stringify({ profileName: session.profileName, sessionId: session.threadId ?? session.sessionId, ...event })).toString("base64")];
+      : ["_supervisor-failover", Buffer.from(JSON.stringify({
+        profileName: session.profileName,
+        sessionId: session.threadId ?? session.sessionId,
+        transcriptPath: session.transcriptPath,
+        ...event,
+      })).toString("base64")];
     const launchArgs = session.policyCommand ? [session.policyCommand, ...args] : args;
     const output = await new Promise((resolve, reject) => {
       const child = spawn(command, launchArgs, {

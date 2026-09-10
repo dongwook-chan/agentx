@@ -7,6 +7,16 @@ import { codexHooksInstalled } from "./install.js";
 import { createCodexRemoteTransport, probeCodexRemoteSupport, withCodexRemote } from "./remote.js";
 export { pickNextProfile } from "./selection.js";
 
+export function codexSessionArgsForRecord(args, record) {
+  const sessionId = record.codexThreadId ?? record.codexSessionId;
+  if (!sessionId) return args;
+  return [
+    "resume",
+    sessionId,
+    ...(typeof record.resumePrompt === "string" && record.resumePrompt ? [record.resumePrompt] : []),
+  ];
+}
+
 async function runUnmanagedCodex(executable, args, reason) {
   process.stderr.write(`[cdxx] Agentx Codex integration is unavailable: ${reason}\n`);
   process.stderr.write("[cdxx] Running the regular Codex CLI without session supervision or automatic profile failover.\n");
@@ -73,9 +83,7 @@ export async function runCodexSession(args) {
       : undefined,
     buildArgs: async ({ record, transport }) => {
       const launchArgs = await buildCodexLaunchArgsFromState(
-        (record.codexThreadId ?? record.codexSessionId)
-          ? ["resume", record.codexThreadId ?? record.codexSessionId]
-          : args,
+        codexSessionArgsForRecord(args, record),
       );
       return integration.mode === "remote"
         ? withCodexRemote(launchArgs, transport?.remoteUrl)

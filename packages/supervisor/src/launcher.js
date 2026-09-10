@@ -78,7 +78,14 @@ export async function runLauncher({ product, executable, args, buildArgs, restar
       env: { ...process.env, AGENTX_MANAGED: "1", AGENTX_LAUNCHER_ID: id, CDXX_LAUNCHER_ID: product === "cdxx" ? id : process.env.CDXX_LAUNCHER_ID },
     });
     lastExitWasRequested = false;
-    await request({ command: "child", launcherId: id, childPid: child.pid, generation, profileName });
+    await request({
+      command: "child",
+      launcherId: id,
+      childPid: child.pid,
+      generation,
+      profileName,
+      consumedResumePrompt: Boolean(record.resumePrompt),
+    });
     return await new Promise((resolve, reject) => {
       child.once("error", reject);
       child.once("exit", (code, signal) => {

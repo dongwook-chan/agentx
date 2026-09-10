@@ -180,5 +180,9 @@ profiles.
 The shared auth-switch transaction pauses every managed session first. It then
 sends each paused terminal exactly three CRLF pairs followed by
 `Quota detected; switching profiles...`, performs the credential switch, and
-finally resumes the sessions. CLI adapters implement only the terminal notice
-transport for their native or JS supervisor.
+finally resumes the sessions. After a successful Codex switch, cdxx submits the
+core-declared `continue` prompt only to the session whose turn hit quota. A
+managed session receives it as the optional prompt on `codex resume`; a session
+found by the global transcript observer is resumed by a detached `codex exec`
+process. CLI adapters implement the terminal notice and continuation transports
+for their native or JS supervisor.

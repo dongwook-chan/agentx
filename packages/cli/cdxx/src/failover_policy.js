@@ -1,10 +1,11 @@
-import { appendAgentEvent, decideLiveQuotaFailover, decideObservedProfileFailover, quotaSwitchingNotice, selectVerifiedAutoSwitchCandidate, stopRetryingAutoSwitch } from "@dong-/agentx-core";
+import { agentCliManifests, appendAgentEvent, decideLiveQuotaFailover, decideObservedProfileFailover, quotaSwitchingNotice, selectVerifiedAutoSwitchCandidate, stopRetryingAutoSwitch } from "@dong-/agentx-core";
 import { effectiveAutoSwitchMode, eventLogPath, loadState } from "./config.js";
 import { recordQuotaForProfile } from "./quota.js";
 import { useProfile } from "./auth.js";
 import { withPausedAuthSwitch } from "./managed_sessions.js";
 import { startBackgroundProfileStatusRefresh, verifyProfileStatuses } from "./background_status.js";
 import { withAuthSwitchLock } from "./lock.js";
+import { startCodexSessionContinuation } from "./session_continuation.js";
 
 async function logFailoverEvent(event) {
   await appendAgentEvent(eventLogPath, { product: "cdxx", ...event }).catch(() => undefined);
@@ -205,10 +206,29 @@ export async function decideCodexFailover(payload, options = {}) {
       reason: summary.reason,
       resetAt: summary.resetAt,
     });
+    const continuationPrompt = agentCliManifests.codex.quotaFailover.postSwitchContinuationPrompt;
+    let continuationError;
     const switched = await withPausedAuthSwitch(
       async () => await useProfile(next.name, { force: true }),
-      { switchingNotice: quotaSwitchingNotice("cdxx") },
+      {
+        switchingNotice: quotaSwitchingNotice("cdxx"),
+        continuation: payload.sessionId && continuationPrompt
+          ? { sessionId: payload.sessionId, prompt: continuationPrompt }
+          : undefined,
+        continueUnmanagedSession: payload.transcriptPath
+          ? (options.continueUnmanagedSession ?? startCodexSessionContinuation)
+          : undefined,
+        onContinuationError: (error) => { continuationError = error; },
+      },
     );
+    if (continuationError) {
+      await logFailoverEvent({
+        event: "continuation.failed",
+        trigger: "autoswitch",
+        sessionId: payload.sessionId,
+        error: continuationError?.message ?? String(continuationError),
+      });
+    }
     if (shouldRefreshStatusAfterSwitch) {
       const scheduleStatusRefresh = options.scheduleStatusRefresh ?? startBackgroundProfileStatusRefresh;
       try {

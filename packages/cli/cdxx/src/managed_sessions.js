@@ -147,6 +147,23 @@ export async function currentManagedSessionRecord(records = undefined) {
   return managed.find((record) => record.childPid && ancestors.has(record.childPid));
 }
 
+function isLegacySessionRecord(record) {
+  return record
+    && typeof record === "object"
+    && typeof record.id === "string"
+    && record.id.length > 0
+    && Number.isInteger(record.pid)
+    && record.pid > 0
+    && typeof record.socketPath === "string"
+    && record.socketPath.length > 0;
+}
+
+function isContinuationSession(record, continuation) {
+  return Boolean(continuation?.sessionId)
+    && (record.codexThreadId === continuation.sessionId
+      || record.codexSessionId === continuation.sessionId);
+}
+
 export async function sessionRecords() {
   try {
     const records = (await supervisorRequest({ command: "sessions" })).records
@@ -165,6 +182,9 @@ export async function sessionRecords() {
     const path = join(runtimeDir, entry);
     try {
       const record = parseJsonPrefix(await readFile(path, "utf8"));
+      // The runtime directory also contains app-server.json, whose socket uses
+      // Codex JSON-RPC rather than the legacy session-control protocol.
+      if (!isLegacySessionRecord(record)) continue;
       process.kill(record.pid, 0);
       await writeRuntimeRecord(path, record);
       records.push(record);
@@ -196,11 +216,12 @@ export function sessionControlAdapter(options = {}) {
       if (!reply.ok) throw new Error(reply.error ?? `Failed to notify ${record.id}`);
     },
     resume: async (record) => {
+      const prompt = options.resumePromptFor?.(record);
       if (record.launcherId) {
-        await supervisorRequest({ command: "resume", launcherId: record.launcherId, reason: options.reason });
+        await supervisorRequest({ command: "resume", launcherId: record.launcherId, reason: options.reason, prompt });
         return;
       }
-      const reply = await send(record.socketPath, "resume", { reason: options.reason }, options);
+      const reply = await send(record.socketPath, "resume", { reason: options.reason, prompt }, options);
       if (!reply.ok) throw new Error(reply.error ?? `Failed to resume ${record.id}`);
     },
     onResumeError: (record, error) => {
@@ -241,16 +262,33 @@ export async function withPausedAuthSwitch(operation, options = {}) {
       + "Run 'codex x use' or 'codex x next' from a separate shell so the current session is not paused by itself.",
     );
   }
-  return await runAuthSwitchTransaction(
+  const continuation = options.continuation;
+  const hasContinuationRecord = records.some((record) => isContinuationSession(record, continuation));
+  let switchCompleted = false;
+  const result = await runAuthSwitchTransaction(
     {
       sessionControl: sessionControlAdapter({
         reason: "profile-switch",
         timeoutMs: options.sessionSocketTimeoutMs,
         sessionRecords: async () => records,
+        resumePromptFor: (record) =>
+          switchCompleted && isContinuationSession(record, continuation) ? continuation.prompt : undefined,
       }),
       withLock: withAuthSwitchLock,
     },
-    operation,
+    async () => {
+      const value = await operation();
+      switchCompleted = true;
+      return value;
+    },
     options,
   );
+  if (switchCompleted && continuation && !hasContinuationRecord && options.continueUnmanagedSession) {
+    try {
+      await options.continueUnmanagedSession(continuation);
+    } catch (error) {
+      options.onContinuationError?.(error);
+    }
+  }
+  return result;
 }

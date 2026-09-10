@@ -72,7 +72,77 @@ test("pauseAll and resumeAll use the managed session socket protocol", async () 
     assert.deepEqual(commands, ["pause", "resume"]);
   } finally {
     server.close();
+    await sessions.cleanupRuntimeFile(recordPath);
     await sessions.cleanupRuntimeFile(socketPath);
+  }
+});
+
+test("app-server metadata is not treated as a legacy managed session", async () => {
+  const statePath = sessions.runtimeRecordPath("app-server");
+  await sessions.writeRuntimeRecord(statePath, {
+    pid: process.pid,
+    executable: "/path/to/codex",
+    profileName: "available-profile",
+    socketPath: join(process.env.CDXX_CONFIG_DIR, "run", "app-server.sock"),
+    startedAt: new Date().toISOString(),
+  });
+  try {
+    assert.deepEqual(await sessions.sessionRecords(), []);
+  } finally {
+    await sessions.cleanupRuntimeFile(statePath);
+  }
+});
+
+test("a successful switch continues only the session that reported quota", async () => {
+  const records = [
+    {
+      id: "session-one",
+      pid: process.pid,
+      childPid: 12351,
+      cwd: root,
+      args: [],
+      codexSessionId: "codex-one",
+      socketPath: join(process.env.CDXX_CONFIG_DIR, "run", "session-one.sock"),
+      paused: false,
+      restartable: true,
+      startedAt: new Date().toISOString(),
+    },
+    {
+      id: "session-two",
+      pid: process.pid,
+      childPid: 12352,
+      cwd: root,
+      args: [],
+      codexSessionId: "codex-two",
+      socketPath: join(process.env.CDXX_CONFIG_DIR, "run", "session-two.sock"),
+      paused: false,
+      restartable: true,
+      startedAt: new Date().toISOString(),
+    },
+  ];
+  const requests = new Map(records.map((record) => [record.id, []]));
+  const servers = [];
+  for (const record of records) {
+    await sessions.writeRuntimeRecord(sessions.runtimeRecordPath(record.id), record);
+    servers.push(await listen(record.socketPath, (request) => {
+      requests.get(record.id).push(request);
+      if (request.command === "pause") return { ok: true, record: { ...record, paused: true } };
+      return { ok: true };
+    }));
+  }
+  try {
+    assert.equal(await sessions.withPausedAuthSwitch(
+      async () => "switched",
+      { continuation: { sessionId: "codex-two", prompt: "continue" } },
+    ), "switched");
+    assert.equal(requests.get("session-one").find((request) => request.command === "resume")?.prompt, undefined);
+    assert.equal(requests.get("session-two").find((request) => request.command === "resume")?.prompt, "continue");
+  } finally {
+    for (const server of servers) server.close();
+    for (const record of records) {
+      await sessions.cleanupRuntimeFile(sessions.runtimeRecordPath(record.id));
+      await sessions.cleanupRuntimeFile(record.socketPath);
+    }
   }
 });
 

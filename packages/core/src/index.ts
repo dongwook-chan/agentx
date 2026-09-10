@@ -327,6 +327,7 @@ export const unmanagedTranscriptObservationPolicy = {
 export interface QuotaFailoverSemantics {
   definitiveLiveExhaustionSwitchesImmediately: boolean;
   usageRefreshMayBlockFailover: boolean;
+  postSwitchContinuationPrompt?: string;
   automaticCandidateQuotaSource: "persisted-quota" | "isolated-live-status";
   verifyAllAutomaticCandidatesBeforeSelection: boolean;
   quotaWindows?: readonly { scope: string; durationMinutes: number }[];
@@ -501,6 +502,7 @@ export const agentCliManifests = {
     quotaFailover: {
       definitiveLiveExhaustionSwitchesImmediately: true,
       usageRefreshMayBlockFailover: false,
+      postSwitchContinuationPrompt: "continue",
       automaticCandidateQuotaSource: "isolated-live-status",
       verifyAllAutomaticCandidatesBeforeSelection: true,
       successfulStatusVerificationClearsCredentialFailure: true,

@@ -127,11 +127,11 @@ test("quota failover switches under the shared paused-session transaction", asyn
     assert.equal(action.kind, "sessions_restarted");
     assert.equal(action.profile, "b");
     assert.deepEqual(
-      requests.map((request) => [request.command, request.reason, request.message]),
+      requests.map((request) => [request.command, request.reason, request.message, request.prompt]),
       [
-        ["pause", "profile-switch", undefined],
-        ["notice", undefined, "\r\n\r\n\r\n[cdxx] Quota detected; switching profiles..."],
-        ["resume", "profile-switch", undefined],
+        ["pause", "profile-switch", undefined, undefined],
+        ["notice", undefined, "\r\n\r\n\r\n[cdxx] Quota detected; switching profiles...", undefined],
+        ["resume", "profile-switch", undefined, "continue"],
       ],
     );
     assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("b"));
@@ -161,6 +161,7 @@ test("quota failover switches under the shared paused-session transaction", asyn
 test("quota failover does not await background status refresh when reset metadata is missing", async () => {
   await resetState();
   let scheduledProfile;
+  let continuation;
   const never = new Promise(() => undefined);
 
   const liveSummary = quotaSummaryFromSupervisorPayload({
@@ -176,8 +177,10 @@ test("quota failover does not await background status refresh when reset metadat
       reachedType: "usage_limit_exceeded",
       reason: "You've hit your usage limit.",
       timestamp: "2026-08-07T00:00:00.000Z",
+      transcriptPath: join(process.env.CODEX_HOME, "sessions", "session-a.jsonl"),
     }, {
       verifyCandidates: verifyAvailable,
+      continueUnmanagedSession: async (request) => { continuation = request; },
       scheduleStatusRefresh: (name) => {
         scheduledProfile = name;
         return never;
@@ -189,6 +192,7 @@ test("quota failover does not await background status refresh when reset metadat
   assert.equal(action.kind, "sessions_restarted");
   assert.equal(action.profile, "b");
   assert.equal(scheduledProfile, "a");
+  assert.deepEqual(continuation, { sessionId: "session-a", prompt: "continue" });
   assert.equal(await readFile(auth.activeAuthPath, "utf8"), codexAuth("b"));
   const state = await config.loadState();
   assert.equal(state.activeProfile, "b");

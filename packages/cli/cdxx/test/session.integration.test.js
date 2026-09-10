@@ -191,6 +191,11 @@ done
     });
     const record = await readSingleSessionRecord(env.AGENTX_SUPERVISOR_SOCKET);
     const socketPath = record.socketPath;
+    await sendSupervisor({
+      command: "hook",
+      launcherId: record.launcherId,
+      sessionId: "00000000-0000-0000-0000-000000000789",
+    }, { socketPath });
     const paused = await sendSupervisor({ command: "pause", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath });
     assert.equal(paused.ok, true);
     await waitFor(async () => {
@@ -200,13 +205,30 @@ done
     const notice = "\r\n\r\n\r\n[cdxx] Quota detected; switching profiles...";
     await sendSupervisor({ command: "notice", launcherId: record.launcherId, message: notice }, { socketPath });
     await waitFor(async () => supervisorStderr.includes(notice));
-    const resumed = await sendSupervisor({ command: "resume", launcherId: record.launcherId, reason: "profile-switch" }, { socketPath });
+    const resumed = await sendSupervisor({
+      command: "resume",
+      launcherId: record.launcherId,
+      reason: "profile-switch",
+      prompt: "continue",
+    }, { socketPath });
     assert.equal(resumed.ok, true);
 
     await waitFor(async () =>
       /Quota detected; switching profiles/.test(supervisorStderr)
       && /Resuming Codex session after profile switch/.test(supervisorStderr)
     );
+    await waitFor(async () => {
+      const lines = (await readFile(launches, "utf8")).trim().split("\n");
+      return lines.length >= 2
+        && lines[1].includes("resume 00000000-0000-0000-0000-000000000789 continue");
+    });
+    await waitFor(async () => {
+      const resumedStatus = await sendSupervisor({
+        command: "status",
+        launcherId: record.launcherId,
+      }, { socketPath });
+      return resumedStatus.record.resumePrompt === undefined;
+    });
   } finally {
     if (supervisor.exitCode === null && supervisor.signalCode === null) {
       supervisor.kill("SIGTERM");
