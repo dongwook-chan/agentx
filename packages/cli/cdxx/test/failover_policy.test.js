@@ -145,14 +145,16 @@ test("quota failover switches under the shared paused-session transaction", asyn
     const productEvents = events.filter((event) => event.emitter !== "agentx-supervisor");
     assert.deepEqual(
       productEvents.map((event) => event.event),
-      ["quota.detected", "candidate.verified", "profile.selected", "switch.completed"],
+      ["quota.detected", "candidate.verified", "profile.selected", "continuation.completed", "switch.completed"],
     );
     assert.equal(productEvents[0].product, "cdxx");
     assert.equal(productEvents[0].profile, "a");
     assert.equal(productEvents[1].candidateProfile, "b");
     assert.equal(productEvents[2].fromProfile, "a");
     assert.equal(productEvents[2].toProfile, "b");
-    assert.equal(productEvents[3].actionKind, "sessions_restarted");
+    assert.equal(productEvents[3].sessionId, "session-a");
+    assert.equal(productEvents[3].transport, "legacy");
+    assert.equal(productEvents[4].actionKind, "sessions_restarted");
   } finally {
     server.close();
   }
@@ -201,15 +203,20 @@ test("quota failover does not await background status refresh when reset metadat
   assert.equal(exhausted?.quotaScopes?.unknown?.status, "exhausted");
 });
 
-test("a stale concurrent quota event does not switch past the replacement profile", async () => {
+test("concurrent quota events continue every failed session without switching twice", async () => {
   await resetState();
+  const continuations = [];
   const first = await decideCodexFailover({
     profileName: "a",
     sessionId: "session-a",
     reachedType: "usage_limit_exceeded",
     reason: "usage limit reached",
     timestamp: "2026-08-13T00:00:00.000Z",
-  }, { verifyCandidates: verifyAvailable });
+    transcriptPath: join(process.env.CODEX_HOME, "sessions", "session-a.jsonl"),
+  }, {
+    verifyCandidates: verifyAvailable,
+    continueUnmanagedSession: async (request) => { continuations.push(request); },
+  });
   assert.equal(first.kind, "sessions_restarted");
   assert.equal(first.profile, "b");
 
@@ -219,11 +226,68 @@ test("a stale concurrent quota event does not switch past the replacement profil
     reachedType: "usage_limit_exceeded",
     reason: "usage limit reached",
     timestamp: "2026-08-13T00:00:00.100Z",
+    transcriptPath: join(process.env.CODEX_HOME, "sessions", "session-b.jsonl"),
+  }, {
+    continueUnmanagedSession: async (request) => { continuations.push(request); },
   });
-  assert.equal(stale.kind, "none");
+  assert.equal(stale.kind, "sessions_restarted");
   assert.equal(stale.reason, "profile_already_switched");
   assert.equal(stale.profile, "b");
+  assert.deepEqual(continuations, [
+    { sessionId: "session-a", prompt: "continue" },
+    { sessionId: "session-b", prompt: "continue" },
+  ]);
   assert.equal((await config.loadState()).activeProfile, "b");
+});
+
+test("a later successful switch continues every session retained while all profiles were exhausted", async () => {
+  await resetState();
+  const continuations = [];
+  const exhausted = async (candidateNames) => candidateNames.map((profileName) => ({
+    profileName,
+    status: "exhausted",
+  }));
+
+  for (const sessionId of ["session-a", "session-b"]) {
+    const stopped = await decideCodexFailover({
+      profileName: "a",
+      sessionId,
+      reachedType: "usage_limit_exceeded",
+      reason: "usage limit reached",
+      timestamp: `2026-09-18T09:0${sessionId === "session-a" ? "5" : "6"}:00.000Z`,
+      transcriptPath: join(process.env.CODEX_HOME, "sessions", `${sessionId}.jsonl`),
+    }, {
+      verifyCandidates: exhausted,
+      continueUnmanagedSession: async (request) => { continuations.push(request); },
+    });
+    assert.equal(stopped.reason, "no_selectable_profile");
+  }
+
+  assert.deepEqual(
+    (await config.loadState()).pendingQuotaContinuations.map(({ sessionId }) => sessionId),
+    ["session-a", "session-b"],
+  );
+  assert.deepEqual(continuations, []);
+
+  const recovered = await decideCodexFailover({
+    profileName: "a",
+    sessionId: "session-a",
+    reachedType: "usage_limit_exceeded",
+    reason: "usage limit reached",
+    timestamp: "2026-09-18T09:08:00.000Z",
+    transcriptPath: join(process.env.CODEX_HOME, "sessions", "session-a.jsonl"),
+  }, {
+    verifyCandidates: verifyAvailable,
+    continueUnmanagedSession: async (request) => { continuations.push(request); },
+  });
+
+  assert.equal(recovered.kind, "sessions_restarted");
+  assert.equal(recovered.profile, "b");
+  assert.deepEqual(continuations, [
+    { sessionId: "session-a", prompt: "continue" },
+    { sessionId: "session-b", prompt: "continue" },
+  ]);
+  assert.deepEqual((await config.loadState()).pendingQuotaContinuations, []);
 });
 
 test("quota failover ignores a persisted exhausted candidate after live verification", async () => {

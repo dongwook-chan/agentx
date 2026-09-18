@@ -1,8 +1,8 @@
-import { agentCliManifests, appendAgentEvent, decideLiveQuotaFailover, decideObservedProfileFailover, quotaSwitchingNotice, selectVerifiedAutoSwitchCandidate, stopRetryingAutoSwitch } from "@dong-/agentx-core";
-import { effectiveAutoSwitchMode, eventLogPath, loadState } from "./config.js";
+import { agentCliManifests, appendAgentEvent, decideLiveQuotaFailover, decideObservedProfileFailover, enqueuePendingQuotaContinuation, quotaSwitchingNotice, removeCompletedQuotaContinuations, selectVerifiedAutoSwitchCandidate, stopRetryingAutoSwitch } from "@dong-/agentx-core";
+import { effectiveAutoSwitchMode, eventLogPath, loadState, saveState } from "./config.js";
 import { recordQuotaForProfile } from "./quota.js";
 import { useProfile } from "./auth.js";
-import { withPausedAuthSwitch } from "./managed_sessions.js";
+import { continueCodexQuotaSession, withPausedAuthSwitch } from "./managed_sessions.js";
 import { startBackgroundProfileStatusRefresh, verifyProfileStatuses } from "./background_status.js";
 import { withAuthSwitchLock } from "./lock.js";
 import { startCodexSessionContinuation } from "./session_continuation.js";
@@ -63,6 +63,73 @@ function quotaSummaryForFailover(payload) {
   return payload.summary ?? quotaSummaryFromSupervisorPayload(payload);
 }
 
+async function queueFailedSession(state, payload, prompt) {
+  if (!payload.sessionId || !prompt) return state;
+  const pending = state.pendingQuotaContinuations ?? [];
+  const next = enqueuePendingQuotaContinuation(pending, {
+    sessionId: payload.sessionId,
+    transcriptPath: payload.transcriptPath,
+    profileName: payload.profileName,
+    queuedAt: payload.timestamp ?? new Date().toISOString(),
+  });
+  const updated = { ...state, pendingQuotaContinuations: next };
+  await saveState(updated);
+  return updated;
+}
+
+async function removeCompletedSessions(sessionIds) {
+  if (!sessionIds.length) return;
+  const state = await loadState();
+  const pending = state.pendingQuotaContinuations ?? [];
+  const remaining = removeCompletedQuotaContinuations(pending, sessionIds);
+  if (remaining.length === pending.length) return;
+  state.pendingQuotaContinuations = remaining;
+  await saveState(state);
+}
+
+async function logContinuationOutcome(outcome, reason, profile) {
+  await logFailoverEvent({
+    event: outcome.status === "completed"
+      ? "continuation.completed"
+      : (outcome.status === "failed" ? "continuation.failed" : "continuation.skipped"),
+    trigger: "autoswitch",
+    reason,
+    sessionId: outcome.continuation.sessionId,
+    profile,
+    transport: outcome.transport,
+    error: outcome.error?.message ?? (outcome.error ? String(outcome.error) : undefined),
+  });
+}
+
+async function continuePendingSessions(state, reason, options = {}) {
+  const prompt = agentCliManifests.codex.quotaFailover.postSwitchContinuationPrompt;
+  const outcomes = [];
+  for (const pending of state.pendingQuotaContinuations ?? []) {
+    const continuation = { ...pending, prompt };
+    try {
+      const result = await continueCodexQuotaSession(continuation, {
+        sessionSocketTimeoutMs: options.sessionSocketTimeoutMs,
+        continueUnmanagedSession: options.continueUnmanagedSession ?? startCodexSessionContinuation,
+      });
+      outcomes.push({
+        status: result.continued ? "completed" : "skipped",
+        continuation,
+        transport: result.transport,
+      });
+    } catch (error) {
+      outcomes.push({ status: "failed", continuation, error });
+    }
+  }
+  const completed = outcomes
+    .filter((outcome) => outcome.status === "completed")
+    .map((outcome) => outcome.continuation.sessionId);
+  await removeCompletedSessions(completed);
+  for (const outcome of outcomes) {
+    await logContinuationOutcome(outcome, reason, state.activeProfile);
+  }
+  return outcomes;
+}
+
 export async function decideCodexFailover(payload, options = {}) {
   const summary = quotaSummaryForFailover(payload);
   const policy = decideLiveQuotaFailover(Boolean(summary.exhausted));
@@ -110,7 +177,8 @@ export async function decideCodexFailover(payload, options = {}) {
 
     const shouldRefreshStatusAfterSwitch = !summary.resetAt && !policy.usageRefreshMayBlock;
 
-    const state = await loadState();
+    const continuationPrompt = agentCliManifests.codex.quotaFailover.postSwitchContinuationPrompt;
+    const state = await queueFailedSession(await loadState(), payload, continuationPrompt);
     const ownership = decideObservedProfileFailover(profile.name, state.activeProfile);
     if (!ownership.switchProfile) {
       await logFailoverEvent({
@@ -121,13 +189,19 @@ export async function decideCodexFailover(payload, options = {}) {
         activeProfile: state.activeProfile,
         sessionId: payload.sessionId,
       });
+      const outcomes = ownership.continueFailedSession
+        ? await continuePendingSessions(state, ownership.reason, options)
+        : [];
+      const continued = outcomes.some((outcome) => outcome.status === "completed");
       return {
         ok: true,
-        kind: "none",
+        kind: continued ? "sessions_restarted" : "none",
         reason: ownership.reason,
         profile: state.activeProfile,
         sessionId: payload.sessionId,
-        message: `[cdxx] Quota was reported for '${profile.name}', but '${state.activeProfile ?? "(none)"}' is already active; no additional profile switch was made.`,
+        message: continued
+          ? `[cdxx] '${state.activeProfile}' is already active; restarting quota-failed session '${payload.sessionId}'.`
+          : `[cdxx] Quota was reported for '${profile.name}', but '${state.activeProfile ?? "(none)"}' is already active; no additional profile switch was made.`,
       };
     }
 
@@ -206,28 +280,33 @@ export async function decideCodexFailover(payload, options = {}) {
       reason: summary.reason,
       resetAt: summary.resetAt,
     });
-    const continuationPrompt = agentCliManifests.codex.quotaFailover.postSwitchContinuationPrompt;
-    let continuationError;
+    const pendingContinuations = (verifiedState.pendingQuotaContinuations ?? [])
+      .map((continuation) => ({ ...continuation, prompt: continuationPrompt }));
+    const continuationOutcomes = [];
     const switched = await withPausedAuthSwitch(
       async () => await useProfile(next.name, { force: true }),
       {
         switchingNotice: quotaSwitchingNotice("cdxx"),
-        continuation: payload.sessionId && continuationPrompt
-          ? { sessionId: payload.sessionId, prompt: continuationPrompt }
-          : undefined,
-        continueUnmanagedSession: payload.transcriptPath
-          ? (options.continueUnmanagedSession ?? startCodexSessionContinuation)
-          : undefined,
-        onContinuationError: (error) => { continuationError = error; },
+        continuations: pendingContinuations,
+        continueUnmanagedSession: options.continueUnmanagedSession ?? startCodexSessionContinuation,
+        onContinuationComplete: (continuation, result) => {
+          continuationOutcomes.push({ status: "completed", continuation, transport: result.transport });
+        },
+        onContinuationSkipped: (continuation, result) => {
+          continuationOutcomes.push({ status: "skipped", continuation, transport: result.transport });
+        },
+        onContinuationError: (error, continuation) => {
+          continuationOutcomes.push({ status: "failed", continuation, error });
+        },
       },
     );
-    if (continuationError) {
-      await logFailoverEvent({
-        event: "continuation.failed",
-        trigger: "autoswitch",
-        sessionId: payload.sessionId,
-        error: continuationError?.message ?? String(continuationError),
-      });
+    await removeCompletedSessions(
+      continuationOutcomes
+        .filter((outcome) => outcome.status === "completed")
+        .map((outcome) => outcome.continuation.sessionId),
+    );
+    for (const outcome of continuationOutcomes) {
+      await logContinuationOutcome(outcome, "profile_switched", switched.name ?? next.name);
     }
     if (shouldRefreshStatusAfterSwitch) {
       const scheduleStatusRefresh = options.scheduleStatusRefresh ?? startBackgroundProfileStatusRefresh;

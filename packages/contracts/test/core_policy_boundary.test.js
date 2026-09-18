@@ -150,6 +150,13 @@ test("both CLI adapters consume shared autoswitch action results", async () => {
   assert.match(cdxx, /stopRetryingAutoSwitch/);
 });
 
+test("Codex continues quota-failed sessions after a concurrent profile switch", async () => {
+  const cdxx = await readFile(join(cdxxSourceDir, "failover_policy.js"), "utf8");
+  assert.match(cdxx, /ownership\.continueFailedSession/);
+  assert.match(cdxx, /enqueuePendingQuotaContinuation/);
+  assert.match(cdxx, /removeCompletedQuotaContinuations/);
+});
+
 test("both CLI adapters use the shared profile table and picker renderer", async () => {
   const agyx = await readFile(join(repoRoot, "packages/cli/agyx/src/ui.ts"), "utf8");
   const cdxx = await readFile(join(cdxxSourceDir, "ui.js"), "utf8");

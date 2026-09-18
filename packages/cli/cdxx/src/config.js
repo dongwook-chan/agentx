@@ -54,6 +54,7 @@ export function emptyState() {
     codexIntegration: undefined,
     profiles: [],
     sessions: {},
+    pendingQuotaContinuations: [],
   };
 }
 
@@ -83,6 +84,9 @@ export async function loadState() {
       settings: { ...emptyState().settings, ...(state.settings ?? {}) },
       profiles: state.profiles ?? [],
       sessions: state.sessions ?? {},
+      pendingQuotaContinuations: Array.isArray(state.pendingQuotaContinuations)
+        ? state.pendingQuotaContinuations
+        : [],
     };
   } catch (error) {
     if (error?.code === "ENOENT") return emptyState();

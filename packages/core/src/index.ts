@@ -393,6 +393,7 @@ export function decideLiveQuotaFailover(
 
 export interface ObservedProfileFailoverDecision {
   switchProfile: boolean;
+  continueFailedSession: boolean;
   reason: "profile_matches" | "missing_observed_profile" | "missing_active_profile" | "profile_already_switched";
 }
 
@@ -405,12 +406,52 @@ export function decideObservedProfileFailover(
   observedProfile: string | undefined,
   activeProfile: string | undefined,
 ): ObservedProfileFailoverDecision {
-  if (!observedProfile) return { switchProfile: false, reason: "missing_observed_profile" };
-  if (!activeProfile) return { switchProfile: false, reason: "missing_active_profile" };
-  if (observedProfile !== activeProfile) {
-    return { switchProfile: false, reason: "profile_already_switched" };
+  if (!observedProfile) {
+    return { switchProfile: false, continueFailedSession: false, reason: "missing_observed_profile" };
   }
-  return { switchProfile: true, reason: "profile_matches" };
+  if (!activeProfile) {
+    return { switchProfile: false, continueFailedSession: false, reason: "missing_active_profile" };
+  }
+  if (observedProfile !== activeProfile) {
+    return { switchProfile: false, continueFailedSession: true, reason: "profile_already_switched" };
+  }
+  return { switchProfile: true, continueFailedSession: true, reason: "profile_matches" };
+}
+
+export interface PendingQuotaContinuation {
+  sessionId: string;
+  transcriptPath?: string;
+  profileName?: string;
+  queuedAt: string;
+}
+
+/**
+ * Retain one continuation per quota-failed session. A later failure from the
+ * same session refreshes its transport/profile metadata without moving its
+ * original queue position or losing the time at which it first became stuck.
+ */
+export function enqueuePendingQuotaContinuation(
+  pending: readonly PendingQuotaContinuation[],
+  continuation: PendingQuotaContinuation,
+): PendingQuotaContinuation[] {
+  const index = pending.findIndex((entry) => entry.sessionId === continuation.sessionId);
+  if (index < 0) return [...pending, continuation];
+  return pending.map((entry, entryIndex) => entryIndex === index
+    ? {
+        ...entry,
+        ...continuation,
+        queuedAt: entry.queuedAt,
+      }
+    : entry);
+}
+
+/** Remove only sessions whose continuation transport completed successfully. */
+export function removeCompletedQuotaContinuations(
+  pending: readonly PendingQuotaContinuation[],
+  completedSessionIds: readonly string[],
+): PendingQuotaContinuation[] {
+  const completed = new Set(completedSessionIds);
+  return pending.filter((entry) => !completed.has(entry.sessionId));
 }
 
 /**

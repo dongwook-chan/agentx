@@ -146,6 +146,61 @@ test("a successful switch continues only the session that reported quota", async
   }
 });
 
+test("a quota session is restarted after another session already switched profiles", async () => {
+  const socketPath = join(process.env.CDXX_CONFIG_DIR, "run", "concurrent-quota.sock");
+  const record = {
+    id: "concurrent-quota",
+    pid: process.pid,
+    childPid: 12353,
+    cwd: root,
+    args: [],
+    codexSessionId: "codex-concurrent",
+    socketPath,
+    paused: false,
+    restartable: true,
+    startedAt: new Date().toISOString(),
+  };
+  const requests = [];
+  await sessions.writeRuntimeRecord(sessions.runtimeRecordPath(record.id), record);
+  const server = await listen(socketPath, (request) => {
+    requests.push(request);
+    if (request.command === "pause") return { ok: true, record: { ...record, paused: true } };
+    return { ok: true };
+  });
+  try {
+    assert.deepEqual(
+      await sessions.continueCodexQuotaSession({ sessionId: "codex-concurrent", prompt: "continue" }),
+      { continued: true, transport: "legacy" },
+    );
+    assert.deepEqual(
+      requests.map((request) => [request.command, request.reason, request.prompt]),
+      [
+        ["pause", "profile-switch", undefined],
+        ["resume", "profile-switch", "continue"],
+      ],
+    );
+  } finally {
+    server.close();
+    await sessions.cleanupRuntimeFile(sessions.runtimeRecordPath(record.id));
+    await sessions.cleanupRuntimeFile(socketPath);
+  }
+});
+
+test("an unmanaged quota session uses the detached continuation transport", async () => {
+  let request;
+  assert.deepEqual(
+    await sessions.continueCodexQuotaSession(
+      { sessionId: "codex-unmanaged", prompt: "continue" },
+      {
+        sessionRecords: async () => [],
+        continueUnmanagedSession: async (value) => { request = value; },
+      },
+    ),
+    { continued: true, transport: "unmanaged" },
+  );
+  assert.deepEqual(request, { sessionId: "codex-unmanaged", prompt: "continue" });
+});
+
 test("profile-switch session adapter sends restart reason", async () => {
   const socketPath = join(process.env.CDXX_CONFIG_DIR, "run", "reason.sock");
   const recordPath = sessions.runtimeRecordPath("reason");

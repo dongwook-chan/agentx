@@ -226,6 +226,7 @@ export function sessionControlAdapter(options = {}) {
     },
     onResumeError: (record, error) => {
       console.error(`cdxx: failed to resume session ${record.id}: ${error?.message ?? error}`);
+      options.onResumeError?.(record, error);
     },
   };
 }
@@ -253,6 +254,33 @@ export async function resumeManaged() {
   }
 }
 
+export async function continueCodexQuotaSession(continuation, options = {}) {
+  const records = await (options.sessionRecords ?? sessionRecords)();
+  const record = records.find((candidate) => isContinuationSession(candidate, continuation));
+  if (!record) {
+    if (!options.continueUnmanagedSession) {
+      return { continued: false, transport: "unavailable" };
+    }
+    await options.continueUnmanagedSession({
+      sessionId: continuation.sessionId,
+      prompt: continuation.prompt,
+    });
+    return { continued: true, transport: "unmanaged" };
+  }
+
+  const control = sessionControlAdapter({
+    reason: "profile-switch",
+    timeoutMs: options.sessionSocketTimeoutMs,
+    resumePromptFor: () => continuation.prompt,
+  });
+  const paused = await control.pause(record);
+  await control.resume(paused);
+  return {
+    continued: true,
+    transport: record.launcherId ? "managed" : "legacy",
+  };
+}
+
 export async function withPausedAuthSwitch(operation, options = {}) {
   const records = await sessionRecords();
   const currentRecord = await currentManagedSessionRecord(records);
@@ -262,8 +290,16 @@ export async function withPausedAuthSwitch(operation, options = {}) {
       + "Run 'codex x use' or 'codex x next' from a separate shell so the current session is not paused by itself.",
     );
   }
-  const continuation = options.continuation;
-  const hasContinuationRecord = records.some((record) => isContinuationSession(record, continuation));
+  const continuations = options.continuations
+    ?? (options.continuation ? [options.continuation] : []);
+  const continuationForRecord = (record) =>
+    continuations.find((continuation) => isContinuationSession(record, continuation));
+  const continuationRecords = new Map();
+  for (const record of records) {
+    const continuation = continuationForRecord(record);
+    if (continuation) continuationRecords.set(continuation.sessionId, record);
+  }
+  const failedContinuationSessionIds = new Set();
   let switchCompleted = false;
   const result = await runAuthSwitchTransaction(
     {
@@ -271,8 +307,15 @@ export async function withPausedAuthSwitch(operation, options = {}) {
         reason: "profile-switch",
         timeoutMs: options.sessionSocketTimeoutMs,
         sessionRecords: async () => records,
-        resumePromptFor: (record) =>
-          switchCompleted && isContinuationSession(record, continuation) ? continuation.prompt : undefined,
+        resumePromptFor: (record) => switchCompleted
+          ? continuationForRecord(record)?.prompt
+          : undefined,
+        onResumeError: (record, error) => {
+          const continuation = continuationForRecord(record);
+          if (!switchCompleted || !continuation) return;
+          failedContinuationSessionIds.add(continuation.sessionId);
+          options.onContinuationError?.(error, continuation);
+        },
       }),
       withLock: withAuthSwitchLock,
     },
@@ -283,11 +326,29 @@ export async function withPausedAuthSwitch(operation, options = {}) {
     },
     options,
   );
-  if (switchCompleted && continuation && !hasContinuationRecord && options.continueUnmanagedSession) {
+
+  for (const continuation of continuations) {
+    const record = continuationRecords.get(continuation.sessionId);
+    if (record) {
+      if (!failedContinuationSessionIds.has(continuation.sessionId)) {
+        options.onContinuationComplete?.(continuation, {
+          transport: record.launcherId ? "managed" : "legacy",
+        });
+      }
+      continue;
+    }
+    if (!options.continueUnmanagedSession) {
+      options.onContinuationSkipped?.(continuation, { transport: "unavailable" });
+      continue;
+    }
     try {
-      await options.continueUnmanagedSession(continuation);
+      await options.continueUnmanagedSession({
+        sessionId: continuation.sessionId,
+        prompt: continuation.prompt,
+      });
+      options.onContinuationComplete?.(continuation, { transport: "unmanaged" });
     } catch (error) {
-      options.onContinuationError?.(error);
+      options.onContinuationError?.(error, continuation);
     }
   }
   return result;

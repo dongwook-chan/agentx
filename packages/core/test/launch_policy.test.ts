@@ -12,6 +12,7 @@ import {
   decideObservedProfileFailover,
   decideLiveQuotaFailover,
   ensureExhaustedUsageScope,
+  enqueuePendingQuotaContinuation,
   decideUseProfile,
   IncrementalFileTail,
   markActiveProfile,
@@ -23,6 +24,7 @@ import {
   persistCurrentCredential,
   resetlessQuotaExpired,
   renderAgentProfileTable,
+  removeCompletedQuotaContinuations,
   runAuthSwitchTransaction,
   runRefreshableCredentialOperation,
   runUsageCheck,
@@ -323,23 +325,57 @@ test("live quota failover never waits for usage metadata refresh", () => {
   });
 });
 
-test("observed-profile failover suppresses stale concurrent quota events", () => {
+test("observed-profile failover suppresses duplicate switches but continues failed sessions", () => {
   assert.deepEqual(decideObservedProfileFailover("account-a", "account-a"), {
     switchProfile: true,
+    continueFailedSession: true,
     reason: "profile_matches",
   });
   assert.deepEqual(decideObservedProfileFailover("account-a", "account-b"), {
     switchProfile: false,
+    continueFailedSession: true,
     reason: "profile_already_switched",
   });
   assert.deepEqual(decideObservedProfileFailover(undefined, "account-a"), {
     switchProfile: false,
+    continueFailedSession: false,
     reason: "missing_observed_profile",
   });
   assert.deepEqual(decideObservedProfileFailover("account-a", undefined), {
     switchProfile: false,
+    continueFailedSession: false,
     reason: "missing_active_profile",
   });
+});
+
+test("quota continuations retain every failed session until its continuation succeeds", () => {
+  const first = {
+    sessionId: "session-a",
+    transcriptPath: "/sessions/a.jsonl",
+    profileName: "account-a",
+    queuedAt: "2026-09-18T09:05:00.000Z",
+  };
+  const second = {
+    sessionId: "session-b",
+    transcriptPath: "/sessions/b.jsonl",
+    profileName: "account-a",
+    queuedAt: "2026-09-18T09:06:00.000Z",
+  };
+  const queued = enqueuePendingQuotaContinuation(
+    enqueuePendingQuotaContinuation([], first),
+    second,
+  );
+  assert.deepEqual(queued, [first, second]);
+
+  assert.deepEqual(enqueuePendingQuotaContinuation(queued, {
+    ...first,
+    profileName: "account-b",
+    queuedAt: "2026-09-18T09:07:00.000Z",
+  }), [
+    { ...first, profileName: "account-b" },
+    second,
+  ]);
+  assert.deepEqual(removeCompletedQuotaContinuations(queued, ["session-b"]), [first]);
 });
 
 test("live quota exhaustion without explicit scope is preserved as unknown", () => {
