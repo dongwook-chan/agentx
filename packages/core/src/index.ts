@@ -509,6 +509,7 @@ export const agentCliManifests = {
     quotaFailover: {
       definitiveLiveExhaustionSwitchesImmediately: true,
       usageRefreshMayBlockFailover: false,
+      postSwitchContinuationPrompt: "continue",
       automaticCandidateQuotaSource: "persisted-quota",
       verifyAllAutomaticCandidatesBeforeSelection: false,
       successfulStatusVerificationClearsCredentialFailure: false,

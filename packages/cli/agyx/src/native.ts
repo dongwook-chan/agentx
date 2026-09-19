@@ -65,10 +65,11 @@ export async function runNativeSupervisor(args: string[]): Promise<number> {
     policyCommand,
     restartable: isRestartable(args),
     buildArgs: async ({ record, logPath }: {
-      record: { conversationId?: string };
+      record: { conversationId?: string; resumePrompt?: string };
       logPath?: string;
     }) => buildAgyLaunchArgs(args, {
       conversationId: record.conversationId,
+      resumePrompt: record.resumePrompt,
       logPath: logPath ?? "",
       state: await loadState(),
     }),

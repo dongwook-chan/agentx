@@ -135,7 +135,7 @@ test("all CLI manifests obey the core live-quota failover policy", () => {
   assert.deepEqual(agentCliManifests.agy.quotaFailover.supportedEligibilityModes, ["allow", "block"]);
   assert.equal(agentCliManifests.agy.quotaFailover.defaultEligibilityMode, "allow");
   assert.equal(agentCliManifests.agy.quotaFailover.observesUnmanagedSessionTranscripts, false);
-  assert.equal(agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt, undefined);
+  assert.equal(agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt, "continue");
 
   assert.deepEqual(agentCliManifests.codex.quotaFailover.supportedAutoSwitchModes, [
     "off",

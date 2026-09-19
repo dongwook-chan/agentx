@@ -59,7 +59,12 @@ function runCLI(
 function sendSession(
   socketPath: string,
   payload: Record<string, unknown>,
-): Promise<{ ok: boolean; error?: string; record?: unknown }> {
+): Promise<{
+  ok: boolean;
+  error?: string;
+  record?: unknown;
+  records?: Array<Record<string, unknown>>;
+}> {
   return new Promise((resolvePromise, reject) => {
     const socket = connect(socketPath);
     let input = "";
@@ -67,7 +72,10 @@ function sendSession(
     socket.on("connect", () => socket.end(`${JSON.stringify(payload)}\n`));
     socket.on("data", (chunk) => { input += chunk; });
     socket.on("error", reject);
-    socket.on("close", () => resolvePromise(JSON.parse(input)));
+    socket.on("close", () => {
+      try { resolvePromise(JSON.parse(input)); }
+      catch (error) { reject(error); }
+    });
   });
 }
 
@@ -148,6 +156,126 @@ while :; do sleep 1; done
       await new Promise<void>((resolvePromise) =>
         supervisor.once("exit", () => resolvePromise())
       );
+    }
+    await shutdownTestSupervisor(environment.AGENTX_SUPERVISOR_SOCKET);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a concurrent agy quota event continues every retained managed session without switching twice", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agyx-integration-"));
+  const config = join(root, "config");
+  const fakeAgy = join(root, "agy");
+  const launches = join(root, "launches.txt");
+  const conversationOne = "11111111-1111-1111-1111-111111111111";
+  const conversationTwo = "22222222-2222-2222-2222-222222222222";
+  const now = "2026-09-19T12:00:00.000Z";
+  await mkdir(config, { recursive: true });
+  await writeFile(join(config, "state.json"), `${JSON.stringify({
+    version: 1,
+    activeProfile: "b",
+    profiles: [
+      { name: "a", createdAt: now, updatedAt: now },
+      { name: "b", createdAt: now, updatedAt: now },
+    ],
+    pendingQuotaContinuations: [{
+      sessionId: conversationTwo,
+      profileName: "a",
+      queuedAt: now,
+    }],
+  }, null, 2)}\n`);
+  await writeFile(fakeAgy, `#!/bin/sh
+log=""
+model=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--log-file" ]; then log="$arg"; fi
+  if [ "$previous" = "--model" ]; then model="$arg"; fi
+  case "$arg" in --log-file=*) log="\${arg#--log-file=}" ;; esac
+  previous="$arg"
+done
+printf '%s|%s\n' "$model" "$*" >> "$AGYX_TEST_LAUNCHES"
+if [ "$model" = "one" ]; then conversation="${conversationOne}"; else conversation="${conversationTwo}"; fi
+if [ -n "$log" ]; then printf 'Created conversation %s\n' "$conversation" >> "$log"; fi
+trap 'exit 0' INT TERM
+while :; do sleep 1; done
+`);
+  await chmod(fakeAgy, 0o755);
+
+  const environment = {
+    ...process.env,
+    AGYX_CONFIG_DIR: config,
+    AGYX_REAL_AGY: fakeAgy,
+    AGYX_TEST_LAUNCHES: launches,
+    AGYX_SKIP_UNMANAGED_AGY_STOP: "1",
+    AGENTX_SUPERVISOR_SOCKET: join(root, "agentx", "supervisor.sock"),
+  };
+  const first = spawn(
+    process.execPath,
+    [resolve("dist/src/cli.js"), "session", "--", "--model", "one"],
+    { env: environment, stdio: ["ignore", "ignore", "pipe"] },
+  );
+  let second: ReturnType<typeof spawn> | undefined;
+
+  try {
+    await waitFor(async () => {
+      try {
+        const sessions = await sendSession(environment.AGENTX_SUPERVISOR_SOCKET, { command: "sessions" });
+        return (sessions.records ?? []).some((record) => record.conversationId === conversationOne);
+      } catch {
+        return false;
+      }
+    });
+    second = spawn(
+      process.execPath,
+      [resolve("dist/src/cli.js"), "session", "--", "--model", "two"],
+      { env: environment, stdio: ["ignore", "ignore", "pipe"] },
+    );
+    await waitFor(async () => {
+      try {
+        const sessions = await sendSession(environment.AGENTX_SUPERVISOR_SOCKET, { command: "sessions" });
+        return (sessions.records ?? []).some((record) => record.conversationId === conversationOne)
+          && (sessions.records ?? []).some((record) => record.conversationId === conversationTwo);
+      } catch {
+        return false;
+      }
+    });
+
+    const result = await runCLI([
+      "_auto-next",
+      "claude",
+      JSON.stringify({
+        profileName: "a",
+        sessionId: conversationOne,
+        conversationId: conversationOne,
+        timestamp: "2026-09-19T12:01:00.000Z",
+      }),
+    ], environment);
+    assert.equal(result.code, 0, result.stderr);
+    const action = JSON.parse(result.stdout) as { kind: string; sessionIds?: string[] };
+    assert.equal(action.kind, "sessions_restarted");
+    assert.deepEqual(new Set(action.sessionIds), new Set([conversationOne, conversationTwo]));
+
+    await waitFor(async () => {
+      const lines = (await readFile(launches, "utf8")).trim().split("\n");
+      return lines.filter((line) => line.startsWith("one|")).length >= 2
+        && lines.filter((line) => line.startsWith("two|")).length >= 2;
+    });
+    const lines = (await readFile(launches, "utf8")).trim().split("\n");
+    const resumedOne = lines.filter((line) => line.startsWith("one|")).at(-1)!;
+    const resumedTwo = lines.filter((line) => line.startsWith("two|")).at(-1)!;
+    assert.match(resumedOne, new RegExp(`--conversation ${conversationOne}`));
+    assert.match(resumedTwo, new RegExp(`--conversation ${conversationTwo}`));
+    assert.match(resumedOne, /--prompt-interactive continue/);
+    assert.match(resumedTwo, /--prompt-interactive continue/);
+    const state = JSON.parse(await readFile(join(config, "state.json"), "utf8")) as { pendingQuotaContinuations?: unknown[] };
+    assert.deepEqual(state.pendingQuotaContinuations, []);
+  } finally {
+    for (const child of [first, second]) {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        await new Promise<void>((resolvePromise) => child.once("exit", () => resolvePromise()));
+      }
     }
     await shutdownTestSupervisor(environment.AGENTX_SUPERVISOR_SOCKET);
     await rm(root, { recursive: true, force: true });

@@ -1,13 +1,18 @@
 import { spawn } from "node:child_process";
 import {
+  agentCliManifests,
   appendAgentEvent,
   AuthSwitchTransactionOptions,
   AutoSwitchAction,
   decideExplicitProfileUse,
   decideLiveQuotaFailover,
+  decideObservedProfileFailover,
+  enqueuePendingQuotaContinuation,
   pauseAllSessions,
+  PendingQuotaContinuation,
   persistCurrentCredential,
   quotaSwitchingNotice,
+  removeCompletedQuotaContinuations,
   resumeAllSessions,
   runAuthSwitchTransaction,
   SessionControlAdapter,
@@ -67,7 +72,6 @@ interface SessionReply {
   record?: SessionRecord;
 }
 
-const autoSwitchLockPath = join(runtimeDir, "auto-switch.lock");
 const authSwitchLockPath = join(runtimeDir, "auth-switch.lock");
 let authSwitchLockDepth = 0;
 
@@ -181,31 +185,6 @@ export async function activeQuotaScopes(): Promise<QuotaScope[]> {
   return [...scopes];
 }
 
-async function withAutoSwitchLock<T>(operation: () => Promise<T>): Promise<T | undefined> {
-  await ensureDirectories();
-  const acquire = async (): Promise<boolean> => {
-    try {
-      await mkdir(autoSwitchLockPath, { mode: 0o700 });
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const lockStat = await stat(autoSwitchLockPath).catch(() => undefined);
-      if (lockStat && Date.now() - lockStat.mtimeMs > 30_000) {
-        await rm(autoSwitchLockPath, { recursive: true, force: true });
-        return await acquire();
-      }
-      return false;
-    }
-  };
-
-  if (!await acquire()) return undefined;
-  try {
-    return await operation();
-  } finally {
-    await rm(autoSwitchLockPath, { recursive: true, force: true });
-  }
-}
-
 export async function withAuthSwitchLock<T>(
   operation: () => Promise<T>,
   options: { timeoutMs?: number; staleMs?: number } = {},
@@ -250,9 +229,26 @@ export async function withAuthSwitchLock<T>(
   }
 }
 
-function sessionControlAdapter(options: { reason?: string } = {}): SessionControlAdapter<SessionRecord> {
+interface AgySessionControlOptions {
+  reason?: string;
+  resumePromptFor?: (record: SessionRecord) => string | undefined;
+  onResumeError?: (record: SessionRecord, error: unknown) => void;
+  sessionRecords?: () => Promise<SessionRecord[]>;
+}
+
+function isContinuationSession(
+  record: SessionRecord,
+  continuation: PendingQuotaContinuation,
+): boolean {
+  return Boolean(continuation.sessionId)
+    && (record.conversationId === continuation.sessionId
+      || record.launcherId === continuation.sessionId
+      || record.id === continuation.sessionId);
+}
+
+function sessionControlAdapter(options: AgySessionControlOptions = {}): SessionControlAdapter<SessionRecord> {
   return {
-    sessionRecords,
+    sessionRecords: options.sessionRecords ?? sessionRecords,
     pause: async (record) => {
       if ((record as SessionRecord & { launcherId?: string }).launcherId) {
         const reply = await supervisorRequest({
@@ -294,35 +290,115 @@ function sessionControlAdapter(options: { reason?: string } = {}): SessionContro
       if (unmanaged.length) await stopProcesses(unmanaged);
     },
     resume: async (record) => {
+      const prompt = options.resumePromptFor?.(record);
       if ((record as SessionRecord & { launcherId?: string }).launcherId) {
         await supervisorRequest({
           command: "resume",
           launcherId: (record as SessionRecord & { launcherId?: string }).launcherId,
           reason: options.reason,
+          prompt,
         });
         return;
       }
-      const reply = await send(record.socketPath, "resume", { reason: options.reason });
+      const reply = await send(record.socketPath, "resume", { reason: options.reason, prompt });
       if (!reply.ok) throw new Error(reply.error);
     },
     onResumeError: (record, error) => {
       console.error(`agyx: failed to resume session ${record.id}: ${(error as Error).message}`);
+      options.onResumeError?.(record, error);
     },
   };
 }
 
+interface AgyAuthSwitchOptions extends AuthSwitchTransactionOptions {
+  continuations?: PendingQuotaContinuation[];
+  onContinuationComplete?: (
+    continuation: PendingQuotaContinuation,
+    result: { transport: "managed" | "legacy" },
+  ) => void;
+  onContinuationSkipped?: (
+    continuation: PendingQuotaContinuation,
+    result: { transport: "unavailable" },
+  ) => void;
+  onContinuationError?: (error: unknown, continuation: PendingQuotaContinuation) => void;
+}
+
 async function withPausedAuthSwitch<T>(
   operation: () => Promise<T>,
-  options: AuthSwitchTransactionOptions = {},
+  options: AgyAuthSwitchOptions = {},
 ): Promise<T> {
-  return await runAuthSwitchTransaction(
+  const records = await sessionRecords();
+  const continuations = options.continuations ?? [];
+  const continuationForRecord = (record: SessionRecord) =>
+    continuations.find((continuation) => isContinuationSession(record, continuation));
+  const continuationRecords = new Map<string, SessionRecord>();
+  for (const record of records) {
+    const continuation = continuationForRecord(record);
+    if (continuation) continuationRecords.set(continuation.sessionId, record);
+  }
+  const failedContinuationSessionIds = new Set<string>();
+  let switchCompleted = false;
+  const result = await runAuthSwitchTransaction(
     {
-      sessionControl: sessionControlAdapter({ reason: "profile-switch" }),
+      sessionControl: sessionControlAdapter({
+        reason: "profile-switch",
+        sessionRecords: async () => records,
+        resumePromptFor: (record) => switchCompleted
+          ? continuationForRecord(record)
+            ? agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt
+            : undefined
+          : undefined,
+        onResumeError: (record, error) => {
+          const continuation = continuationForRecord(record);
+          if (!switchCompleted || !continuation) return;
+          failedContinuationSessionIds.add(continuation.sessionId);
+          options.onContinuationError?.(error, continuation);
+        },
+      }),
       withLock: withAuthSwitchLock,
     },
-    operation,
+    async () => {
+      const value = await operation();
+      switchCompleted = true;
+      return value;
+    },
     options,
   );
+
+  for (const continuation of continuations) {
+    const record = continuationRecords.get(continuation.sessionId);
+    if (!record) {
+      options.onContinuationSkipped?.(continuation, { transport: "unavailable" });
+      continue;
+    }
+    if (!failedContinuationSessionIds.has(continuation.sessionId)) {
+      options.onContinuationComplete?.(continuation, {
+        transport: record.launcherId ? "managed" : "legacy",
+      });
+    }
+  }
+  return result;
+}
+
+export async function continueAgyQuotaSession(
+  continuation: PendingQuotaContinuation,
+  options: { sessionRecords?: () => Promise<SessionRecord[]> } = {},
+): Promise<{ continued: boolean; transport: "managed" | "legacy" | "unavailable" }> {
+  const records = await (options.sessionRecords ?? sessionRecords)();
+  const record = records.find((candidate) => isContinuationSession(candidate, continuation));
+  if (!record) return { continued: false, transport: "unavailable" };
+  const control = sessionControlAdapter({
+    reason: "profile-switch",
+    sessionRecords: async () => records,
+    resumePromptFor: () => agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt,
+  });
+  const paused = await control.pause(record);
+  if (!control.resume) throw new Error("Agy session adapter does not implement resume.");
+  await control.resume(paused);
+  return {
+    continued: true,
+    transport: record.launcherId ? "managed" : "legacy",
+  };
 }
 
 export async function withPausedCredentialOperation<T>(
@@ -619,13 +695,135 @@ export async function setAllowIneligibleActivation(allow: boolean): Promise<void
   await saveState(state);
 }
 
+export interface AgyQuotaObservation {
+  sessionId?: string;
+  conversationId?: string;
+  launcherId?: string;
+  profileName?: string;
+  timestamp?: string;
+}
+
+interface AgyQuotaFailoverResult extends ProfileSwitchResult {
+  switched: boolean;
+  continuedSessionIds: string[];
+  reason?: string;
+}
+
+function observedAgySessionId(observation?: AgyQuotaObservation): string | undefined {
+  return observation?.sessionId
+    ?? observation?.conversationId
+    ?? observation?.launcherId;
+}
+
+async function queueFailedAgySession(
+  state: State,
+  observation?: AgyQuotaObservation,
+): Promise<State> {
+  const sessionId = observedAgySessionId(observation);
+  const prompt = agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt;
+  if (!sessionId || !prompt) return state;
+  const updated: State = {
+    ...state,
+    pendingQuotaContinuations: enqueuePendingQuotaContinuation(
+      state.pendingQuotaContinuations ?? [],
+      {
+        sessionId,
+        profileName: observation?.profileName,
+        queuedAt: observation?.timestamp ?? new Date().toISOString(),
+      },
+    ),
+  };
+  await saveState(updated);
+  return updated;
+}
+
+async function removeCompletedAgySessions(sessionIds: string[]): Promise<void> {
+  if (!sessionIds.length) return;
+  const state = await loadState();
+  const pending = state.pendingQuotaContinuations ?? [];
+  const remaining = removeCompletedQuotaContinuations(pending, sessionIds);
+  if (remaining.length === pending.length) return;
+  state.pendingQuotaContinuations = remaining;
+  await saveState(state);
+}
+
+async function logAgyContinuationOutcome(
+  continuation: PendingQuotaContinuation,
+  status: "completed" | "skipped" | "failed",
+  reason: string,
+  transport?: string,
+  error?: unknown,
+): Promise<void> {
+  await logSwitchEvent({
+    event: `continuation.${status}`,
+    trigger: "autoswitch",
+    reason,
+    sessionId: continuation.sessionId,
+    profile: (await loadState()).activeProfile,
+    transport,
+    error: error instanceof Error ? error.message : (error ? String(error) : undefined),
+  });
+}
+
+async function continuePendingAgySessions(
+  state: State,
+  reason: string,
+): Promise<string[]> {
+  const completed: string[] = [];
+  for (const continuation of state.pendingQuotaContinuations ?? []) {
+    try {
+      const result = await continueAgyQuotaSession(continuation);
+      if (result.continued) completed.push(continuation.sessionId);
+      await logAgyContinuationOutcome(
+        continuation,
+        result.continued ? "completed" : "skipped",
+        reason,
+        result.transport,
+      );
+    } catch (error) {
+      await logAgyContinuationOutcome(continuation, "failed", reason, undefined, error);
+    }
+  }
+  await removeCompletedAgySessions(completed);
+  return completed;
+}
+
 export async function autoSwitchAfterQuota(
   quotaScope: QuotaScope,
-): Promise<ProfileSwitchResult | undefined> {
-  return await withAutoSwitchLock(async () => {
+  observation?: AgyQuotaObservation,
+): Promise<AgyQuotaFailoverResult | undefined> {
+  return await withAuthSwitchLock(async () => {
     const failoverPolicy = decideLiveQuotaFailover(true);
     if (!failoverPolicy.switchImmediately) return undefined;
-    const initialState = await loadState();
+    const initialState = await queueFailedAgySession(await loadState(), observation);
+    const observedProfile = observation?.profileName;
+    const sessionId = observedAgySessionId(observation);
+    if (observedProfile || sessionId) {
+      const ownership = decideObservedProfileFailover(observedProfile, initialState.activeProfile);
+      if (!ownership.switchProfile) {
+        await logSwitchEvent({
+          event: "switch.stopped",
+          trigger: "autoswitch",
+          reason: ownership.reason,
+          fromProfile: observedProfile,
+          activeProfile: initialState.activeProfile,
+          sessionId,
+          quotaScope,
+        });
+        const completed = ownership.continueFailedSession
+          ? await continuePendingAgySessions(initialState, ownership.reason)
+          : [];
+        return initialState.activeProfile
+          ? {
+              name: initialState.activeProfile,
+              alreadyActive: true,
+              switched: false,
+              continuedSessionIds: completed,
+              reason: ownership.reason,
+            }
+          : undefined;
+      }
+    }
     const mode = effectiveAutoSwitchMode(initialState);
     if (mode === "off") {
       await logSwitchEvent({
@@ -652,34 +850,14 @@ export async function autoSwitchAfterQuota(
       return undefined;
     }
 
-    return await withPausedAuthSwitch(async () => {
-      const initialState = await loadState();
-      const mode = effectiveAutoSwitchMode(initialState);
-      if (mode === "off") {
-        await logSwitchEvent({
-          event: "switch.stopped",
-          trigger: "autoswitch",
-          reason: "autoswitch_off",
-          fromProfile: initialState.activeProfile,
-          quotaScope,
-        });
-        return undefined;
-      }
-      const activeProfile = initialState.profiles.find((profile) =>
-        profile.name === initialState.activeProfile
-      );
-      if (!shouldAutoSwitchAfterQuota(activeProfile, mode, quotaScope)) {
-        await logSwitchEvent({
-          event: "switch.stopped",
-          trigger: "autoswitch",
-          reason: "quota_scope_not_switchable",
-          fromProfile: initialState.activeProfile,
-          quotaScope,
-          mode,
-        });
-        return undefined;
-      }
-
+    const continuations = initialState.pendingQuotaContinuations ?? [];
+    const continuationOutcomes: Array<{
+      status: "completed" | "skipped" | "failed";
+      continuation: PendingQuotaContinuation;
+      transport?: string;
+      error?: unknown;
+    }> = [];
+    const switched = await withPausedAuthSwitch(async () => {
       const initialCandidate = selectAutoSwitchProfile(initialState, mode, quotaScope);
       const previousCredential = await keychain.readActive().catch(() => undefined);
       let lastError: Error | undefined;
@@ -687,7 +865,9 @@ export async function autoSwitchAfterQuota(
         for (let attempt = 0; attempt < 10000; attempt += 1) {
           const state = await loadState();
           const currentMode = effectiveAutoSwitchMode(state);
-          if (currentMode === "off") return undefined;
+          if (currentMode === "off") {
+            throw new Error("Automatic quota failover was disabled during profile selection.");
+          }
           const candidate = attempt === 0
             ? initialCandidate
             : selectAutoSwitchProfile(state, currentMode, quotaScope);
@@ -731,16 +911,57 @@ export async function autoSwitchAfterQuota(
         });
         throw error;
       }
-    }, { switchingNotice: quotaSwitchingNotice("agyx") });
+    }, {
+      switchingNotice: quotaSwitchingNotice("agyx"),
+      continuations,
+      onContinuationComplete: (continuation, result) => {
+        continuationOutcomes.push({ status: "completed", continuation, transport: result.transport });
+      },
+      onContinuationSkipped: (continuation, result) => {
+        continuationOutcomes.push({ status: "skipped", continuation, transport: result.transport });
+      },
+      onContinuationError: (error, continuation) => {
+        continuationOutcomes.push({ status: "failed", continuation, error });
+      },
+    });
+    const completed = continuationOutcomes
+      .filter((outcome) => outcome.status === "completed")
+      .map((outcome) => outcome.continuation.sessionId);
+    await removeCompletedAgySessions(completed);
+    for (const outcome of continuationOutcomes) {
+      await logAgyContinuationOutcome(
+        outcome.continuation,
+        outcome.status,
+        "profile_switched",
+        outcome.transport,
+        outcome.error,
+      );
+    }
+    return {
+      ...switched,
+      switched: true,
+      continuedSessionIds: completed,
+    };
   });
 }
 
 export async function autoSwitchAfterQuotaAction(
   quotaScope: QuotaScope,
+  observation?: AgyQuotaObservation,
 ): Promise<AutoSwitchAction> {
   try {
-    const result = await autoSwitchAfterQuota(quotaScope);
+    const result = await autoSwitchAfterQuota(quotaScope, observation);
     if (!result) return { kind: "none" };
+    if (!result.switched) {
+      if (!result.continuedSessionIds.length) return { kind: "none", reason: result.reason };
+      return {
+        kind: "sessions_restarted",
+        reason: result.reason,
+        profile: result.name,
+        sessionIds: result.continuedSessionIds,
+        message: `\n[agyx] '${result.name}' is already active; continued ${result.continuedSessionIds.length} quota-failed session(s).`,
+      };
+    }
     return {
       kind: "switched",
       profile: result.name,

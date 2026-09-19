@@ -516,7 +516,13 @@ export class SupervisorDaemon {
   async runFailover(session, event) {
     const command = session.policyCommand ? process.execPath : (session.product === "agyx" ? "agyx" : "cdxx");
     const args = session.product === "agyx"
-      ? ["_auto-next", event.scope ?? "unknown"]
+      ? ["_auto-next", event.scope ?? "unknown", JSON.stringify({
+        profileName: session.profileName,
+        sessionId: session.conversationId ?? session.launcherId,
+        conversationId: session.conversationId,
+        launcherId: session.launcherId,
+        timestamp: event.timestamp ?? nowIso(),
+      })]
       : ["_supervisor-failover", Buffer.from(JSON.stringify({
         profileName: session.profileName,
         sessionId: session.threadId ?? session.sessionId,

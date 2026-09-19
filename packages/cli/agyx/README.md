@@ -261,6 +261,15 @@ controls whether profiles marked ineligible may be selected; its default is
 `allow`. Automatic switching uses the same global pause/switch/resume
 transaction as `agyx next`.
 
+When a managed turn ends at quota before an answer is produced, agyx retains
+that conversation in a pending continuation queue. A successful profile switch
+restarts every retained conversation with `--prompt-interactive continue` and
+removes only the sessions whose restart succeeded. If another session already
+switched the active profile, the later quota event drains the same queue without
+switching profiles a second time. Direct `--native` agy sessions are not yet
+included because their process, conversation, and profile ownership cannot be
+attributed safely.
+
 If no profile is selectable, the policy helper reports the reason to the active
 terminal and the supervisor suppresses repeated autoswitch attempts for that
 quota scope in the current session.

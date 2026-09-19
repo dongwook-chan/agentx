@@ -5,6 +5,7 @@ import {
   agentProfileColumnWidths,
   agentProfileHeaderLine,
   agentProfileRowLine,
+  agentCliManifests,
   appendAgentEvent,
   clearExpiredProfileQuota,
   credentialLifecyclePolicy,
@@ -376,6 +377,11 @@ test("quota continuations retain every failed session until its continuation suc
     second,
   ]);
   assert.deepEqual(removeCompletedQuotaContinuations(queued, ["session-b"]), [first]);
+});
+
+test("both managed CLI products share the core post-quota continuation prompt", () => {
+  assert.equal(agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt, "continue");
+  assert.equal(agentCliManifests.codex.quotaFailover.postSwitchContinuationPrompt, "continue");
 });
 
 test("live quota exhaustion without explicit scope is preserved as unknown", () => {

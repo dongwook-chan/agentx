@@ -980,18 +980,23 @@ async function main(): Promise<number> {
       await activateProfile(args[0] ?? "");
       return 0;
     case "_auto-next":
-      console.log(JSON.stringify(await autoSwitchAfterQuotaAction(parseQuotaScope(args[0]))));
+      console.log(JSON.stringify(await autoSwitchAfterQuotaAction(
+        parseQuotaScope(args[0]),
+        args[1] ? JSON.parse(args[1]) : undefined,
+      )));
       return 0;
     case "_supervisor-launch-args": {
       const payload = JSON.parse(args[0] ?? "{}") as {
         args?: string[];
         conversationId?: string;
+        resumePrompt?: string;
         logPath?: string;
       };
       if (!payload.logPath) throw new Error("Usage: agyx _supervisor-launch-args <json>");
       console.log(JSON.stringify({
         argv: buildAgyLaunchArgs(payload.args ?? [], {
           conversationId: payload.conversationId,
+          resumePrompt: payload.resumePrompt,
           logPath: payload.logPath,
           state: await loadState(),
         }),

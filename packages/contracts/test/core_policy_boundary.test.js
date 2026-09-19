@@ -150,11 +150,19 @@ test("both CLI adapters consume shared autoswitch action results", async () => {
   assert.match(cdxx, /stopRetryingAutoSwitch/);
 });
 
-test("Codex continues quota-failed sessions after a concurrent profile switch", async () => {
+test("both CLI adapters retain and continue quota-failed sessions through core policy", async () => {
+  const agyx = await readFile(join(repoRoot, "packages/cli/agyx/src/coordinator.ts"), "utf8");
   const cdxx = await readFile(join(cdxxSourceDir, "failover_policy.js"), "utf8");
-  assert.match(cdxx, /ownership\.continueFailedSession/);
-  assert.match(cdxx, /enqueuePendingQuotaContinuation/);
-  assert.match(cdxx, /removeCompletedQuotaContinuations/);
+  const supervisor = await readFile(join(repoRoot, "packages/supervisor/src/daemon.js"), "utf8");
+  assert.equal(agentCliManifests.agy.quotaFailover.postSwitchContinuationPrompt, "continue");
+  assert.equal(agentCliManifests.codex.quotaFailover.postSwitchContinuationPrompt, "continue");
+  for (const source of [agyx, cdxx]) {
+    assert.match(source, /ownership\.continueFailedSession/);
+    assert.match(source, /enqueuePendingQuotaContinuation/);
+    assert.match(source, /removeCompletedQuotaContinuations/);
+  }
+  assert.match(supervisor, /sessionId: session\.conversationId \?\? session\.launcherId/);
+  assert.match(supervisor, /profileName: session\.profileName/);
 });
 
 test("both CLI adapters use the shared profile table and picker renderer", async () => {

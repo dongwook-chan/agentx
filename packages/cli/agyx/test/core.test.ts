@@ -107,6 +107,27 @@ test("buildAgyLaunchArgs honors yolo off and rejects Codex yolo flag", () => {
   );
 });
 
+test("buildAgyLaunchArgs replaces an initial prompt with the quota continuation prompt", () => {
+  assert.deepEqual(
+    buildAgyLaunchArgs(["--model", "gemini", "--prompt-interactive", "initial"], {
+      conversationId: "11111111-1111-1111-1111-111111111111",
+      resumePrompt: "continue",
+      logPath: "/tmp/agy.log",
+      state: { settings: { yolo: false } },
+    }),
+    [
+      "--model",
+      "gemini",
+      "--conversation",
+      "11111111-1111-1111-1111-111111111111",
+      "--prompt-interactive",
+      "continue",
+      "--log-file",
+      "/tmp/agy.log",
+    ],
+  );
+});
+
 test("native supervisor is scoped to supported arm64 Unix hosts", () => {
   assert.equal(nativeSupervisorBinaryName("darwin", "arm64"), "agyx-supervisor-darwin-arm64");
   assert.equal(nativeSupervisorBinaryName("linux", "arm64"), "agyx-supervisor-linux-arm64");

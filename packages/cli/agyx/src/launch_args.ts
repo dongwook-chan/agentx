@@ -9,15 +9,37 @@ export const agyTargetCapabilities = {
 
 export interface AgyLaunchOptions {
   conversationId?: string;
+  resumePrompt?: string;
   logPath: string;
   state: Pick<State, "settings">;
+}
+
+export function withAgyResumePrompt(
+  args: string[],
+  resumePrompt?: string,
+): string[] {
+  if (!resumePrompt) return [...args];
+  const result: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "-i" || argument === "--prompt-interactive") {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--prompt-interactive=")) continue;
+    result.push(argument);
+  }
+  return [...result, "--prompt-interactive", resumePrompt];
 }
 
 export function buildAgyLaunchArgs(
   args: string[],
   options: AgyLaunchOptions,
 ): string[] {
-  const launchArgs = withConversation(args, options.conversationId);
+  const launchArgs = withAgyResumePrompt(
+    withConversation(args, options.conversationId),
+    options.resumePrompt,
+  );
   if (!launchArgs.some((argument) =>
     argument === "--log-file" || argument.startsWith("--log-file=")
   )) {

@@ -7,6 +7,7 @@ import {
   clearExpiredProfileQuota,
   ensureExhaustedUsageScope,
   markActiveProfile,
+  PendingQuotaContinuation,
   profileNameFromIdentity,
   resetlessQuotaExpired,
   uniqueProfileName as coreUniqueProfileName,
@@ -99,6 +100,7 @@ export interface State {
     githubStarredAt?: string;
   };
   profiles: ProfileRecord[];
+  pendingQuotaContinuations?: PendingQuotaContinuation[];
 }
 
 export const configDir = process.env.AGYX_CONFIG_DIR
@@ -117,10 +119,17 @@ export async function ensureDirectories(): Promise<void> {
 
 export async function loadState(): Promise<State> {
   try {
-    return JSON.parse(await readFile(statePath, "utf8")) as State;
+    const state = JSON.parse(await readFile(statePath, "utf8")) as State;
+    return {
+      ...state,
+      profiles: state.profiles ?? [],
+      pendingQuotaContinuations: Array.isArray(state.pendingQuotaContinuations)
+        ? state.pendingQuotaContinuations
+        : [],
+    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { version: 1, profiles: [] };
+      return { version: 1, profiles: [], pendingQuotaContinuations: [] };
     }
     throw error;
   }

@@ -45,6 +45,7 @@ struct SessionCommand {
     command: String,
     reason: Option<String>,
     message: Option<String>,
+    prompt: Option<String>,
 }
 
 struct LaunchCommand {
@@ -74,6 +75,7 @@ struct Supervisor {
     auto_switch_stopped_scopes: HashSet<String>,
     current_model_label: Option<String>,
     current_quota_scope: Option<String>,
+    resume_prompt: Option<String>,
     persist_count: usize,
 }
 
@@ -122,8 +124,12 @@ impl Supervisor {
         self.terminal_log_offset = 0;
         self.usage_transcript_state = json!({ "inUsageView": false });
         let _ = fs::remove_file(&self.terminal_log_path);
-        let launch_args =
-            supervisor_launch_args(&self.args, self.conversation_id.as_deref(), &self.log_path)?;
+        let launch_args = supervisor_launch_args(
+            &self.args,
+            self.conversation_id.as_deref(),
+            self.resume_prompt.as_deref(),
+            &self.log_path,
+        )?;
         let launch_command =
             terminal_transcript_command(&self.real_agy, &launch_args, &self.terminal_log_path)
                 .unwrap_or_else(|| LaunchCommand {
@@ -140,6 +146,7 @@ impl Supervisor {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(to_string)?;
+        self.resume_prompt = None;
         self.child = Some(child);
         self.persist()?;
         Ok(())
@@ -381,6 +388,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         auto_switch_stopped_scopes: HashSet::new(),
         current_model_label: None,
         current_quota_scope: None,
+        resume_prompt: None,
         persist_count: 0,
     }));
 
@@ -438,7 +446,17 @@ fn process_auto_switch_scopes(
     scopes: Vec<String>,
 ) -> Result<(), String> {
     for scope in scopes {
-        if let Some(action) = trigger_auto_switch(&scope) {
+        let observation = {
+            let guard = supervisor.lock().map_err(to_string)?;
+            json!({
+                "profileName": guard.profile_at_start.as_deref(),
+                "sessionId": guard.conversation_id.as_deref().unwrap_or(&guard.id),
+                "conversationId": guard.conversation_id.as_deref(),
+                "launcherId": &guard.id,
+                "timestamp": now_iso(),
+            })
+        };
+        if let Some(action) = trigger_auto_switch(&scope, &observation) {
             if let Some(message) = action.get("message").and_then(Value::as_str) {
                 eprintln!("{message}");
             }
@@ -494,6 +512,7 @@ fn handle_socket(supervisor: Arc<Mutex<Supervisor>>, mut stream: UnixStream) -> 
             if request.reason.as_deref() == Some("profile-switch") {
                 eprintln!("[agyx] Resuming agy session after profile switch.");
             }
+            guard.resume_prompt = request.prompt;
             if guard.child.is_none() {
                 guard.start_child()?;
             }
@@ -629,11 +648,13 @@ fn active_profile() -> Result<Option<String>, String> {
 fn supervisor_launch_args(
     args: &[String],
     conversation_id: Option<&str>,
+    resume_prompt: Option<&str>,
     log_path: &Path,
 ) -> Result<Vec<String>, String> {
     let payload = json!({
         "args": args,
         "conversationId": conversation_id,
+        "resumePrompt": resume_prompt,
         "logPath": log_path.to_string_lossy(),
     });
     let payload = serde_json::to_string(&payload).map_err(to_string)?;
@@ -1103,7 +1124,8 @@ fn remove_key(value: &mut Value, key: &str) {
     }
 }
 
-fn trigger_auto_switch(scope: &str) -> Option<Value> {
+fn trigger_auto_switch(scope: &str, observation: &Value) -> Option<Value> {
+    let observation = serde_json::to_string(observation).ok()?;
     let output = if let Ok(cli_path) = env::var("AGYX_CLI_PATH") {
         let node_path = env::var("AGYX_NODE_PATH").unwrap_or_else(|_| "node".to_string());
         let mut command = Command::new(node_path);
@@ -1111,6 +1133,7 @@ fn trigger_auto_switch(scope: &str) -> Option<Value> {
         command
             .arg("_auto-next")
             .arg(scope)
+            .arg(&observation)
             .stdin(Stdio::null())
             .env("AGYX_AUTO_SWITCH_TRIGGER", "1")
             .output()
@@ -1119,6 +1142,7 @@ fn trigger_auto_switch(scope: &str) -> Option<Value> {
         Command::new("agyx")
             .arg("_auto-next")
             .arg(scope)
+            .arg(&observation)
             .stdin(Stdio::null())
             .env("AGYX_AUTO_SWITCH_TRIGGER", "1")
             .output()
